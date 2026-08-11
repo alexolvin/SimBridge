@@ -85,7 +85,7 @@ class Userbot:
                 await evt.reply("Access denied: no out_sms permission.")
                 return
 
-            # Call agent API (HTTP, not SSH)
+            # Call agent API (HTTP)
             import httpx
             try:
                 async with httpx.AsyncClient() as http:

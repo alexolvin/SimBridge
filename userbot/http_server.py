@@ -1,7 +1,7 @@
 """Userbot HTTP server — receives incoming events from Asterisk hooks.
 
 On the Telegram node. The GSM node's Asterisk hooks (tg-sms-forward.sh)
-POST to this server over Tailscale. Replaces the SSH reverse path.
+POST to this server over Tailscale. Replaces the shell-command reverse path.
 """
 
 from __future__ import annotations

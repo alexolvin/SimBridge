@@ -215,8 +215,12 @@ class TestACL:
         acl_file.write_text("1234567 out_sms\n")
         acl = ACLManager(str(acl_file))
 
-        # Add new user
+        # Add new user — force mtime change so reload() detects it
+        import os, time
+        time.sleep(0.01)
         acl_file.write_text("1234567 out_sms\n9999999 in_sms\n")
+        # Touch to ensure mtime updates on fast filesystems
+        os.utime(str(acl_file))
         acl.reload()
 
         assert acl.check(9999999, "in_sms") is True
