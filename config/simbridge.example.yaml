@@ -82,3 +82,4 @@ paths:
   blacklist: /etc/simbridge/blacklist.txt
   contacts_cache: /var/lib/simbridge/contacts.csv
   audit_log: /var/log/simbridge/audit.jsonl
+  recordings_dir: /var/lib/simbridge/recordings

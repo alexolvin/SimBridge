@@ -97,14 +97,79 @@ def create_http_server(
 
     @app.post("/events/voicemail")
     async def handle_voicemail_event(req: Request):
-        """Receive voicemail notification from Asterisk hook."""
+        """Receive voicemail from Asterisk hook (tg-voice-forward.sh).
+
+        Expects multipart form-data:
+        - file: normalized audio (opus/ogg)
+        - phone_number: caller E.164 number
+        - voicemail_type: "normal" | "early_hangup" | "recording_missing"
+        - correlation_id: Asterisk UNIQUEID
+        - duration: recording duration in seconds
+
+        S03.1: Distinguishes early hangup from normal voicemail.
+        S03.3: Uses ContactResolver for caller display name.
+        """
         received_secret = req.headers.get("x-simbridge-secret", "")
         if received_secret != secret:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-        body = await req.json()
-        logger.info("Received voicemail from %s", body.get("phone_number"))
-        return {"ok": True}
+        # Parse multipart form-data
+        form = await req.form()
+        audio_file = form.get("file")
+        phone_number = form.get("phone_number", "unknown")
+        vm_type = form.get("voicemail_type", "normal")
+        correlation_id = form.get("correlation_id", "")
+        duration = form.get("duration", "0")
+
+        # S03.1: Resolve contact name (S02 feature)
+        from core.phone import normalize_e164
+        norm = normalize_e164(phone_number) or phone_number
+        name = None
+        if contacts:
+            name = contacts.resolve(norm)
+
+        # Build Telegram notification text
+        if vm_type == "early_hangup":
+            vm_label = "📞 Звонок (брёл)"  # called, hung up during greeting
+            if name:
+                vm_label = f"📞 Звонок — {name} ({norm})"
+            else:
+                vm_label = f"📞 Звонок — {norm}"
+        elif vm_type == "recording_missing":
+            vm_label = f"⚠️ Нет записи — {norm}"
+            if name:
+                vm_label = f"⚠️ Нет записи — {name} ({norm})"
+        else:  # normal
+            vm_label = f"🎙 Голосовое — {norm}"
+            if name:
+                vm_label = f"🎙 Голосовое — {name} ({norm})"
+
+        logger.info(
+            "Received voicemail from %s type=%s duration=%ss correlation=%s",
+            norm, vm_type, duration, correlation_id,
+        )
+
+        # Audit log
+        event_type = EventType.VOICEMAIL_EARLY_HANGUP if vm_type == "early_hangup" else EventType.VOICEMAIL_RECEIVED
+        audit.log(
+            event_type,
+            outcome="ok",
+            correlation_id=correlation_id,
+            details={
+                "from": norm,
+                "name": name,
+                "voicemail_type": vm_type,
+                "duration": duration,
+            },
+        )
+
+        # TODO: Send to Telegram via Telethon client (wired via app state)
+        # The audio file is available as audio_file (UploadFile)
+        # Notification text: vm_label
+        if audio_file:
+            logger.info("Voicemail audio received: %s (%d bytes)", audio_file.filename, len(audio_file.file.read(0) if hasattr(audio_file.file, 'read') else 0))
+
+        return {"ok": True, "voicemail_type": vm_type, "label": vm_label}
 
     @app.get("/health")
     async def health():

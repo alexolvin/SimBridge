@@ -144,6 +144,7 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("paths.blacklist", str),
     _SchemaEntry("paths.contacts_cache", str),
     _SchemaEntry("paths.audit_log", str),
+    _SchemaEntry("paths.recordings_dir", str, required=False),
 ]
 
 

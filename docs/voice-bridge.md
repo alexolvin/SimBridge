@@ -93,3 +93,67 @@ Telegram User ──MTProto+WebRTC──► tg2sip (Telegram node)
                                         │
                                    GSM Network
 ```
+
+## Incoming Call Flow — Voicemail as Fallback (S03.4)
+
+### Current (Pre-Stage-04)
+
+Incoming calls go directly to voicemail — there is no Telegram ring yet:
+
+```
+chan_dongle (incoming-mobile/s)
+    │
+    ├── Dial(Local/voicemail-fallback@voicemail-ctx, ${RING_WAIT_SECONDS})
+    │
+    └── voicemail-ctx/voicemail-fallback
+            │
+            ├── Gosub(voicemail-record, s, 1)
+            │   ├── Answer()
+            │   ├── MixMonitor()        ← starts BEFORE prompt (S03.1)
+            │   ├── Playback(vm-prompt)
+            │   ├── WaitExten()
+            │   └── Hangup()
+            │
+            └── hangup-handler
+                ├── MixMonitor callback (recording complete)
+                └── tg-voice-forward.sh → /events/voicemail (HTTP)
+```
+
+### Post-Stage-04 (Planned)
+
+Stage 04 introduces a state machine that rings the user in Telegram first:
+
+```
+chan_dongle (incoming-mobile/s)
+    │
+    ├── Dial(SIP/tg-bridge@tg-ringing, ${OUTBOUND_RING_TIMEOUT})
+    │   │
+    │   └── If unanswered → voicemail-ctx/voicemail-fallback (same sub)
+    │
+    └── If answered → live voice bridge (Stage 04)
+```
+
+The voicemail recording sub (`voicemail-record`) is a reusable, stateless branch
+that can be invoked from any context. It requires:
+
+- `CALL_FROM` — caller phone number (set by caller context)
+- Channel variables from generated globals (`RING_WAIT_SECONDS`, `MAX_RECORD_SECONDS`, `VM_PROMPT`)
+
+### Early Hangup Detection (S03.1)
+
+The `tg-voice-forward.sh` script determines the voicemail type by recording
+duration:
+
+| Duration | Type | Telegram Notification |
+|---|---|---|
+| < 3s | `early_hangup` | "📞 Звонок — (Name)" (no audio) |
+| ≥ 3s, valid audio | `normal` | "🎙 Голосовое — (Name)" (with audio) |
+| No file found | `recording_missing` | "⚠️ Нет записи — (Name)" |
+
+### Voicemail Recording — Prompt Handling
+
+MixMonitor starts before the prompt playback (S03.1 fix). The resulting
+recording contains the prompt at the beginning. This is intentional: it makes
+it audible when the call was answered and gives context to the message. The
+prompt duration is used by the forwarding script to distinguish early hangups
+from actual messages.
