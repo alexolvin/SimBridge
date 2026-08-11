@@ -70,6 +70,9 @@ def generate(config: dict, output_path: str) -> None:
     max_call = int(limits.get("max_call_seconds", 1800))
     content += f"; Call limits (S04.3)\n"
     content += f"MAX_CALL_SECONDS={max_call}\n"
+    # S04.4: Distributed mode — Tailscale network settings
+    content += f"; Distributed mode (S04.4): Tailscale network\n"
+    content += f"TAILNET_CGNAT=100.64.0.0/10\n"
 
     out = Path(output_path)
     out.write_text(content, encoding="utf-8")

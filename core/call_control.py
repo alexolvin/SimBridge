@@ -600,3 +600,40 @@ class CallRegistry:
                 if not call.is_terminal:
                     channels.extend(call.get_active_channel_ids())
         return channels
+
+    # -- Bridge health / link drop detection (S04.4) --
+
+    def get_bridged_calls(self) -> List[CallMachine]:
+        """Return all calls in BRIDGED state.
+
+        Used for bridge health monitoring — if the Tailscale link drops,
+        these calls need to be terminated and the user notified.
+        """
+        with self._lock:
+            return [
+                c for c in self._calls.values()
+                if c.state == CallState.BRIDGED
+            ]
+
+    def terminate_bridged_calls(self, reason: str = "link_drop") -> List[str]:
+        """Terminate all bridged calls due to a link failure.
+
+        Returns list of call_ids that were terminated.
+        This is the last resort when the Tailscale link drops mid-call.
+        """
+        terminated = []
+        with self._lock:
+            for call in list(self._calls.values()):
+                if call.state == CallState.BRIDGED:
+                    try:
+                        call.transition(CallState.HANGUP)
+                    except InvalidTransition:
+                        pass
+                    call.error = reason
+                    terminated.append(call.call_id)
+                    logger.warning(
+                        "Terminated bridged call %s: %s",
+                        call.call_id[:8],
+                        reason,
+                    )
+        return terminated

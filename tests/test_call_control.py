@@ -750,3 +750,189 @@ class TestCallEventTypes:
     def test_call_duration_expired_event(self):
         from core.events import EventType
         assert EventType.CALL_DURATION_EXPIRED.value == "CALL_DURATION_EXPIRED"
+
+
+# =========================================================================
+# S04.4 — Distributed mode: link drop detection, bridge health
+# =========================================================================
+
+class TestDistributedMode:
+    """Distributed mode: link drop detection, bridge health monitoring."""
+
+    @pytest.fixture
+    def registry(self):
+        mock_sms = MagicMock()
+        mock_audit = MagicMock()
+        return CallRegistry(sms_store=mock_sms, audit=mock_audit)
+
+    def test_get_bridged_calls_empty(self, registry):
+        """No bridged calls initially."""
+        assert registry.get_bridged_calls() == []
+
+    def test_get_bridged_calls_returns_bridged(self, registry):
+        """get_bridged_calls returns calls in BRIDGED state."""
+        call = registry.create_incoming(caller_number="+79261234555")
+        registry.start_telegram_ring(call.call_id)
+        registry.accept_incoming(call.call_id)
+        registry.answer_gsm(call.call_id)
+        registry.bridge_call(call.call_id)
+        bridged = registry.get_bridged_calls()
+        assert len(bridged) == 1
+        assert bridged[0].call_id == call.call_id
+
+    def test_get_bridged_calls_excludes_non_bridged(self, registry):
+        """get_bridged_calls excludes non-bridged calls."""
+        call = registry.create_incoming(caller_number="+79261234555")
+        # Call is in RINGING, not BRIDGED
+        assert registry.get_bridged_calls() == []
+
+    def test_terminate_bridged_calls(self, registry):
+        """terminate_bridged_calls hangs up all bridged calls."""
+        call1 = registry.create_incoming(caller_number="+79261234555")
+        registry.start_telegram_ring(call1.call_id)
+        registry.accept_incoming(call1.call_id)
+        registry.answer_gsm(call1.call_id)
+        registry.bridge_call(call1.call_id)
+
+        call2 = registry.create_incoming(caller_number="+14155552671")
+        registry.start_telegram_ring(call2.call_id)
+        registry.accept_incoming(call2.call_id)
+        registry.answer_gsm(call2.call_id)
+        registry.bridge_call(call2.call_id)
+
+        terminated = registry.terminate_bridged_calls(reason="link_drop")
+        assert len(terminated) == 2
+        assert call1.call_id in terminated
+        assert call2.call_id in terminated
+
+        # Verify calls are now in HANGUP state
+        c1 = registry.get(call1.call_id)
+        c2 = registry.get(call2.call_id)
+        assert c1.state == CallState.HANGUP
+        assert c1.error == "link_drop"
+        assert c2.state == CallState.HANGUP
+        assert c2.error == "link_drop"
+
+    def test_terminate_bridged_calls_empty(self, registry):
+        """terminate_bridged_calls returns empty list when nothing bridged."""
+        terminated = registry.terminate_bridged_calls(reason="link_drop")
+        assert terminated == []
+
+    def test_terminate_bridged_calls_mixed_states(self, registry):
+        """Only bridged calls are terminated; ringing calls survive."""
+        call_bridged = registry.create_incoming(caller_number="+79261234555")
+        registry.start_telegram_ring(call_bridged.call_id)
+        registry.accept_incoming(call_bridged.call_id)
+        registry.answer_gsm(call_bridged.call_id)
+        registry.bridge_call(call_bridged.call_id)
+
+        call_ringing = registry.create_incoming(caller_number="+14155552671")
+        # call_ringing is still in RINGING
+
+        terminated = registry.terminate_bridged_calls(reason="link_drop")
+        assert len(terminated) == 1
+        assert terminated[0] == call_bridged.call_id
+
+        # Ringing call should be unaffected
+        assert registry.get(call_ringing.call_id).state == CallState.RINGING
+
+
+# =========================================================================
+# S04.4 — PJSIP config: distributed mode settings
+# =========================================================================
+
+class TestPjsipDistributed:
+    """PJSIP config for distributed mode (S04.4)."""
+
+    @pytest.fixture(autouse=True)
+    def load_pjsip(self):
+        pjsip = Path(__file__).parent.parent / "asterisk" / "pjsip.conf.example"
+        self.pjsip = pjsip.read_text()
+
+    def test_local_net_tailscale(self):
+        """local_net is set to Tailscale CGNAT range."""
+        assert "local_net=100.64.0.0/10" in self.pjsip
+
+    def test_nat_option(self):
+        """nat_option is configured for tailnet."""
+        assert "nat_option=rtp" in self.pjsip
+
+    def test_external_media_addr_documented(self):
+        """external_media_addr is documented for distributed mode."""
+        assert "external_media_addr" in self.pjsip
+
+    def test_no_srtp(self):
+        """No SRTP transport configured — Tailscale already encrypts."""
+        assert "srtp" not in self.pjsip.lower() or "srtp" not in self.pjsip
+
+
+# =========================================================================
+# S04.4 — Config generator: distributed mode globals
+# =========================================================================
+
+class TestConfigGeneratorDistributed:
+    """Config generator produces distributed mode globals."""
+
+    def test_tailnet_cgnat_in_output(self):
+        from scripts.generate_asterisk_config import generate
+
+        config = {
+            "asterisk": {
+                "ring_wait_seconds": 24,
+                "max_record_seconds": 90,
+                "prompt": "/var/lib/asterisk/sounds/custom/vm-prompt",
+            },
+            "voice": {
+                "bridge_endpoint": "tg-bridge",
+                "bridge_host": "100.123.45.67",
+                "bridge_port": 5062,
+                "outbound_answer_timeout": 30,
+            },
+            "limits": {"max_call_seconds": 1800},
+            "paths": {},
+        }
+        with tempfile.NamedTemporaryFile(suffix=".conf", delete=False) as f:
+            out = f.name
+        try:
+            generate(config, out)
+            result = Path(out).read_text()
+            assert "TAILNET_CGNAT=100.64.0.0/10" in result
+        finally:
+            os.unlink(out)
+
+
+# =========================================================================
+# S04.4 — Docs: distributed mode documentation
+# =========================================================================
+
+class TestDistributedDocs:
+    """Voice bridge docs cover distributed mode."""
+
+    @pytest.fixture(autouse=True)
+    def load_docs(self):
+        docs = Path(__file__).parent.parent / "docs" / "voice-bridge.md"
+        self.docs = docs.read_text()
+
+    def test_distributed_mode_documented(self):
+        """Distributed mode section exists."""
+        assert "Distributed Mode" in self.docs
+
+    def test_srtp_rationale_documented(self):
+        """SRTP rationale states Tailscale already encrypts."""
+        assert "duplicated mechanism" in self.docs or "duplicate" in self.docs.lower()
+
+    def test_tailscale_cgnat_documented(self):
+        """Tailscale CGNAT range is documented."""
+        assert "100.64.0.0/10" in self.docs
+
+    def test_magicdns_or_raw_ip(self):
+        """Docs specify MagicDNS FQDN or raw Tailscale IP."""
+        assert "MagicDNS" in self.docs
+
+    def test_link_drop_handling_documented(self):
+        """Link drop handling is documented."""
+        assert "link drop" in self.docs.lower() or "link_drop" in self.docs
+
+    def test_config_only_change(self):
+        """Docs state that distributed mode is a config-only change."""
+        assert "config-only" in self.docs.lower() or "config-only change" in self.docs

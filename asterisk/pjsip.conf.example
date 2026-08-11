@@ -9,11 +9,21 @@
 ; - direct_media=no — media MUST flow through Asterisk for bridging
 ; - allow=ulaw,alaw — GSM-compatible codecs only (8 kHz)
 ; - rtptimeout/rtpholdtimeout — dead call detection
+; - external_media_addr — for distributed mode: tells tg-bridge what IP
+;   to send RTP to (the GSM node's Tailscale IP)
+; - local_net — tells Asterisk not to rewrite SIP/RTP addresses for
+;   Tailscale peers (100.64.0.0/10 is the Tailscale CGNAT range)
 ;
 ; Codec path:
 ;   Telegram (Opus 48kHz) → sip-tg-bridge → SIP/RTP (ulaw 8kHz)
 ;     → Asterisk transcoding (if needed) → chan_dongle (ulaw 8kHz) → GSM
 ;   One transcode is unavoidable. Asterisk handles it natively.
+;
+; Distributed mode (S04.4):
+;   - bridge_host in simbridge.yaml = peer's Tailscale IP or MagicDNS FQDN
+;   - RTP is plain (no SRTP) — Tailscale already encrypts at the network layer
+;   - local_net prevents Asterisk from applying external-address rewriting
+;     to tailnet peers
 
 ; ---------------------------------------------------------------------------
 ; Transport — UDP only (SIP + RTP). SRTP disabled: Tailscale already encrypts.
@@ -39,6 +49,15 @@ direct_media=no
 rtptimeout=60
 rtpholdtimeout=30
 ice_support=no
+; S04.4: Distributed mode — tell Asterisk the Tailscale network so it
+; doesn't rewrite SIP/RTP addresses for tailnet peers. Tailscale uses
+; 100.64.0.0/10 (CGNAT range).
+local_net=100.64.0.0/10
+; In distributed mode: set external_media_addr to the GSM node's Tailscale IP
+; so the bridge sends RTP to the correct address.
+; external_media_addr=100.x.x.x
+; S04.4: NAT handling — use rtp for direct media on the tailnet
+nat_option=rtp
 
 ; ---------------------------------------------------------------------------
 ; Authentication — bridge credentials (generated at deploy time)

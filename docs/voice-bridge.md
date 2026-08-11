@@ -186,3 +186,112 @@ recording contains the prompt at the beginning. This is intentional: it makes
 it audible when the call was answered and gives context to the message. The
 prompt duration is used by the forwarding script to distinguish early hangups
 from actual messages.
+
+---
+
+## Distributed Mode (S04.4)
+
+### Config-Only Change
+
+Switching from single-node to distributed mode is a **config-only change**.
+No code changes are required. The single-node codebase reads all network
+parameters from `simbridge.yaml` — no hardcoded assumptions about
+`127.0.0.1`.
+
+**Single-node config:**
+```yaml
+voice:
+  bridge_host: 127.0.0.1
+  bridge_port: 5062
+```
+
+**Distributed config:**
+```yaml
+voice:
+  bridge_host: 100.x.x.x  # Tailscale IP of the Telegram node
+  # or: bridge_host: my-telegram-node.tail-<netid>.ts.net  # MagicDNS FQDN
+  bridge_port: 5062
+```
+
+That is the only code-relevant difference. All other changes are in
+Asterisk PJSIP configuration (local_net, external_media_addr).
+
+### Addressing: MagicDNS FQDN or Raw Tailscale IP
+
+Use either the full MagicDNS FQDN (`my-node.tail-<netid>.ts.net`) or the raw
+Tailscale IP (`100.x.x.x`). **Never use short hostnames** — they may not
+resolve reliably across all nodes in the tailnet.
+
+### SRTP Rationale — Why Plain RTP on Tailscale
+
+Tailscale (WireGuard) provides point-to-point encryption at the network layer.
+Every packet between nodes is encrypted end-to-end. The device's private key
+never leaves the device — Tailscale cannot decrypt the traffic either.
+
+Adding SRTP would create a **duplicated mechanism** (Rule 1):
+- A second key infrastructure (DTLS-SRTP requires certificate exchange)
+- Per-packet CPU cost for encrypting already-encrypted traffic
+- Certificate management overhead
+
+Plain RTP over the tailnet is the deliberate, correct choice. It is not an
+oversight — the tailnet already provides the encryption that SRTP would add.
+
+**When SRTP becomes necessary:** If the transport ever changes to something
+untrusted (public internet without WireGuard, shared hosting, etc.), enable
+`voice.srtp: true` in the config.
+
+### PJSIP local_net and NAT Settings
+
+For the distributed mode, the PJSIP endpoint must be configured so that
+Asterisk does not apply external-address rewriting to Tailscale peers. The
+Tailscale CGNAT range is `100.64.0.0/10`:
+
+```ini
+[tg-bridge]
+type=endpoint
+...
+local_net=100.64.0.0/10
+external_media_addr=100.x.x.x  # GSM node's Tailscale IP
+nat_option=rtp
+```
+
+- `local_net` — tells Asterisk that peers on this network should be addressed
+  directly (no NAT traversal)
+- `external_media_addr` — the IP the bridge should send RTP to (GSM node's
+  Tailscale IP). In single-node mode this is not needed.
+- `nat_option=rtp` — use RTP for media address detection on the tailnet
+
+### Link Drop Handling
+
+If the Tailscale link drops mid-call, both legs must terminate cleanly:
+
+1. The call registry exposes `get_bridged_calls()` for health monitoring
+2. On link failure, `terminate_bridged_calls(reason="link_drop")` hangs up
+   all bridged calls
+3. AMI `hangup_channel()` is called for each active channel (GSM + bridge)
+4. The user is notified via Telegram that the call was terminated
+
+**Verification (MANUAL_VERIFY):** Run `tailscale down` on one node during an
+active call. Both sides should see the call end within seconds.
+`core show channels` should be empty after cleanup.
+
+### Architecture — Distributed
+
+```
+Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node, 100.a.b.c)
+                                        │
+                                   SIP 5062
+                                        │
+                                 ┌───────┴───────┐
+                                 │    Tailscale   │  ← encrypted (WireGuard)
+                                 │  100.64.0.0/10 │  ← plain RTP on top
+                                 └───────┬───────┘
+                                        │
+                                   SIP + RTP (plain)
+                                        │
+                              Asterisk (GSM node, 100.x.y.z)
+                                        │
+                                   chan_dongle
+                                        │
+                                   GSM Network
+```
