@@ -1,6 +1,52 @@
 # Voice Bridge Architecture (Stage 04)
 
-## Decision: Plain RTP over Tailscale, no SRTP
+## Bridge Selection — Research Results (S04.1)
+
+### Candidates Evaluated
+
+Evaluated in order: tg2sip (primary), sip-tg-bridge (fallback), direct ntgcalls (last resort).
+
+#### 1. Infactum/tg2sip — DISQUALIFIED (libtgvoip)
+
+- **Media library**: `libtgvoip` (directory in repo tree). **DISQUALIFIED** per task rule: "any candidate depending on `libtgvoip` rather than `tgcalls`/`ntgcalls`/`WebRTC` is disqualified regardless of how well it appears to work, because it is on a deprecation path."
+- **Codecs**: `L16@48000` or `OPUS@48000` — too high for GSM 8kHz ulaw. Would need transcoding on both legs.
+- **Build**: CMake, C++17, `settings.ini` with API_ID/API_HASH.
+- **Status**: 46 commits, CI workflow, but dead end due to libtgvoip dependency.
+
+#### 2. foobar26/tg2sip (ntgcalls fork) — NOT FOUND
+
+- The task document references this as a "maintained fork of Infactum/tg2sip, rebuilt on ntgcalls."
+- Both `https://github.com/foobar26/tg2sip` and `https://github.com/foobar2003/tg2sip` return HTTP 404.
+- GitHub search for "tg2sip" returns only Infactum/tg2sip and forks of it.
+- **Conclusion**: This fork may be private, deleted, or the username is incorrect. Without access, this candidate cannot be evaluated. **MANUAL_VERIFY** — the next session should confirm whether this repo exists under a different name or is private.
+
+#### 3. blitss/sip-tg-bridge — VIABLE (ntgcalls + LiveKit SIP)
+
+- **Media library**: `ntgcalls` (pytgcalls/ntgcalls at commit 9e4890a). **NOT disqualified.**
+- **Architecture**: Based on [LiveKit SIP](https://github.com/livekit/sip) audio pipeline. Adapts LiveKit's SIP/RTP handling and audio transcoding for direct Telegram integration instead of WebRTC rooms.
+- **Status**: **POC / Work in Progress** — 7 commits, very young project.
+- **Build**: `make build-bridge` or `make build-all` (CMake + Go).
+- **Language**: Go binary (`cmd/sip-tg-bridge`) with C++ bridge code and ntgcalls submodule.
+- **Assessment**: Promising architecture, but POC status means gaps in error handling, call control, and production hardening.
+
+#### 4. Direct ntgcalls Integration — VIABLE (LAST RESORT)
+
+- **Library**: pytgcalls/ntgcalls — mature Python library with Go bindings.
+- **Topics**: audio, calls, cpp, ffmpeg, group-chat, library, python, stream, telegram, tgcalls, video, video-calls, video-chat, voice-chat, voip, webrtc.
+- **Go bindings**: Available via CGO. Example in `./examples/go/`.
+- **Assessment**: Would give maximum control but requires building the SIP layer ourselves. Only pursue if sip-tg-bridge proves insufficient.
+
+### Selection: blitss/sip-tg-bridge (FALLBACK → PRIMARY by default)
+
+**Reasoning**: The primary candidate (foobar26/tg2sip) is unavailable. sip-tg-bridge uses ntgcalls (not libtgvoip), is built on LiveKit SIP (battle-tested), and is explicitly designed as a tg2sip substitute. The POC status is a risk, but it's the only ntgcalls-based bridge with SIP integration that is publicly available.
+
+**Contingency**: If sip-tg-bridge fails in practice (build issues, call reliability), fall back to direct ntgcalls integration using Go bindings + custom pjsip wrapper.
+
+**MANUAL_VERIFY**: Build sip-tg-bridge from source and place a real Telegram voice call. This cannot be verified in this session without the build environment.
+
+---
+
+## Transport Decision: Plain RTP over Tailscale, no SRTP
 
 ### Rationale
 
@@ -23,23 +69,6 @@ Plain RTP over the tailnet is the correct choice.
 If the transport ever changes to something untrusted (public internet
 without WireGuard, shared hosting, etc.), enable `voice.srtp: true`
 in the config. The bridge code supports both modes.
-
-## Bridge Selection
-
-Evaluated in order:
-
-1. **foobar26/tg2sip** (PRIMARY) — maintained fork of Infactum/tg2sip,
-   rebuilt on ntgcalls (WebRTC-based). Bridges native Telegram P2P voice
-   calls to SIP. Distributed as Docker.
-
-   Deployment alongside Asterisk: tg2sip listens on UDP 5062 while
-   Asterisk keeps 5060. The PJSIP endpoint is defined with
-   `disallow=all`, `allow=ulaw,alaw`, `direct_media=no`.
-
-2. **blitss/sip-tg-bridge** (FALLBACK) — Go, LiveKit-derived SIP/RTP
-   pipeline. Self-described as POC/WIP.
-
-3. **Direct ntgcalls integration** (LAST RESORT) — most control, most work.
 
 ## Where the Bridge Runs
 
@@ -79,7 +108,7 @@ transport=udp
 ## Media Flow
 
 ```
-Telegram User ──MTProto+WebRTC──► tg2sip (Telegram node)
+Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node)
                                         │
                                    SIP 5062
                                         │
