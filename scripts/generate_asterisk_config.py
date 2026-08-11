@@ -46,6 +46,13 @@ def generate(config: dict, output_path: str) -> None:
     # and doesn't want the .ulaw suffix
     prompt_path = prompt.rsplit(".", 1)[0] if "." in prompt.split("/")[-1] else prompt
 
+    # Bridge settings (S04.2)
+    voice = config.get("voice", {})
+    bridge_endpoint = voice.get("bridge_endpoint", "tg-bridge")
+    bridge_host = voice.get("bridge_host", "127.0.0.1")
+    bridge_port = int(voice.get("bridge_port", 5062))
+    outbound_timeout = int(voice.get("outbound_answer_timeout", 30))
+
     content = OUTPUT_HEADER
     content += "[globals]\n"
     content += f"; Timing: ring_wait_seconds={ring_wait} (≈ {ring_wait // 5} ring cycles)\n"
@@ -53,6 +60,11 @@ def generate(config: dict, output_path: str) -> None:
     content += f"MAX_RECORD_SECONDS={max_record}\n"
     content += f"VM_PROMPT={prompt_path}\n"
     content += f"VM_REC_DIR={config.get('paths', {}).get('recordings_dir', '/var/lib/simbridge/recordings')}\n"
+    content += f"; Bridge (S04.2): Telegram voice bridge settings\n"
+    content += f"BRIDGE_ENDPOINT={bridge_endpoint}\n"
+    content += f"BRIDGE_HOST={bridge_host}\n"
+    content += f"BRIDGE_PORT={bridge_port}\n"
+    content += f"OUTBOUND_RING_TIMEOUT={outbound_timeout}\n"
 
     out = Path(output_path)
     out.write_text(content, encoding="utf-8")
@@ -60,6 +72,8 @@ def generate(config: dict, output_path: str) -> None:
     print(f"  RING_WAIT_SECONDS = {ring_wait} ({ring_wait // 5} ring cycles)")
     print(f"  MAX_RECORD_SECONDS = {max_record}")
     print(f"  VM_PROMPT = {prompt_path}")
+    print(f"  BRIDGE_ENDPOINT = {bridge_endpoint}")
+    print(f"  OUTBOUND_RING_TIMEOUT = {outbound_timeout}")
 
 
 def main() -> None:

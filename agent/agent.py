@@ -18,6 +18,7 @@ from core.audit import AuditLogger
 from core.contacts import ContactResolver
 from core.blacklist import BlacklistManager
 from core.sms_correlation import SMSCorrelationStore
+from core.call_control import CallRegistry
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
@@ -86,6 +87,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize SMS correlation store (S02.3)
     sms_store = SMSCorrelationStore()
     app.state.sms_store = sms_store
+
+    # Initialize call registry (S04.2)
+    call_registry = CallRegistry(sms_store=sms_store, audit=audit)
+    app.state.call_registry = call_registry
 
     # Initialize auth/replay state from config
     init_deps(app)

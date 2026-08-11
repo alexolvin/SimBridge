@@ -27,7 +27,9 @@ from agent.deps import (
     get_sms_limiter,
     get_blacklist,
     get_sms_store,
+    get_call_registry,
 )
+from core.call_control import CallRegistry, CallState, InvalidTransition, ModemBusyError
 
 router = APIRouter()
 # Apply auth + IP allowlist + replay protection to all /v1 routes
@@ -76,6 +78,35 @@ class BlockResponse(BaseModel):
     ok: bool
     action: str  # "blocked" or "unblocked"
     number: str
+
+
+# ---------------------------------------------------------------------------
+# Call control schemas (S04.2)
+# ---------------------------------------------------------------------------
+
+class CallRequest(BaseModel):
+    phone_number: str = Field(..., description="Phone number (E.164)")
+    contact_name: Optional[str] = Field(None, description="Display name")
+
+
+class OutgoingCallRequest(BaseModel):
+    phone_number: str = Field(..., description="Destination (E.164)")
+    telegram_user_id: Optional[int] = Field(None, description="Sender for ACL")
+
+
+class CallResponse(BaseModel):
+    call_id: str
+    state: str
+    caller_number: str
+    callee_number: str
+    direction: str
+
+
+class CallStateResponse(BaseModel):
+    call_id: str
+    state: str
+    direction: str
+    error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +308,170 @@ async def get_modems(
         )]
     except ConnectionError:
         raise HTTPException(status_code=503, detail="Asterisk AMI unreachable")
+
+
+# ---------------------------------------------------------------------------
+# Call control endpoints (S04.2)
+# ---------------------------------------------------------------------------
+
+@router.post("/call/incoming", response_model=CallResponse)
+async def call_incoming(
+    req: CallRequest,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Register an incoming GSM → Telegram call."""
+    call = registry.create_incoming(
+        caller_number=req.phone_number,
+        caller_name=req.contact_name,
+    )
+    audit.log(
+        EventType.CALL_INCOMING,
+        outcome="ok",
+        correlation_id=call.call_id,
+        details={"from": req.phone_number},
+    )
+    return CallResponse(
+        call_id=call.call_id,
+        state=call.state.value,
+        caller_number=call.caller_number,
+        callee_number=call.callee_number,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/outgoing", response_model=CallResponse)
+async def call_outgoing(
+    req: OutgoingCallRequest,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    blacklist: BlacklistManager = Depends(get_blacklist),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Register an outgoing Telegram → GSM call."""
+    if blacklist.contains(req.phone_number):
+        raise HTTPException(
+            status_code=403,
+            detail=SMSErrorType.BLACKLISTED.message,
+        )
+    try:
+        call = registry.create_outgoing(
+            callee_number=req.phone_number,
+            caller_number=f"user:{req.telegram_user_id or 0}",
+        )
+    except ModemBusyError:
+        raise HTTPException(status_code=503, detail="Modem busy — another call in progress")
+    audit.log(
+        EventType.CALL_OUTGOING,
+        telegram_user_id=req.telegram_user_id,
+        outcome="ok",
+        correlation_id=call.call_id,
+        details={"to": req.phone_number},
+    )
+    return CallResponse(
+        call_id=call.call_id,
+        state=call.state.value,
+        caller_number=call.caller_number,
+        callee_number=call.callee_number,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/{call_id}/accept", response_model=CallStateResponse)
+async def call_accept(
+    call_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """Accept an incoming call → bridge GSM leg."""
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    ok = registry.transition(call_id, CallState.ACCEPTED)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot accept — call is in {call.state.value} state",
+        )
+    return CallStateResponse(
+        call_id=call_id,
+        state=call.state.value,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/{call_id}/reject", response_model=CallStateResponse)
+async def call_reject(
+    call_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """Reject an incoming call."""
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    ok = registry.transition(call_id, CallState.REJECTED)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reject — call is in {call.state.value} state",
+        )
+    registry.cleanup(call_id)
+    return CallStateResponse(
+        call_id=call_id,
+        state=call.state.value,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/{call_id}/hangup", response_model=CallStateResponse)
+async def call_hangup(
+    call_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """Hang up a call → cleanup both legs."""
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    ok = registry.transition(call_id, CallState.HANGUP)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot hangup — call is in {call.state.value} state",
+        )
+    registry.cleanup(call_id)
+    return CallStateResponse(
+        call_id=call_id,
+        state=call.state.value,
+        direction=call.direction,
+    )
+
+
+@router.get("/call/{call_id}", response_model=CallStateResponse)
+async def call_state(
+    call_id: str,
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """Get current call state."""
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return CallStateResponse(
+        call_id=call.call_id,
+        state=call.state.value,
+        direction=call.direction,
+        error=call.error,
+    )
+
+
+@router.get("/calls")
+async def list_calls(
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """List all active calls."""
+    return [c.to_dict() for c in registry.list_active()]
 
 
 @router.get("/health", response_model=HealthResponse)

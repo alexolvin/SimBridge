@@ -133,3 +133,8 @@ def get_blacklist(request: Request):
 def get_sms_store(request: Request):
     """Get SMSCorrelationStore from app state."""
     return request.app.state.sms_store
+
+
+def get_call_registry(request: Request):
+    """Get CallRegistry from app state (S04.2)."""
+    return request.app.state.call_registry

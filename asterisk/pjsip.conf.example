@@ -1,26 +1,58 @@
-; SimBridge PJSIP — example (for tg-bridge voice bridge, Stage 04)
+; SimBridge PJSIP — tg-bridge endpoint (Stage 04)
 ; Copy to /etc/asterisk/pjsip_custom.conf and adapt.
+;
+; The tg-bridge (sip-tg-bridge) runs on the Telegram node and connects
+; to Asterisk over Tailscale. This endpoint receives incoming calls from
+; the bridge and routes them to the GSM modem via chan_dongle.
+;
+; Key settings:
+; - direct_media=no — media MUST flow through Asterisk for bridging
+; - allow=ulaw,alaw — GSM-compatible codecs only (8 kHz)
+; - rtptimeout/rtpholdtimeout — dead call detection
+;
+; Codec path:
+;   Telegram (Opus 48kHz) → sip-tg-bridge → SIP/RTP (ulaw 8kHz)
+;     → Asterisk transcoding (if needed) → chan_dongle (ulaw 8kHz) → GSM
+;   One transcode is unavoidable. Asterisk handles it natively.
 
 ; ---------------------------------------------------------------------------
-; tg-bridge endpoint — receives calls from the Telegram voice bridge
-; Runs on the Telegram node; connects over Tailscale.
+; Transport — UDP only (SIP + RTP). SRTP disabled: Tailscale already encrypts.
 ; ---------------------------------------------------------------------------
 [transport-udp]
 type=transport
 protocol=udp
 bind=0.0.0.0
 
+; ---------------------------------------------------------------------------
+; tg-bridge endpoint — receives calls from the Telegram voice bridge
+; ---------------------------------------------------------------------------
 [tg-bridge]
 type=endpoint
 transport=udp
 aors=tg-bridge-aor
-contexts=incoming-mobile
+auth=tg-bridge-auth
+contexts=tg-bridge
 disallow=all
 allow=ulaw,alaw
+dtmf_mode=rfc2833
 direct_media=no
 rtptimeout=60
 rtpholdtimeout=30
+ice_support=no
 
+; ---------------------------------------------------------------------------
+; Authentication — bridge credentials (generated at deploy time)
+; ---------------------------------------------------------------------------
+[tg-bridge-auth]
+type=auth
+username=tg-bridge
+password=simbridge-bridge-secret
+realm=asterisk
+md5_cred=no
+
+; ---------------------------------------------------------------------------
+; Address of Record — single contact, periodic qualification
+; ---------------------------------------------------------------------------
 [tg-bridge-aor]
 type=aor
 max_contacts=1
