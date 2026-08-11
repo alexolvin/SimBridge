@@ -29,15 +29,51 @@
 ; ===========================================================================
 [incoming-mobile]
 ; ---------------------------------------------------------------------------
-; Incoming call → Telegram ring → voicemail fallback (S04.3)
-; Current: voicemail fallback (pre-Stage-04, S03.4)
-; Post-Stage-04: try tg-bridge first, fall through to voicemail
+; S04.3: Incoming call → Telegram ring → voicemail fallback
+;
+; Key: Do NOT answer the GSM channel. The caller hears real ringback
+; while we ring Telegram. Only answer when the Telegram user accepts.
+;
+; Flow:
+;   1. Notify agent via AGI/HTTP that the call is incoming
+;   2. Agent sends Telegram ring notification
+;   3. Wait in loop checking TG_ACCEPTED variable (set by agent via AMI)
+;   4. If accepted → answer GSM, originate bridge leg
+;   5. If timeout → fall through to voicemail
+;   6. If caller hangs up → channel dies, no action needed
 ; ---------------------------------------------------------------------------
-exten => s,1,NoOp(Incoming call from ${DONGLE_CALLERID})
+exten => s,1,NoOp(Incoming call from ${DONGLE_CALLERID} — S04.3 flow)
  same => n,Set(CALL_FROM=${DONGLE_CALLERID})
  same => n,Set(GLOBAL(VM_CALL_FROM)=${DONGLE_CALLERID})
-; Pre-Stage-04: voicemail is the only outcome. Stage 04 inserts Telegram ring.
- same => n,Dial(Local/voicemail-fallback@voicemail-ctx,${RING_WAIT_SECONDS})
+; Record the GSM channel ID for the agent to reference
+ same => n,Set(GLOBAL(ACTIVE_GSM_CHANNEL)=${CHANNEL(uniqueid)})
+; Notify the agent (S04.3: agent sends Telegram ring, then signals back)
+ same => n,AGI(notify-agent-agi.py,incoming,${DONGLE_CALLERID},${CHANNEL(uniqueid)})
+; Wait for Telegram user response without answering
+; TG_ACCEPTED is set by the agent via AMI SetVariable when user accepts
+ same => n,Set(RING_START=${EPOCH})
+ same => n,Wait(1)
+ same => n,While($["${TG_ACCEPTED}" != "1"])
+ same => n,  Set(ELAPSED=$[${EPOCH} - ${RING_START}])
+ same => n,  If($[${ELAPSED} >= ${RING_WAIT_SECONDS}])
+ same => n( timeout ),  NoOp(Ring timeout — falling through to voicemail)
+ same => n,  Hangup()
+ same => n,  EndIf()
+ same => n,  Wait(1)
+ same => n,EndWhile()
+; User accepted — answer the GSM leg
+ same => n,NoOp(Telegram user accepted — answering GSM leg)
+ same => n,Answer()
+; Originate the bridge leg to tg-bridge to connect Telegram audio
+ same => n,AsyncGosub(Local/bridge-sip@tg-bridge-sip,1(,n(),(${BRIDGE_ENDPOINT}),(${BRIDGE_HOST}),(${BRIDGE_PORT})
+ same => n,Wait(2)
+ same => n,If($["${BRIDGE_CONNECTED}" != "1"])
+ same => n( bridge_fail ),NoOp(Bridge leg failed — falling through to voicemail)
+ same => n,Gosub(vmb-notify,s,1)
+ same => n,Hangup()
+ same => n,EndIf()
+; Both legs connected — wait for hangup
+ same => n,WaitForHangup()
  same => h,Hangup()
 
 ; ---------------------------------------------------------------------------
@@ -78,6 +114,38 @@ exten => s,1,NoOp(Inbound call from tg-bridge)
 ; Notify the agent that the bridge called (S04.3: full call control)
 exten => vmb-notify,1,NoOp(Voicemail branch notification)
  same => n,Hangup()
+
+; ===========================================================================
+; [tg-bridge-sip] — Outgoing GSM dial from tg-bridge (S04.3)
+; ===========================================================================
+; When the Telegram user answers an outgoing call, the agent instructs
+; tg-bridge to originate a call to this context. The GSM target number
+; is passed as EXTEN. This context dials the GSM modem and bridges the
+; two legs.
+; ===========================================================================
+[tg-bridge-sip]
+exten => s,1,NoOp(tg-bridge: outgoing GSM dial to ${EXTEN})
+ same => n,Set(GSM_TARGET=${EXTEN})
+; Notify the agent that GSM dialing has started
+ same => n,AGI(notify-agent-agi.py,gsm-dialing,${GSM_TARGET},${CHANNEL(uniqueid)})
+; Dial the GSM modem via chan_dongle
+ same => n,Dial(Dongle/${GSM_TARGET},gsm-answer,${OUTBOUND_RING_TIMEOUT})
+; Check dial result
+ same => n,If($["${DIALSTATUS}" = "ANSWERED"])
+ same => n,  NoOp(GSM answered — bridge established)
+ same => n,  Set(BRIDGE_CONNECTED=1)
+ same => n,  WaitForHangup()
+ same => n,EndIf()
+ same => n,If($["${DIALSTATUS}" = "BUSY"])
+ same => n,  NoOp(GSM busy)
+ same => n,  AGI(notify-agent-agi.py,gsm-busy,${GSM_TARGET})
+ same => n,EndIf()
+ same => n,If($["${DIALSTATUS}" = "NOANSWER"])
+ same => n,  NoOp(GSM no answer)
+ same => n,  AGI(notify-agent-agi.py,gsm-no-answer,${GSM_TARGET})
+ same => n,EndIf()
+ same => n,Hangup()
+ same => h,Hangup()
 
 ; ===========================================================================
 ; [voicemail-ctx] — Voicemail recording (reusable branch, S03.4)

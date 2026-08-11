@@ -5,11 +5,29 @@ S04.2: Bridge wiring. S04.3: Full call control with both directions.
 Each call goes through a deterministic state machine. States are enums,
 transitions are validated, and every transition emits an audit event.
 
-Incoming flow: IDLE -> RINGING -> TELEGRAM_RINGING -> ACCEPTED -> BRIDGED -> HANGUP -> CLEANUP
-Outgoing flow: IDLE -> REQUESTED -> MODEM_RESERVED -> TELEGRAM_CALLING -> ACCEPTED -> GSM_DIALING -> BRIDGED -> HANGUP -> CLEANUP
+Incoming flow (GSM → Telegram):
+    IDLE → RINGING → TELEGRAM_RINGING → TELEGRAM_ACCEPTED → GSM_ANSWERED → BRIDGED → HANGUP → CLEANUP
+    Branches from RINGING:
+      - GSM caller hangs up → HANGUP
+      - Telegram user rejects → REJECTED
+      - Timeout (ring_wait_seconds) → VOICEMAIL
 
-Branches from RINGING: reject -> REJECTED, timeout -> VOICEMAIL, caller-hangup -> HANGUP
-Branches from REQUESTED/TELEGRAM_CALLING: reject -> REJECTED, timeout -> TIMEOUT
+Outgoing flow (Telegram → GSM):
+    IDLE → REQUESTED → ACL_CHECKED → MODEM_RESERVED → TELEGRAM_CALLING
+      → USER_ACCEPTED → GSM_DIALING → GSM_RINGING → CONNECTED → BRIDGED → HANGUP → CLEANUP
+    Branches:
+      - ACL denied → ACL_DENIED (terminal)
+      - Telegram user doesn't answer → TELEGRAM_TIMEOUT (terminal)
+      - GSM busy → GSM_BUSY (terminal)
+      - GSM no answer → GSM_NO_ANSWER (terminal)
+      - GSM network error → GSM_ERROR (terminal)
+
+Bridge legs:
+    gsm_channel_id — Asterisk channel name for the GSM leg (chan_dongle)
+    bridge_channel_id — Asterisk channel name for the bridge leg (PJSIP/tg-bridge)
+
+Symmetric hangup:
+    Either side hanging up triggers HANGUP → CLEANUP, both legs terminated.
 """
 
 from __future__ import annotations
@@ -31,28 +49,56 @@ logger = logging.getLogger("simbridge.call_control")
 
 class CallState(str, Enum):
     """Call lifecycle states."""
+
+    # -- Shared terminal states --
     IDLE = "idle"
-    RINGING = "ringing"
-    TELEGRAM_RINGING = "telegram_ringing"
-    ACCEPTED = "accepted"
-    BRIDGED = "bridged"
     HANGUP = "hangup"
     CLEANUP = "cleanup"
     REJECTED = "rejected"
+
+    # -- Incoming path (GSM → Telegram) --
+    RINGING = "ringing"
+    TELEGRAM_RINGING = "telegram_ringing"
+    TELEGRAM_ACCEPTED = "telegram_accepted"
+    GSM_ANSWERED = "gsm_answered"
     VOICEMAIL = "voicemail"
+
+    # -- Outgoing path (Telegram → GSM) --
     REQUESTED = "requested"
+    ACL_CHECKED = "acl_checked"
+    ACL_DENIED = "acl_denied"
     MODEM_RESERVED = "modem_reserved"
     TELEGRAM_CALLING = "telegram_calling"
+    USER_ACCEPTED = "user_accepted"
     GSM_DIALING = "gsm_dialing"
-    TIMEOUT = "timeout"
+    GSM_RINGING = "gsm_ringing"
+    GSM_BUSY = "gsm_busy"
+    GSM_NO_ANSWER = "gsm_no_answer"
+    GSM_ERROR = "gsm_error"
+    CONNECTED = "connected"
+    TELEGRAM_TIMEOUT = "telegram_timeout"
+
+    # -- Both directions --
+    BRIDGED = "bridged"
 
 
 # Valid state transitions per direction
 _INCOMING_TRANSITIONS: Dict[CallState, List[CallState]] = {
     CallState.IDLE: [CallState.RINGING],
-    CallState.RINGING: [CallState.TELEGRAM_RINGING, CallState.REJECTED, CallState.HANGUP, CallState.VOICEMAIL],
-    CallState.TELEGRAM_RINGING: [CallState.ACCEPTED, CallState.REJECTED, CallState.HANGUP, CallState.VOICEMAIL],
-    CallState.ACCEPTED: [CallState.BRIDGED, CallState.HANGUP],
+    CallState.RINGING: [
+        CallState.TELEGRAM_RINGING,
+        CallState.REJECTED,
+        CallState.HANGUP,
+        CallState.VOICEMAIL,
+    ],
+    CallState.TELEGRAM_RINGING: [
+        CallState.TELEGRAM_ACCEPTED,
+        CallState.REJECTED,
+        CallState.HANGUP,
+        CallState.VOICEMAIL,
+    ],
+    CallState.TELEGRAM_ACCEPTED: [CallState.GSM_ANSWERED, CallState.HANGUP],
+    CallState.GSM_ANSWERED: [CallState.BRIDGED, CallState.HANGUP],
     CallState.BRIDGED: [CallState.HANGUP],
     CallState.HANGUP: [CallState.CLEANUP],
     CallState.VOICEMAIL: [CallState.HANGUP],
@@ -60,13 +106,42 @@ _INCOMING_TRANSITIONS: Dict[CallState, List[CallState]] = {
 
 _OUTGOING_TRANSITIONS: Dict[CallState, List[CallState]] = {
     CallState.IDLE: [CallState.REQUESTED],
-    CallState.REQUESTED: [CallState.MODEM_RESERVED, CallState.REJECTED],
-    CallState.MODEM_RESERVED: [CallState.TELEGRAM_CALLING, CallState.REJECTED, CallState.TIMEOUT],
-    CallState.TELEGRAM_CALLING: [CallState.ACCEPTED, CallState.REJECTED, CallState.TIMEOUT],
-    CallState.ACCEPTED: [CallState.GSM_DIALING],
-    CallState.GSM_DIALING: [CallState.BRIDGED, CallState.HANGUP],
+    CallState.REQUESTED: [CallState.ACL_CHECKED, CallState.REJECTED],
+    CallState.ACL_CHECKED: [CallState.ACL_DENIED, CallState.MODEM_RESERVED],
+    CallState.MODEM_RESERVED: [
+        CallState.TELEGRAM_CALLING,
+        CallState.REJECTED,
+        CallState.TELEGRAM_TIMEOUT,
+    ],
+    CallState.TELEGRAM_CALLING: [
+        CallState.USER_ACCEPTED,
+        CallState.REJECTED,
+        CallState.TELEGRAM_TIMEOUT,
+    ],
+    CallState.USER_ACCEPTED: [CallState.GSM_DIALING],
+    CallState.GSM_DIALING: [
+        CallState.GSM_RINGING,
+        CallState.GSM_BUSY,
+        CallState.GSM_NO_ANSWER,
+        CallState.GSM_ERROR,
+    ],
+    CallState.GSM_RINGING: [CallState.CONNECTED, CallState.GSM_NO_ANSWER, CallState.GSM_ERROR],
+    CallState.CONNECTED: [CallState.BRIDGED, CallState.HANGUP],
     CallState.BRIDGED: [CallState.HANGUP],
     CallState.HANGUP: [CallState.CLEANUP],
+}
+
+# Terminal states — no further transitions expected
+_TERMINAL_STATES = {
+    CallState.CLEANUP,
+    CallState.REJECTED,
+    CallState.HANGUP,
+    CallState.VOICEMAIL,
+    CallState.ACL_DENIED,
+    CallState.TELEGRAM_TIMEOUT,
+    CallState.GSM_BUSY,
+    CallState.GSM_NO_ANSWER,
+    CallState.GSM_ERROR,
 }
 
 
@@ -76,6 +151,10 @@ class InvalidTransition(Exception):
 
 class ModemBusyError(Exception):
     """Raised when the modem is already in use."""
+
+
+class ACLDeniedError(Exception):
+    """Raised when a call request fails ACL check."""
 
 
 @dataclass
@@ -93,6 +172,14 @@ class CallMachine:
     created_at: str = ""
     updated_at: str = ""
     error: Optional[str] = None
+
+    # Bridge leg tracking (S04.3)
+    gsm_channel_id: Optional[str] = None
+    bridge_channel_id: Optional[str] = None
+
+    # Telegram call session tracking
+    telegram_user_id: Optional[int] = None
+    telegram_call_id: Optional[str] = None
 
     # Dependency references (set by registry)
     _sms_store: Optional[SMSCorrelationStore] = None
@@ -130,6 +217,37 @@ class CallMachine:
             new_state.value,
         )
 
+    @property
+    def is_terminal(self) -> bool:
+        """Return True if the call is in a terminal state."""
+        return self.state in _TERMINAL_STATES
+
+    @property
+    def is_active(self) -> bool:
+        """Return True if the call has active legs (not in a terminal state)."""
+        return not self.is_terminal
+
+    def check_duration_exceeded(self, max_seconds: int) -> bool:
+        """Check if the call duration has exceeded max_seconds.
+
+        Returns True if the call should be hung up due to duration limit.
+        """
+        try:
+            created = datetime.fromisoformat(self.created_at)
+            elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+            return elapsed > max_seconds
+        except (ValueError, TypeError):
+            return False
+
+    def get_active_channel_ids(self) -> List[str]:
+        """Return list of active Asterisk channel IDs for this call."""
+        channels = []
+        if self.gsm_channel_id:
+            channels.append(self.gsm_channel_id)
+        if self.bridge_channel_id:
+            channels.append(self.bridge_channel_id)
+        return channels
+
     def to_dict(self) -> dict:
         """Serialize call state for API responses."""
         return {
@@ -144,13 +262,18 @@ class CallMachine:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
+            "gsm_channel_id": self.gsm_channel_id,
+            "bridge_channel_id": self.bridge_channel_id,
+            "telegram_user_id": self.telegram_user_id,
+            "telegram_call_id": self.telegram_call_id,
+            "is_terminal": self.is_terminal,
         }
 
 
 class CallRegistry:
     """Thread-safe registry of active calls.
 
-    Manages call lifecycle and modem reservation.
+    Manages call lifecycle, modem reservation, and timeout handling.
     """
 
     def __init__(
@@ -169,20 +292,32 @@ class CallRegistry:
         caller_number: str,
         caller_name: Optional[str] = None,
         modem_id: str = "gsm",
+        gsm_channel_id: Optional[str] = None,
     ) -> CallMachine:
-        """Create a new incoming call (GSM -> Telegram)."""
+        """Create a new incoming call (GSM -> Telegram).
+
+        Starts in RINGING state. GSM channel is NOT answered yet —
+        the caller hears real ringback while we ring Telegram.
+        """
         call = CallMachine(
             call_id=uuid.uuid4().hex,
             direction="incoming",
             caller_number=caller_number,
             caller_name=caller_name,
             modem_id=modem_id,
+            gsm_channel_id=gsm_channel_id,
         )
         call._sms_store = self._sms_store
         call._audit = self._audit
         call.transition(CallState.RINGING)
         with self._lock:
             self._calls[call.call_id] = call
+        logger.info(
+            "Incoming call %s from %s (%s)",
+            call.call_id[:8],
+            caller_number,
+            caller_name or "unknown",
+        )
         return call
 
     def create_outgoing(
@@ -191,8 +326,13 @@ class CallRegistry:
         caller_number: str = "simbridge",
         callee_name: Optional[str] = None,
         modem_id: str = "gsm",
+        telegram_user_id: Optional[int] = None,
     ) -> CallMachine:
-        """Create a new outgoing call (Telegram -> GSM)."""
+        """Create a new outgoing call (Telegram -> GSM).
+
+        Starts in REQUESTED state. ACL check happens before this
+        (in the route handler). Modem is reserved atomically.
+        """
         if self._modems_reserved > 0:
             raise ModemBusyError("Modem is already in use")
         call = CallMachine(
@@ -202,14 +342,24 @@ class CallRegistry:
             callee_number=callee_number,
             callee_name=callee_name,
             modem_id=modem_id,
+            telegram_user_id=telegram_user_id,
         )
         call._sms_store = self._sms_store
         call._audit = self._audit
         call.transition(CallState.REQUESTED)
+        # ACL check happens before this (in the route handler).
+        # We transition through ACL_CHECKED to record that the check passed.
+        call.transition(CallState.ACL_CHECKED)
         self._modems_reserved += 1
         call.transition(CallState.MODEM_RESERVED)
         with self._lock:
             self._calls[call.call_id] = call
+        logger.info(
+            "Outgoing call %s to %s (user %s)",
+            call.call_id[:8],
+            callee_number,
+            telegram_user_id or "unknown",
+        )
         return call
 
     def get(self, call_id: str) -> Optional[CallMachine]:
@@ -234,14 +384,18 @@ class CallRegistry:
             call = self._calls.pop(call_id, None)
             if call and call.direction == "outgoing":
                 self._modems_reserved = max(0, self._modems_reserved - 1)
+            if call:
+                logger.info("Cleaned up call %s (was %s)", call.call_id[:8], call.state.value)
 
     def list_active(self) -> List[CallMachine]:
-        """Return all non-CLEANUP calls."""
+        """Return all non-terminal calls."""
         with self._lock:
-            return [
-                c for c in self._calls.values()
-                if c.state != CallState.CLEANUP
-            ]
+            return [c for c in self._calls.values() if c.is_active]
+
+    def list_all(self) -> List[CallMachine]:
+        """Return all calls including terminal ones."""
+        with self._lock:
+            return list(self._calls.values())
 
     def count_by_state(self, state: CallState) -> int:
         """Count calls in a specific state."""
@@ -253,5 +407,196 @@ class CallRegistry:
         with self._lock:
             return sum(
                 1 for c in self._calls.values()
-                if c.direction == direction and c.state != CallState.CLEANUP
+                if c.direction == direction and c.is_active
             )
+
+    # -----------------------------------------------------------------------
+    # Higher-level call orchestration (S04.3)
+    # -----------------------------------------------------------------------
+
+    def start_telegram_ring(self, call_id: str) -> bool:
+        """Transition from RINGING → TELEGRAM_RINGING.
+
+        Called after sending the Telegram notification to the user.
+        """
+        return self.transition(call_id, CallState.TELEGRAM_RINGING)
+
+    def accept_incoming(self, call_id: str) -> bool:
+        """Transition from TELEGRAM_RINGING → TELEGRAM_ACCEPTED.
+
+        Called when the Telegram user accepts the incoming call.
+        Next step: answer the GSM leg.
+        """
+        return self.transition(call_id, CallState.TELEGRAM_ACCEPTED)
+
+    def answer_gsm(self, call_id: str, gsm_channel_id: Optional[str] = None) -> bool:
+        """Transition from TELEGRAM_ACCEPTED → GSM_ANSWERED.
+
+        Called after answering the GSM leg via AMI.
+        """
+        ok = self.transition(call_id, CallState.GSM_ANSWERED)
+        if ok and gsm_channel_id:
+            call = self.get(call_id)
+            if call:
+                call.gsm_channel_id = gsm_channel_id
+        return ok
+
+    def set_bridge_leg(self, call_id: str, channel_id: str) -> bool:
+        """Record the bridge channel ID.
+
+        Called when the PJSIP bridge leg is established.
+        """
+        with self._lock:
+            call = self._calls.get(call_id)
+            if not call:
+                return False
+            call.bridge_channel_id = channel_id
+            return True
+
+    def bridge_call(self, call_id: str) -> bool:
+        """Transition to BRIDGED state.
+
+        Called when both legs are connected and bridged.
+        """
+        return self.transition(call_id, CallState.BRIDGED)
+
+    def hangup(self, call_id: str, reason: Optional[str] = None) -> bool:
+        """Transition to HANGUP. Optionally record the reason."""
+        ok = self.transition(call_id, CallState.HANGUP)
+        if ok and reason:
+            call = self.get(call_id)
+            if call:
+                call.error = reason
+        return ok
+
+    def reject(self, call_id: str, reason: Optional[str] = None) -> bool:
+        """Transition to REJECTED. Optionally record the reason."""
+        ok = self.transition(call_id, CallState.REJECTED)
+        if ok and reason:
+            call = self.get(call_id)
+            if call:
+                call.error = reason
+        return ok
+
+    def fallback_to_voicemail(self, call_id: str) -> bool:
+        """Transition to VOICEMAIL. Called on ring timeout."""
+        return self.transition(call_id, CallState.VOICEMAIL)
+
+    # -- Outgoing-specific orchestration --
+
+    def start_telegram_calling(self, call_id: str) -> bool:
+        """Transition from MODEM_RESERVED → TELEGRAM_CALLING.
+
+        Called when the Telegram call invitation is sent.
+        """
+        return self.transition(call_id, CallState.TELEGRAM_CALLING)
+
+    def user_accepted(self, call_id: str) -> bool:
+        """Transition from TELEGRAM_CALLING → USER_ACCEPTED.
+
+        Called when the Telegram user answers the outgoing call.
+        """
+        return self.transition(call_id, CallState.USER_ACCEPTED)
+
+    def dial_gsm(self, call_id: str, gsm_channel_id: Optional[str] = None) -> bool:
+        """Transition from USER_ACCEPTED → GSM_DIALING.
+
+        Called when we start dialing the GSM number.
+        """
+        ok = self.transition(call_id, CallState.GSM_DIALING)
+        if ok and gsm_channel_id:
+            call = self.get(call_id)
+            if call:
+                call.gsm_channel_id = gsm_channel_id
+        return ok
+
+    def gsm_ringing(self, call_id: str) -> bool:
+        """Transition from GSM_DIALING → GSM_RINGING.
+
+        Called when the GSM side is ringing.
+        """
+        return self.transition(call_id, CallState.GSM_RINGING)
+
+    def gsm_connected(self, call_id: str) -> bool:
+        """Transition from GSM_RINGING → CONNECTED.
+
+        Called when the GSM call is answered.
+        """
+        return self.transition(call_id, CallState.CONNECTED)
+
+    def gsm_busy(self, call_id: str) -> bool:
+        """Transition to GSM_BUSY (terminal)."""
+        return self.transition(call_id, CallState.GSM_BUSY)
+
+    def gsm_no_answer(self, call_id: str) -> bool:
+        """Transition to GSM_NO_ANSWER (terminal)."""
+        return self.transition(call_id, CallState.GSM_NO_ANSWER)
+
+    def gsm_error(self, call_id: str, reason: Optional[str] = None) -> bool:
+        """Transition to GSM_ERROR (terminal)."""
+        ok = self.transition(call_id, CallState.GSM_ERROR)
+        if ok and reason:
+            call = self.get(call_id)
+            if call:
+                call.error = reason
+        return ok
+
+    def telegram_timeout(self, call_id: str) -> bool:
+        """Transition to TELEGRAM_TIMEOUT (terminal)."""
+        return self.transition(call_id, CallState.TELEGRAM_TIMEOUT)
+
+    def set_telegram_call_id(self, call_id: str, tg_call_id: str) -> bool:
+        """Record the Telegram call session ID."""
+        with self._lock:
+            call = self._calls.get(call_id)
+            if not call:
+                return False
+            call.telegram_call_id = tg_call_id
+            return True
+
+    # -- Timeout/duration checking --
+
+    def get_timed_out_calls(
+        self, ring_wait_seconds: int, max_call_seconds: int
+    ) -> List[CallMachine]:
+        """Return calls that have exceeded their timeout.
+
+        Checks:
+        - Ringing calls that exceeded ring_wait_seconds
+        - Bridged calls that exceeded max_call_seconds
+        """
+        now = datetime.now(timezone.utc)
+        timed_out = []
+
+        with self._lock:
+            for call in self._calls.values():
+                if call.is_terminal:
+                    continue
+                try:
+                    created = datetime.fromisoformat(call.created_at)
+                    elapsed = (now - created).total_seconds()
+                except (ValueError, TypeError):
+                    continue
+
+                if call.state in (CallState.RINGING, CallState.TELEGRAM_RINGING):
+                    if elapsed > ring_wait_seconds:
+                        timed_out.append(call)
+                elif call.state == CallState.BRIDGED:
+                    if elapsed > max_call_seconds:
+                        timed_out.append(call)
+
+        return timed_out
+
+    # -- Orphan channel detection --
+
+    def get_orphan_channel_ids(self) -> List[str]:
+        """Return all channel IDs registered to active calls.
+
+        Used to detect orphan channels in Asterisk after cleanup.
+        """
+        channels = []
+        with self._lock:
+            for call in self._calls.values():
+                if not call.is_terminal:
+                    channels.extend(call.get_active_channel_ids())
+        return channels

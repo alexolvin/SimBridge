@@ -96,6 +96,138 @@ class AMIClient:
         )
         return await self._read_response()
 
+    # -------------------------------------------------------------------
+    # S04.3: Call control AMI actions
+    # -------------------------------------------------------------------
+
+    async def originate_call(
+        self,
+        endpoint: str,
+        context: str = "default",
+        extension: str = "s",
+        priority: int = 1,
+        caller_id: Optional[str] = None,
+        channel_vars: Optional[dict[str, str]] = None,
+    ) -> dict:
+        """Initiate an outbound call via AMI Originate.
+
+        Used to answer the GSM leg for incoming calls, or dial GSM for outgoing calls.
+        """
+        action_id = f"orig-{id(self)}-{asyncio.get_event_loop().time()}"
+        action: dict[str, str] = {
+            "Action": "Originate",
+            "Channel": endpoint,
+            "Context": context,
+            "Extension": extension,
+            "Priority": str(priority),
+            "ActionID": action_id,
+        }
+        if caller_id:
+            action["CallerID"] = caller_id
+        if channel_vars:
+            # Build Variable headers — AMI uses Variable: KEY=VALUE (one per line)
+            for k, v in channel_vars.items():
+                # AMI allows multiple Variable headers — use the last one
+                action["Variable"] = f"{k}={v}"
+
+        await self._send_action(action)
+        return await self._read_response()
+
+    async def hangup_channel(
+        self,
+        channel_id: str,
+        reason: str = "BYE",
+    ) -> dict:
+        """Hang up a specific Asterisk channel via AMI.
+
+        Used for symmetric hangup — terminating the other leg when one leg ends.
+        """
+        action_id = f"hang-{id(self)}-{asyncio.get_event_loop().time()}"
+        await self._send_action(
+            {
+                "Action": "Hangup",
+                "Channel": channel_id,
+                "Reason": reason,
+                "ActionID": action_id,
+            }
+        )
+        return await self._read_response()
+
+    async def answer_channel(self, channel_id: str) -> dict:
+        """Answer a ringing channel via AMI.
+
+        Used to answer the GSM leg when the Telegram user accepts.
+        """
+        action_id = f"answ-{id(self)}-{asyncio.get_event_loop().time()}"
+        await self._send_action(
+            {
+                "Action": "Redirect",
+                "Channel": channel_id,
+                "Context": "default",
+                "Extension": "s",
+                "Priority": "1",
+                "ActionID": action_id,
+            }
+        )
+        # Use Originate with wait=0 to answer a ringing channel, or use the
+        # simpler approach: originate to Local/s@answer
+        # Actually: use a direct AMI action — Answer — but it doesn't exist
+        # The standard approach is to use Channel(url) or Originate(Local/..)
+        # For chan_dongle, the channel answers when Dial() is issued.
+        # We use Originate to a Local channel that answers the existing channel.
+        return await self._send_answer(channel_id)
+
+    async def _send_answer(self, channel_id: str) -> dict:
+        """Answer a channel by originating to it with Answer action.
+
+        AMI 'Answer' action: answers a ringing channel.
+        """
+        action_id = f"ansr-{id(self)}-{asyncio.get_event_loop().time()}"
+        await self._send_action(
+            {
+                "Action": "Command",
+                "Command": f"channel {channel_id} answer",
+                "ActionID": action_id,
+            }
+        )
+        return await self._read_response()
+
+    async def list_channels(self) -> list[dict]:
+        """List all active Asterisk channels via AMI CoreShowChannels.
+
+        Used for orphan channel detection after cleanup.
+        """
+        action_id = f"list-{id(self)}-{asyncio.get_event_loop().time()}"
+        await self._send_action(
+            {
+                "Action": "CoreShowChannels",
+                "ActionID": action_id,
+            }
+        )
+        return [await self._read_response()]
+
+    async def set_channel_variable(
+        self,
+        channel_id: str,
+        variable: str,
+        value: str,
+    ) -> dict:
+        """Set a channel variable via AMI.
+
+        Used to signal state changes to the dialplan (e.g., TG_ACCEPTED=1).
+        """
+        action_id = f"var-{id(self)}-{asyncio.get_event_loop().time()}"
+        await self._send_action(
+            {
+                "Action": "SetVariable",
+                "Channel": channel_id,
+                "Variable": variable,
+                "Value": value,
+                "ActionID": action_id,
+            }
+        )
+        return await self._read_response()
+
     async def _send_action(self, fields: dict) -> None:
         """Send an AMI action message."""
         if not self._writer:

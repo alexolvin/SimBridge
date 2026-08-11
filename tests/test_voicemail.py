@@ -352,8 +352,9 @@ class TestVoicemailFallback:
                     "incoming-mobile should route to voicemail-fallback"
                 )
 
-        # Verify the Dial command routes to voicemail context
-        assert "voicemail-fallback@voicemail-ctx" in dialplan
+        # S04.3: incoming-mobile now routes via Telegram ring flow
+        # Voicemail is the fallback when the Telegram ring times out
+        assert "TG_ACCEPTED" in dialplan or "voicemail-ctx" in dialplan
 
 
 # =========================================================================

@@ -138,3 +138,8 @@ def get_sms_store(request: Request):
 def get_call_registry(request: Request):
     """Get CallRegistry from app state (S04.2)."""
     return request.app.state.call_registry
+
+
+def get_acl(request: Request):
+    """Get ACLManager from app state (S04.3)."""
+    return request.app.state.acl

@@ -18,6 +18,7 @@ from core.ratelimit import RateLimiter
 from core.blacklist import BlacklistManager
 from core.sms_correlation import SMSCorrelationStore
 from core.errors import SMSErrorType
+from core.acl import ACLManager
 from agent.ami_client import AMIClient
 from agent.deps import (
     require_auth,
@@ -28,6 +29,7 @@ from agent.deps import (
     get_blacklist,
     get_sms_store,
     get_call_registry,
+    get_acl,
 )
 from core.call_control import CallRegistry, CallState, InvalidTransition, ModemBusyError
 
@@ -321,7 +323,11 @@ async def call_incoming(
     registry: CallRegistry = Depends(get_call_registry),
     audit: AuditLogger = Depends(get_audit),
 ):
-    """Register an incoming GSM → Telegram call."""
+    """Register an incoming GSM → Telegram call.
+
+    S04.3: The GSM channel is NOT answered — the caller hears real ringback
+    while we ring Telegram. The user must accept before we answer the GSM leg.
+    """
     call = registry.create_incoming(
         caller_number=req.phone_number,
         caller_name=req.contact_name,
@@ -347,9 +353,33 @@ async def call_outgoing(
     request: Request,
     registry: CallRegistry = Depends(get_call_registry),
     blacklist: BlacklistManager = Depends(get_blacklist),
+    acl: ACLManager = Depends(get_acl),
     audit: AuditLogger = Depends(get_audit),
 ):
-    """Register an outgoing Telegram → GSM call."""
+    """Register an outgoing Telegram → GSM call.
+
+    S04.3: ACL is checked BEFORE any call session is created.
+    Never call the user first and authorize afterwards.
+    """
+    # ACL check — before any call session (GPT §26)
+    if req.telegram_user_id and not acl.check(req.telegram_user_id, "out_call"):
+        audit.log(
+            EventType.CALL_ACL_CHECK,
+            telegram_user_id=req.telegram_user_id,
+            outcome="denied",
+            details={"to": req.phone_number},
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to place outgoing calls",
+        )
+    audit.log(
+        EventType.CALL_ACL_CHECK,
+        telegram_user_id=req.telegram_user_id,
+        outcome="allowed",
+        details={"to": req.phone_number},
+    )
+
     if blacklist.contains(req.phone_number):
         raise HTTPException(
             status_code=403,
@@ -359,6 +389,7 @@ async def call_outgoing(
         call = registry.create_outgoing(
             callee_number=req.phone_number,
             caller_number=f"user:{req.telegram_user_id or 0}",
+            telegram_user_id=req.telegram_user_id,
         )
     except ModemBusyError:
         raise HTTPException(status_code=503, detail="Modem busy — another call in progress")
@@ -383,17 +414,34 @@ async def call_accept(
     call_id: str,
     request: Request,
     registry: CallRegistry = Depends(get_call_registry),
+    ami: AMIClient = Depends(get_ami),
+    audit: AuditLogger = Depends(get_audit),
 ):
-    """Accept an incoming call → bridge GSM leg."""
+    """Accept an incoming call → Telegram accepted → answer GSM → bridge.
+
+    S04.3: The GSM leg was NOT answered while Telegram was ringing.
+    Accept transitions: TELEGRAM_RINGING → TELEGRAM_ACCEPTED.
+    Then the GSM leg is answered via AMI, and the bridge leg is initiated.
+    """
     call = registry.get(call_id)
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
-    ok = registry.transition(call_id, CallState.ACCEPTED)
+
+    # Transition to accepted
+    ok = registry.accept_incoming(call_id)
     if not ok:
         raise HTTPException(
             status_code=409,
             detail=f"Cannot accept — call is in {call.state.value} state",
         )
+
+    audit.log(
+        EventType.CALL_ACCEPTED,
+        correlation_id=call_id,
+        outcome="ok",
+        details={"from": call.caller_number, "direction": call.direction},
+    )
+
     return CallStateResponse(
         call_id=call_id,
         state=call.state.value,
@@ -401,22 +449,135 @@ async def call_accept(
     )
 
 
+@router.post("/call/{call_id}/answer-gsm", response_model=CallStateResponse)
+async def call_answer_gsm(
+    call_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    ami: AMIClient = Depends(get_ami),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Answer the GSM leg after Telegram user accepts.
+
+    S04.3: Called after accept. Answers the GSM channel and initiates
+    the bridge leg to tg-bridge.
+    """
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    # Answer the GSM channel
+    if call.gsm_channel_id:
+        try:
+            await ami.answer_channel(call.gsm_channel_id)
+        except Exception as e:
+            audit.log(
+                EventType.CALL_GSM_ANSWERED,
+                correlation_id=call_id,
+                outcome="error",
+                details={"error": str(e)},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to answer GSM channel: {e}",
+            )
+
+    ok = registry.answer_gsm(call_id, gsm_channel_id=call.gsm_channel_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot answer GSM — call is in {call.state.value} state",
+        )
+
+    audit.log(
+        EventType.CALL_GSM_ANSWERED,
+        correlation_id=call_id,
+        outcome="ok",
+    )
+
+    return CallStateResponse(
+        call_id=call_id,
+        state=call.state.value,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/{call_id}/bridge", response_model=CallStateResponse)
+async def call_bridge(
+    call_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Mark both legs as bridged.
+
+    S04.3: Called when the PJSIP bridge leg connects to the GSM leg.
+    """
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    ok = registry.bridge_call(call_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot bridge — call is in {call.state.value} state",
+        )
+
+    audit.log(
+        EventType.CALL_BRIDGED,
+        correlation_id=call_id,
+        outcome="ok",
+        details={
+            "gsm_channel": call.gsm_channel_id,
+            "bridge_channel": call.bridge_channel_id,
+        },
+    )
+
+    return CallStateResponse(
+        call_id=call_id,
+        state=call.state.value,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/{call_id}/set-bridge-leg")
+async def call_set_bridge_leg(
+    call_id: str,
+    channel_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """Record the bridge channel ID."""
+    ok = registry.set_bridge_leg(call_id, channel_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return {"ok": True, "call_id": call_id, "bridge_channel_id": channel_id}
+
+
 @router.post("/call/{call_id}/reject", response_model=CallStateResponse)
 async def call_reject(
     call_id: str,
     request: Request,
     registry: CallRegistry = Depends(get_call_registry),
+    audit: AuditLogger = Depends(get_audit),
 ):
-    """Reject an incoming call."""
+    """Reject an incoming call → hang up GSM leg, audit the reason."""
     call = registry.get(call_id)
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
-    ok = registry.transition(call_id, CallState.REJECTED)
+    ok = registry.reject(call_id, reason="user_rejected")
     if not ok:
         raise HTTPException(
             status_code=409,
             detail=f"Cannot reject — call is in {call.state.value} state",
         )
+    audit.log(
+        EventType.CALL_REJECTED,
+        correlation_id=call_id,
+        outcome="user_rejected",
+        details={"from": call.caller_number},
+    )
     registry.cleanup(call_id)
     return CallStateResponse(
         call_id=call_id,
@@ -430,23 +591,136 @@ async def call_hangup(
     call_id: str,
     request: Request,
     registry: CallRegistry = Depends(get_call_registry),
+    ami: AMIClient = Depends(get_ami),
+    audit: AuditLogger = Depends(get_audit),
 ):
-    """Hang up a call → cleanup both legs."""
+    """Hang up a call → symmetric hangup, terminate both legs, cleanup.
+
+    S04.3: Either side hanging up terminates both legs. No orphan channels.
+    """
     call = registry.get(call_id)
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
-    ok = registry.transition(call_id, CallState.HANGUP)
+
+    # Symmetric hangup: terminate the other leg if it exists
+    channels = call.get_active_channel_ids()
+    for channel_id in channels:
+        try:
+            await ami.hangup_channel(channel_id, reason="BYE")
+        except Exception as e:
+            audit.log(
+                EventType.CALL_HANGUP,
+                correlation_id=call_id,
+                outcome="partial_hangup",
+                details={"error": str(e), "channel": channel_id},
+            )
+
+    ok = registry.hangup(call_id)
     if not ok:
         raise HTTPException(
             status_code=409,
             detail=f"Cannot hangup — call is in {call.state.value} state",
         )
+
+    audit.log(
+        EventType.CALL_HANGUP,
+        correlation_id=call_id,
+        outcome="ok",
+        details={"channels_terminated": len(channels)},
+    )
+
     registry.cleanup(call_id)
     return CallStateResponse(
         call_id=call_id,
         state=call.state.value,
         direction=call.direction,
     )
+
+
+@router.post("/call/{call_id}/telegram-ring")
+async def call_telegram_ring(
+    call_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Start Telegram ringing for an incoming call.
+
+    S04.3: After the GSM caller is ringing, we notify Telegram.
+    Transition: RINGING → TELEGRAM_RINGING.
+    """
+    call = registry.get(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    ok = registry.start_telegram_ring(call_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot start telegram ring — call is in {call.state.value} state",
+        )
+    audit.log(
+        EventType.CALL_TELEGRAM_RING,
+        correlation_id=call_id,
+        outcome="ok",
+        details={"from": call.caller_number},
+    )
+    return {"ok": True, "call_id": call_id}
+
+
+@router.post("/call/{call_id}/set-gsm-channel")
+async def call_set_gsm_channel(
+    call_id: str,
+    channel_id: str,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+):
+    """Record the GSM channel ID for this call."""
+    with registry._lock:
+        call = registry._calls.get(call_id)
+        if not call:
+            raise HTTPException(status_code=404, detail="Call not found")
+        call.gsm_channel_id = channel_id
+    return {"ok": True, "call_id": call_id, "gsm_channel_id": channel_id}
+
+
+@router.post("/call/check-timeouts")
+async def call_check_timeouts(
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    cfg: dict = Depends(get_cfg),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Check for calls that have exceeded ring_wait or max_call_seconds.
+
+    S04.3: Fallback to voicemail on ring timeout.
+    """
+    ring_wait = cfg.get("asterisk", {}).get("ring_wait_seconds", 24)
+    max_call = cfg.get("limits", {}).get("max_call_seconds", 1800)
+
+    timed_out = registry.get_timed_out_calls(ring_wait, max_call)
+    handled: list[dict] = []
+
+    for call in timed_out:
+        if call.state in (CallState.RINGING, CallState.TELEGRAM_RINGING):
+            registry.fallback_to_voicemail(call.call_id)
+            audit.log(
+                EventType.CALL_TELEGRAM_TIMEOUT,
+                correlation_id=call.call_id,
+                outcome="voicemail_fallback",
+                details={"from": call.caller_number},
+            )
+            handled.append({"call_id": call.call_id, "action": "voicemail"})
+        elif call.state == CallState.BRIDGED:
+            registry.hangup(call.call_id, reason="max_duration_exceeded")
+            audit.log(
+                EventType.CALL_DURATION_EXPIRED,
+                correlation_id=call.call_id,
+                outcome="max_duration",
+            )
+            registry.cleanup(call.call_id)
+            handled.append({"call_id": call.call_id, "action": "hangup_duration"})
+
+    return {"timed_out": len(handled), "actions": handled}
 
 
 @router.get("/call/{call_id}", response_model=CallStateResponse)

@@ -65,6 +65,11 @@ def generate(config: dict, output_path: str) -> None:
     content += f"BRIDGE_HOST={bridge_host}\n"
     content += f"BRIDGE_PORT={bridge_port}\n"
     content += f"OUTBOUND_RING_TIMEOUT={outbound_timeout}\n"
+    # S04.3: Call duration limit
+    limits = config.get("limits", {})
+    max_call = int(limits.get("max_call_seconds", 1800))
+    content += f"; Call limits (S04.3)\n"
+    content += f"MAX_CALL_SECONDS={max_call}\n"
 
     out = Path(output_path)
     out.write_text(content, encoding="utf-8")

@@ -19,6 +19,7 @@ from core.contacts import ContactResolver
 from core.blacklist import BlacklistManager
 from core.sms_correlation import SMSCorrelationStore
 from core.call_control import CallRegistry
+from core.acl import ACLManager
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
@@ -91,6 +92,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize call registry (S04.2)
     call_registry = CallRegistry(sms_store=sms_store, audit=audit)
     app.state.call_registry = call_registry
+
+    # Initialize ACL manager (S04.3)
+    acl = ACLManager(path=cfg["telegram.acl_file"])
+    app.state.acl = acl
 
     # Initialize auth/replay state from config
     init_deps(app)
