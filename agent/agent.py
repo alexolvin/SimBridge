@@ -15,6 +15,9 @@ from fastapi import FastAPI
 
 from core.config import load_config, redact_config
 from core.audit import AuditLogger
+from core.contacts import ContactResolver
+from core.blacklist import BlacklistManager
+from core.sms_correlation import SMSCorrelationStore
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
@@ -71,6 +74,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         max_requests=cfg["limits.sms_per_hour"],
         window_seconds=3600,
     )
+
+    # Initialize contact resolver (S02.1)
+    contacts = ContactResolver(csv_path=cfg["paths.contacts_cache"])
+    app.state.contacts = contacts
+
+    # Initialize blacklist manager (S02.2)
+    blacklist = BlacklistManager(path=cfg["paths.blacklist"])
+    app.state.blacklist = blacklist
+
+    # Initialize SMS correlation store (S02.3)
+    sms_store = SMSCorrelationStore()
+    app.state.sms_store = sms_store
 
     # Initialize auth/replay state from config
     init_deps(app)

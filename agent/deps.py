@@ -118,3 +118,18 @@ def get_audit(request: Request):
 def get_sms_limiter(request: Request):
     """Get SMS RateLimiter from app state."""
     return request.app.state.sms_limiter
+
+
+def get_contacts(request: Request):
+    """Get ContactResolver from app state."""
+    return request.app.state.contacts
+
+
+def get_blacklist(request: Request):
+    """Get BlacklistManager from app state."""
+    return request.app.state.blacklist
+
+
+def get_sms_store(request: Request):
+    """Get SMSCorrelationStore from app state."""
+    return request.app.state.sms_store

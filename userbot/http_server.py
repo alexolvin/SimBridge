@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import os
 from logging import getLogger
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 
 from core.acl import ACLManager
 from core.audit import AuditLogger
+from core.contacts import ContactResolver
 from core.events import EventType, SMSEvent
 
 logger = getLogger("simbridge.userbot.http")
@@ -23,6 +25,7 @@ def create_http_server(
     allowed_peers: list[str],
     acl: ACLManager,
     audit: AuditLogger,
+    contacts: Optional[ContactResolver] = None,
 ) -> FastAPI:
     """Create the HTTP server for receiving Asterisk events."""
 
@@ -31,6 +34,7 @@ def create_http_server(
     app.state.allowed_peers = allowed_peers
     app.state.acl = acl
     app.state.audit = audit
+    app.state.contacts = contacts
 
     @app.post("/events/sms")
     async def handle_sms_event(req: Request):
@@ -57,6 +61,16 @@ def create_http_server(
             modem_id=body.get("modem_id", "gsm"),
         )
 
+        # S02.1: Format with contact name if available
+        formatted_text = sms_event.text
+        if contacts:
+            from core.phone import normalize_e164
+            name = contacts.resolve(sms_event.phone_number)
+            if name:
+                formatted_text = f"SMS {sms_event.phone_number} ({name}):\n{sms_event.text}"
+            else:
+                formatted_text = f"SMS {sms_event.phone_number}:\n{sms_event.text}"
+
         # Forward to Telegram users who have in_sms right
         # (This would call the Telethon client — wired via app state)
         logger.info(
@@ -75,7 +89,11 @@ def create_http_server(
             details={"from": sms_event.phone_number, "text_len": len(sms_event.text)},
         )
 
-        return {"ok": True, "correlation_id": sms_event.correlation_id}
+        return {
+            "ok": True,
+            "correlation_id": sms_event.correlation_id,
+            "formatted_text": formatted_text,
+        }
 
     @app.post("/events/voicemail")
     async def handle_voicemail_event(req: Request):
