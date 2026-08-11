@@ -1,0 +1,7 @@
+# SimBridge blacklist — one number per line.
+# Numbers are matched against incoming phone numbers (E.164 format).
+# Blank lines and lines starting with # are ignored.
+
+# Example:
+# +79161234567
+# +12125551234

@@ -1,0 +1,23 @@
+; SimBridge chan_dongle — example
+; Copy to /etc/asterisk/dongle_custom.conf and adapt.
+;
+; chan_dongle provides GSM modem support via libdongle.
+; Device paths should use udev symlinks, not /dev/ttyUSB* directly.
+
+[globals]
+dongle_dir=/dev/dongle
+context=incoming-mobile
+dtmf_mode=1
+sms_mode=1
+call_mode=1
+
+; ---------------------------------------------------------------------------
+; Modem definition — adjust device_path to match your udev rules
+; ---------------------------------------------------------------------------
+[gsm]
+type=dongle
+device_path=/dev/dongle/gsm0
+context=incoming-mobile
+sms_mode=1
+call_mode=1
+dtmf_mode=1

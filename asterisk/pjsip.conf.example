@@ -1,0 +1,27 @@
+; SimBridge PJSIP — example (for tg-bridge voice bridge, Stage 04)
+; Copy to /etc/asterisk/pjsip_custom.conf and adapt.
+
+; ---------------------------------------------------------------------------
+; tg-bridge endpoint — receives calls from the Telegram voice bridge
+; Runs on the Telegram node; connects over Tailscale.
+; ---------------------------------------------------------------------------
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0
+
+[tg-bridge]
+type=endpoint
+transport=udp
+aors=tg-bridge-aor
+contexts=incoming-mobile
+disallow=all
+allow=ulaw,alaw
+direct_media=no
+rtptimeout=60
+rtpholdtimeout=30
+
+[tg-bridge-aor]
+type=aor
+max_contacts=1
+qualify_frequency=60

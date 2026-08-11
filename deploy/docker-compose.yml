@@ -1,0 +1,74 @@
+# Docker Compose for SimBridge (Telegram node only)
+#
+# The GSM node requires USB modem passthrough — native install is
+# recommended there. This compose file is for the Telegram node
+# (userbot + bridge) or for development.
+
+version: "3.8"
+
+services:
+  userbot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.userbot
+    container_name: simbridge-userbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - SIMBRIDGE_CONFIG=/etc/simbridge/simbridge.yaml
+    volumes:
+      - simbridge-config:/etc/simbridge:ro
+      - simbridge-data:/var/lib/simbridge
+      - simbridge-logs:/var/log/simbridge
+    networks:
+      - tailnet
+    # Tailscale sidecar for mesh connectivity
+    depends_on:
+      - tailscale
+
+  bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.bridge
+    container_name: simbridge-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - SIMBRIDGE_CONFIG=/etc/simbridge/simbridge.yaml
+    volumes:
+      - simbridge-config:/etc/simbridge:ro
+    networks:
+      - tailnet
+    ports:
+      # SIP signaling — only on tailnet
+      - "5062:5062/udp"
+      # RTP media range
+      - "10000-20000:10000-20000/udp"
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: simbridge-tailscale
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    capabilities:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      tailnet:
+        driver_opts:
+          com.docker.network.enable_ipv6: "false"
+
+volumes:
+  simbridge-config:
+  simbridge-data:
+  simbridge-logs:
+  tailscale-state:
+
+networks:
+  tailnet:
+    driver: bridge

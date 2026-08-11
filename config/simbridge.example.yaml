@@ -1,0 +1,84 @@
+# SimBridge configuration — copy to /etc/simbridge/simbridge.yaml
+# and fill in real values. THIS FILE IS TRACKED IN GIT; the real
+# config is NOT (it is in .gitignore).
+#
+# Secrets are NEVER stored in this file. They are loaded from
+# environment variables by name. The systemd unit files or an
+# EnvironmentFile provide the actual values.
+
+# ---------------------------------------------------------------------------
+# Node identity
+# ---------------------------------------------------------------------------
+node:
+  role: all-in-one        # all-in-one | gsm | telegram
+  id: gsm-01              # unique node identifier
+
+# ---------------------------------------------------------------------------
+# Telegram userbot (MTProto user account, NOT Bot API)
+# ---------------------------------------------------------------------------
+telegram:
+  master_username: "<telegram_username>"   # resolved to ID via get_entity at startup
+  session_path: /var/lib/simbridge/sim_session
+  acl_file: /etc/simbridge/acl.conf
+  # Secrets are read from environment variables:
+  api_id_env: SIMBRIDGE_TG_API_ID       # set in systemd / .env
+  api_hash_env: SIMBRIDGE_TG_API_HASH   # set in systemd / .env
+
+# ---------------------------------------------------------------------------
+# Agent (GSM-node HTTP API — replaces SSH+shell-interpolation)
+# ---------------------------------------------------------------------------
+agent:
+  listen: "100.x.x.x:8090"          # Tailscale interface only, never 0.0.0.0
+  token_env: SIMBRIDGE_AGENT_TOKEN   # bearer token, from env
+  allowed_peers:
+    - "100.x.x.x"                   # Telegram node Tailscale IP
+
+# ---------------------------------------------------------------------------
+# Userbot HTTP server (receives events from Asterisk hooks)
+# ---------------------------------------------------------------------------
+userbot_http:
+  listen: "100.x.x.x:8088"
+  secret_env: SIMBRIDGE_HTTP_SECRET  # from env
+  allowed_peers:
+    - "100.x.x.x"                   # GSM node Tailscale IP
+
+# ---------------------------------------------------------------------------
+# Asterisk
+# ---------------------------------------------------------------------------
+asterisk:
+  ari_url: http://127.0.0.1:8088/ari
+  dongle: gsm                       # chan_dongle device name
+  ring_wait_seconds: 24             # voicemail ringback duration
+  max_record_seconds: 90            # max voicemail length
+  prompt: /var/lib/asterisk/sounds/custom/vm-prompt.ulaw
+  # AMI access — for the agent HTTP API (replaces SSH shell commands)
+  ami_host: 127.0.0.1
+  ami_port: 5038
+  ami_username: simbridge
+  ami_password_env: SIMBRIDGE_AMI_PASSWORD   # from env, never in YAML
+
+# ---------------------------------------------------------------------------
+# Voice bridge (stage 04 — live bidirectional voice)
+# ---------------------------------------------------------------------------
+voice:
+  bridge_endpoint: tg-bridge        # PJSIP endpoint name for tg2sip
+  bridge_host: 127.0.0.1            # or peer Tailscale IP in distributed mode
+  bridge_port: 5062
+  srtp: false                       # tailnet already encrypts (see docs/voice-bridge.md)
+  outbound_answer_timeout: 30       # seconds
+
+# ---------------------------------------------------------------------------
+# Rate limits
+# ---------------------------------------------------------------------------
+limits:
+  sms_per_hour: 30
+  calls_per_minute: 3
+  max_call_seconds: 3600            # 1 hour max call duration
+
+# ---------------------------------------------------------------------------
+# File paths
+# ---------------------------------------------------------------------------
+paths:
+  blacklist: /etc/simbridge/blacklist.txt
+  contacts_cache: /var/lib/simbridge/contacts.csv
+  audit_log: /var/log/simbridge/audit.jsonl

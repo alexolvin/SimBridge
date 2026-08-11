@@ -7,6 +7,18 @@
 *.secret
 *.key
 
+# SimBridge — NEVER commit these
+*.session
+*.session-journal
+config/simbridge.yaml          # real config (only .example.yaml is tracked)
+/etc/simbridge/env             # systemd environment file
+/var/lib/simbridge/            # session, recordings, data
+/var/log/simbridge/            # audit logs
+
+# Python
+.pytype/
+mypy_cache/
+
 # Node
 node_modules/
 npm-debug.log*

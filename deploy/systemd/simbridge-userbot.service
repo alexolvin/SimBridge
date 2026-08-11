@@ -1,0 +1,25 @@
+[Unit]
+Description=SimBridge Userbot — Telegram node
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=simbridge
+Group=nogroup
+WorkingDirectory=/opt/simbridge
+ExecStart=/opt/simbridge-venv/bin/python -m userbot.main
+Restart=on-failure
+RestartSec=5
+
+# Secrets via environment — NEVER in the unit file
+EnvironmentFile=/etc/simbridge/env
+Environment=SIMBRIDGE_CONFIG=/etc/simbridge/simbridge.yaml
+
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/simbridge /var/lib/simbridge
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

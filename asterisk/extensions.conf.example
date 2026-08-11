@@ -1,0 +1,54 @@
+; SimBridge dialplan — example
+; Copy to /etc/asterisk/extensions_custom.conf and adapt.
+;
+; chan_dongle routes incoming events into the 'incoming-mobile' context:
+;   s       — incoming call
+;   sms     — incoming SMS
+;   report  — delivery report
+;   ussd    — USSD response
+
+[incoming-mobile]
+; ---------------------------------------------------------------------------
+; Incoming call → ring → voicemail
+; ---------------------------------------------------------------------------
+exten => s,1,NoOp(Incoming call from ${DONGLE_CALLERID})
+ same => n,Set(CALL_FROM=${DONGLE_CALLERID})
+ same => n,Set(TIMEOUT(response)=24)
+ same => n,Dial(Local/voicemail@internal,24)
+ same => h,Hangup()
+
+; ---------------------------------------------------------------------------
+; Incoming SMS → forward to Telegram via HTTP
+; ---------------------------------------------------------------------------
+exten => sms,1,NoOp(Incoming SMS from ${DONGLE_FROM}: ${DONGLE_TEXT})
+ same => n,Set(FROM=${DONGLE_FROM})
+ same => n,Set(TEXT=${DONGLE_TEXT})
+ same => n,System(/usr/local/bin/tg-sms-forward.sh "${DONGLE_FROM}" "${DONGLE_TEXT}")
+ same => n,Hangup()
+
+; ---------------------------------------------------------------------------
+; Delivery report → forward to Telegram as reply
+; ---------------------------------------------------------------------------
+exten => report,1,NoOp(Delivery report from ${DONGLE_FROM})
+ same => n,System(/usr/local/bin/tg-sms-forward.sh "${DONGLE_FROM}" "__DELIVERY_REPORT__")
+ same => n,Hangup()
+
+; ---------------------------------------------------------------------------
+; Voicemail handler
+; ---------------------------------------------------------------------------
+[voicemail]
+exten => s,1,Answer()
+ same => n,Wait(1)
+ same => n,Set(MIXMON_DIR=/var/lib/simbridge/recordings)
+ same => n,Set(MIXMON_FORMAT=wav)
+ same => n,Set(CORRELATION=${UNIQUEID})
+ same => n,MixMonitor(${MIXMON_DIR}/${CORRELATION}.${MIXMON_FORMAT},@hangup_handler)
+ same => n,Playback(/var/lib/asterisk/sounds/custom/vm-prompt)
+ same => n,WaitExten(60)
+ same => n,Hangup()
+
+exten => h,1,Hangup()
+
+; Post-hangup: forward recording to Telegram
+exten => hangup_handler,1,NoOp(Hangup handler — forwarding voicemail)
+ same => n,System(/usr/local/bin/tg-voice-forward.sh "${CORRELATION}" "${CALL_FROM}")

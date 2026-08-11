@@ -2,11 +2,11 @@
 
 ## Агент
 
-Claude Code (Anthropic CLI).
+Claude Code (Anthropic CLI). Проект — telephony-система класса финансовых решений: сбои грозят потерей капитала. Корректность выше скорости.
 
 ## Язык
 
-- Коммиты, комментарии в коде, документация — **русский** или **английский** (что указано в задании; по умолчанию — английский).
+- Коммиты, комментарии в коде, документация — **английский** (код), **русский** (отчёты пользователю).
 - Ответы пользователю — на том же языке, на котором он пишет.
 
 ## Стиль коммитов
@@ -15,7 +15,7 @@ Claude Code (Anthropic CLI).
 <тип>: <краткое описание>
 
 - тип: feat, fix, refactor, docs, chore, test, ci
-- пример: `feat: add user authentication flow`
+- пример: `feat: add agent HTTP API for outgoing SMS`
 - подпись: `Co-Authored-By: Claude <noreply@anthropic.com>`
 ```
 
@@ -28,12 +28,26 @@ Claude Code (Anthropic CLI).
   1. Статус в файле задания → `done` (локально).
   2. Осмысленный commit.
   3. Push в GitHub (`origin main`).
-  4. Отчёт: что сделано, какие файлы изменены, хеш коммита.
+  4. HANDOFF документ для каждого stage.
+  5. «ОТЧЁТ О ЧЕСТНОСТИ»: что реализовано, что нет, где допущения.
+
+## Standing Rules (из OVERVIEW)
+
+**Rule 1** — no hardcoding, no duplicate mechanisms. Любой literal в логике, который должен быть в config, — дефект.
+
+**Rule 2** — no unverified claims. Каждый "works" требует артефакта: log, test run, output.
+
+**Rule 3** — real-device evidence for telephony. Каждый stage с SMS/voice включает хотя бы один end-to-end run на физическом модеме. Если оборудование недоступно — честно фиксировать `MANUAL_VERIFY`.
+
+**Rule 4** — preserve working behavior. Существующая система работает для пользователей. Регрессия хуже медленного прогресса.
+
+**Rule 5** — secrets never enter git. Pre-commit hook + CI check.
 
 ## Безопасность
 
-- Не коммить секреты, ключи, `.env`.
+- Не коммить секреты, ключи, `.env`, `*.session`.
 - Перед деструктивными действиями (`force push`, удаление веток, `reset --hard`) — **спросить** подтверждение.
+- Хардкод секретов — запрещён. Все секреты через environment variables.
 
 ## GitHub
 
