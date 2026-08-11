@@ -936,3 +936,565 @@ class TestDistributedDocs:
     def test_config_only_change(self):
         """Docs state that distributed mode is a config-only change."""
         assert "config-only" in self.docs.lower() or "config-only change" in self.docs
+
+
+# =========================================================================
+# S05.1 — Modem abstraction and provenance
+# =========================================================================
+
+class TestModemStates:
+    """ModemState enum (GPT §7.2)."""
+
+    def test_all_states_exist(self):
+        from core.modem import ModemState
+        expected = {
+            "offline", "initializing", "ready", "busy",
+            "sms_busy", "call_busy", "error", "disabled",
+        }
+        actual = {s.value for s in ModemState}
+        assert expected == actual
+
+    def test_available_states(self):
+        from core.modem import ModemState, AVAILABLE_STATES
+        assert ModemState.READY in AVAILABLE_STATES
+        assert ModemState.CALL_BUSY not in AVAILABLE_STATES
+        assert ModemState.SMS_BUSY not in AVAILABLE_STATES
+
+    def test_online_states(self):
+        from core.modem import ModemState, ONLINE_STATES
+        assert ModemState.READY in ONLINE_STATES
+        assert ModemState.OFFLINE not in ONLINE_STATES
+        assert ModemState.INITIALIZING in ONLINE_STATES
+
+
+class TestSingleModemProvider:
+    """SingleModemProvider — state derivation from device reports."""
+
+    @pytest.fixture
+    def provider(self):
+        from core.modem import SingleModemProvider
+        return SingleModemProvider(modem_id="gsm", device="gsm")
+
+    def test_initial_state_offline(self, provider):
+        info = provider.get_info("gsm")
+        assert info.state.value == "offline"
+
+    def test_update_registered_becomes_ready(self, provider):
+        provider.update_state("gsm", registered=True, signal_percent=85)
+        info = provider.get_info("gsm")
+        assert info.state.value == "ready"
+        assert info.signal_percent == 85
+
+    def test_sms_active_becomes_sms_busy(self, provider):
+        provider.update_state("gsm", registered=True)
+        provider.set_sms_active("gsm", True)
+        info = provider.get_info("gsm")
+        assert info.state.value == "sms_busy"
+
+    def test_call_active_becomes_call_busy(self, provider):
+        provider.update_state("gsm", registered=True)
+        provider.set_call_active("gsm", True)
+        info = provider.get_info("gsm")
+        assert info.state.value == "call_busy"
+
+    def test_error_state(self, provider):
+        provider.update_state("gsm", registered=True, error="no_network")
+        info = provider.get_info("gsm")
+        assert info.state.value == "error"
+
+    def test_unknown_modem_returns_none(self, provider):
+        assert provider.get_info("unknown") is None
+
+    def test_list_modems(self, provider):
+        provider.update_state("gsm", registered=True)
+        modems = provider.list_modems()
+        assert len(modems) == 1
+        assert modems[0].modem_id == "gsm"
+
+    def test_is_available_ready(self, provider):
+        provider.update_state("gsm", registered=True)
+        assert provider.is_available("gsm") is True
+
+    def test_is_available_busy(self, provider):
+        provider.update_state("gsm", registered=True)
+        provider.set_call_active("gsm", True)
+        assert provider.is_available("gsm") is False
+
+    def test_to_dict(self, provider):
+        provider.update_state("gsm", registered=True, signal_percent=90)
+        info = provider.get_info("gsm")
+        d = info.to_dict()
+        assert d["modem_id"] == "gsm"
+        assert d["state"] == "ready"
+        assert d["signal_percent"] == 90
+
+
+class TestRoutingStrategies:
+    """Routing strategy implementations (S05.2)."""
+
+    def test_first_available_selects_first(self):
+        from core.modem import FirstAvailableStrategy, ModemInfo, ModemState
+
+        modems = [
+            ModemInfo(modem_id="b", device="b", state=ModemState.READY),
+            ModemInfo(modem_id="a", device="a", state=ModemState.READY),
+        ]
+        strategy = FirstAvailableStrategy()
+        chosen = strategy.select(modems)
+        assert chosen.modem_id == "a"  # sorted by modem_id
+
+    def test_first_available_empty(self):
+        from core.modem import FirstAvailableStrategy
+        strategy = FirstAvailableStrategy()
+        assert strategy.select([]) is None
+
+    def test_round_robin_alternates(self):
+        from core.modem import RoundRobinStrategy, ModemInfo, ModemState
+
+        modems = [
+            ModemInfo(modem_id="a", device="a", state=ModemState.READY),
+            ModemInfo(modem_id="b", device="b", state=ModemState.READY),
+        ]
+        strategy = RoundRobinStrategy()
+        first = strategy.select(modems)
+        second = strategy.select(modems)
+        third = strategy.select(modems)
+        assert first.modem_id == "a"
+        assert second.modem_id == "b"
+        assert third.modem_id == "a"
+
+    def test_round_robin_empty(self):
+        from core.modem import RoundRobinStrategy
+        strategy = RoundRobinStrategy()
+        assert strategy.select([]) is None
+
+
+class TestModemPool:
+    """ModemPool — selection, reservation, release (S05.2)."""
+
+    @pytest.fixture
+    def pool(self):
+        from core.modem import ModemPool, SingleModemProvider
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")
+        provider.update_state("gsm", registered=True)
+        return ModemPool(provider=provider)
+
+    def test_select_for_sms(self, pool):
+        chosen = pool.select_for_sms(destination="+79261234555")
+        assert chosen is not None
+        assert chosen.modem_id == "gsm"
+
+    def test_select_for_call(self, pool):
+        chosen = pool.select_for_call(destination="+79261234555")
+        assert chosen is not None
+        assert chosen.modem_id == "gsm"
+
+    def test_release(self, pool):
+        pool.select_for_call(destination="+79261234555")
+        pool.release("gsm")
+        assert pool.get_reserved_count() == 0
+
+    def test_all_busy_returns_none(self, pool):
+        pool.select_for_call(destination="+79261234555")
+        chosen = pool.select_for_call(destination="+79261234556")
+        assert chosen is None
+
+    def test_is_all_busy(self, pool):
+        assert pool.is_all_busy() is False
+        pool.select_for_call(destination="+79261234555")
+        assert pool.is_all_busy() is True
+
+    def test_list_modems(self, pool):
+        modems = pool.list_modems()
+        assert len(modems) == 1
+        assert modems[0].modem_id == "gsm"
+
+    def test_atomic_reservation(self):
+        """Two concurrent requests, one modem, exactly one winner."""
+        from core.modem import ModemPool, SingleModemProvider
+
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")
+        provider.update_state("gsm", registered=True)
+        pool = ModemPool(provider=provider)
+
+        results = []
+
+        def select():
+            results.append(pool.select_for_call(destination="+1111111111"))
+
+        import threading
+        t1 = threading.Thread(target=select)
+        t2 = threading.Thread(target=select)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        winners = [r for r in results if r is not None]
+        assert len(winners) == 1
+
+    def test_release_allows_new_selection(self, pool):
+        pool.select_for_call(destination="+79261234555")
+        pool.release("gsm")
+        chosen = pool.select_for_call(destination="+14155552671")
+        assert chosen is not None
+
+
+class TestCallRegistryWithPool:
+    """CallRegistry integration with ModemPool (S05.1)."""
+
+    @pytest.fixture
+    def registry_with_pool(self):
+        from core.modem import ModemPool, SingleModemProvider
+        mock_sms = MagicMock()
+        mock_audit = MagicMock()
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")
+        provider.update_state("gsm", registered=True)
+        pool = ModemPool(provider=provider)
+        return CallRegistry(
+            sms_store=mock_sms,
+            audit=mock_audit,
+            modem_pool=pool,
+        )
+
+    def test_outgoing_uses_pool(self, registry_with_pool):
+        call = registry_with_pool.create_outgoing(
+            callee_number="+14155552671",
+            telegram_user_id=12345,
+        )
+        assert call.modem_id == "gsm"
+        assert call.state == CallState.MODEM_RESERVED
+
+    def test_outgoing_pool_busy_raises(self, registry_with_pool):
+        registry_with_pool.create_outgoing(
+            callee_number="+14155552671",
+            telegram_user_id=12345,
+        )
+        with pytest.raises(ModemBusyError):
+            registry_with_pool.create_outgoing(
+                callee_number="+14155552672",
+                telegram_user_id=12346,
+            )
+
+    def test_cleanup_releases_pool(self, registry_with_pool):
+        call = registry_with_pool.create_outgoing(
+            callee_number="+14155552671",
+            telegram_user_id=12345,
+        )
+        registry_with_pool.transition(call.call_id, CallState.TELEGRAM_CALLING)
+        registry_with_pool.transition(call.call_id, CallState.USER_ACCEPTED)
+        registry_with_pool.transition(call.call_id, CallState.GSM_DIALING)
+        registry_with_pool.transition(call.call_id, CallState.GSM_RINGING)
+        registry_with_pool.transition(call.call_id, CallState.CONNECTED)
+        registry_with_pool.transition(call.call_id, CallState.BRIDGED)
+        registry_with_pool.transition(call.call_id, CallState.HANGUP)
+        registry_with_pool.cleanup(call.call_id)
+        # After cleanup, a new outgoing call should succeed
+        call2 = registry_with_pool.create_outgoing(
+            callee_number="+14155552672",
+            telegram_user_id=12346,
+        )
+        assert call2.state == CallState.MODEM_RESERVED
+
+    def test_provenance_in_dict(self, registry_with_pool):
+        call = registry_with_pool.create_incoming(
+            caller_number="+79261234555",
+            modem_id="gsm",
+        )
+        d = call.to_dict()
+        assert d["modem_id"] == "gsm"
+
+    def test_backwards_compat_no_pool(self):
+        """Without a pool, CallRegistry falls back to direct reservation."""
+        mock_sms = MagicMock()
+        mock_audit = MagicMock()
+        registry = CallRegistry(
+            sms_store=mock_sms,
+            audit=mock_audit,
+            modem_pool=None,
+        )
+        call = registry.create_outgoing(callee_number="+14155552671")
+        assert call.state == CallState.MODEM_RESERVED
+        with pytest.raises(ModemBusyError):
+            registry.create_outgoing(callee_number="+14155552672")
+
+
+# =========================================================================
+# S05.1 — Modem abstraction and provenance
+# =========================================================================
+
+class TestModemStates:
+    """ModemState enum (GPT §7.2)."""
+
+    def test_all_states_exist(self):
+        from core.modem import ModemState
+        expected = {
+            "offline", "initializing", "ready", "busy",
+            "sms_busy", "call_busy", "error", "disabled",
+        }
+        actual = {s.value for s in ModemState}
+        assert expected == actual
+
+    def test_available_states(self):
+        from core.modem import ModemState, AVAILABLE_STATES
+        assert ModemState.READY in AVAILABLE_STATES
+        assert ModemState.CALL_BUSY not in AVAILABLE_STATES
+        assert ModemState.SMS_BUSY not in AVAILABLE_STATES
+
+    def test_online_states(self):
+        from core.modem import ModemState, ONLINE_STATES
+        assert ModemState.READY in ONLINE_STATES
+        assert ModemState.OFFLINE not in ONLINE_STATES
+        assert ModemState.INITIALIZING in ONLINE_STATES
+
+
+class TestSingleModemProvider:
+    """SingleModemProvider — state derivation from device reports."""
+
+    @pytest.fixture
+    def provider(self):
+        from core.modem import SingleModemProvider
+        return SingleModemProvider(modem_id="gsm", device="gsm")
+
+    def test_initial_state_offline(self, provider):
+        info = provider.get_info("gsm")
+        assert info.state.value == "offline"
+
+    def test_update_registered_becomes_ready(self, provider):
+        provider.update_state("gsm", registered=True, signal_percent=85)
+        info = provider.get_info("gsm")
+        assert info.state.value == "ready"
+        assert info.signal_percent == 85
+
+    def test_sms_active_becomes_sms_busy(self, provider):
+        provider.update_state("gsm", registered=True)
+        provider.set_sms_active("gsm", True)
+        info = provider.get_info("gsm")
+        assert info.state.value == "sms_busy"
+
+    def test_call_active_becomes_call_busy(self, provider):
+        provider.update_state("gsm", registered=True)
+        provider.set_call_active("gsm", True)
+        info = provider.get_info("gsm")
+        assert info.state.value == "call_busy"
+
+    def test_error_state(self, provider):
+        provider.update_state("gsm", registered=True, error="no_network")
+        info = provider.get_info("gsm")
+        assert info.state.value == "error"
+
+    def test_unknown_modem_returns_none(self, provider):
+        assert provider.get_info("unknown") is None
+
+    def test_list_modems(self, provider):
+        provider.update_state("gsm", registered=True)
+        modems = provider.list_modems()
+        assert len(modems) == 1
+        assert modems[0].modem_id == "gsm"
+
+    def test_is_available_ready(self, provider):
+        provider.update_state("gsm", registered=True)
+        assert provider.is_available("gsm") is True
+
+    def test_is_available_busy(self, provider):
+        provider.update_state("gsm", registered=True)
+        provider.set_call_active("gsm", True)
+        assert provider.is_available("gsm") is False
+
+    def test_to_dict(self, provider):
+        provider.update_state("gsm", registered=True, signal_percent=90)
+        info = provider.get_info("gsm")
+        d = info.to_dict()
+        assert d["modem_id"] == "gsm"
+        assert d["state"] == "ready"
+        assert d["signal_percent"] == 90
+
+
+class TestRoutingStrategies:
+    """Routing strategy implementations (S05.2)."""
+
+    def test_first_available_selects_first(self):
+        from core.modem import FirstAvailableStrategy, ModemInfo, ModemState
+
+        modems = [
+            ModemInfo(modem_id="b", device="b", state=ModemState.READY),
+            ModemInfo(modem_id="a", device="a", state=ModemState.READY),
+        ]
+        strategy = FirstAvailableStrategy()
+        chosen = strategy.select(modems)
+        assert chosen.modem_id == "a"  # sorted by modem_id
+
+    def test_first_available_empty(self):
+        from core.modem import FirstAvailableStrategy
+        strategy = FirstAvailableStrategy()
+        assert strategy.select([]) is None
+
+    def test_round_robin_alternates(self):
+        from core.modem import RoundRobinStrategy, ModemInfo, ModemState
+
+        modems = [
+            ModemInfo(modem_id="a", device="a", state=ModemState.READY),
+            ModemInfo(modem_id="b", device="b", state=ModemState.READY),
+        ]
+        strategy = RoundRobinStrategy()
+        first = strategy.select(modems)
+        second = strategy.select(modems)
+        third = strategy.select(modems)
+        assert first.modem_id == "a"
+        assert second.modem_id == "b"
+        assert third.modem_id == "a"
+
+    def test_round_robin_empty(self):
+        from core.modem import RoundRobinStrategy
+        strategy = RoundRobinStrategy()
+        assert strategy.select([]) is None
+
+
+class TestModemPool:
+    """ModemPool — selection, reservation, release (S05.2)."""
+
+    @pytest.fixture
+    def pool(self):
+        from core.modem import ModemPool, SingleModemProvider
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")
+        provider.update_state("gsm", registered=True)
+        return ModemPool(provider=provider)
+
+    def test_select_for_sms(self, pool):
+        chosen = pool.select_for_sms(destination="+79261234555")
+        assert chosen is not None
+        assert chosen.modem_id == "gsm"
+
+    def test_select_for_call(self, pool):
+        chosen = pool.select_for_call(destination="+79261234555")
+        assert chosen is not None
+        assert chosen.modem_id == "gsm"
+
+    def test_release(self, pool):
+        pool.select_for_call(destination="+79261234555")
+        pool.release("gsm")
+        assert pool.get_reserved_count() == 0
+
+    def test_all_busy_returns_none(self, pool):
+        pool.select_for_call(destination="+79261234555")
+        chosen = pool.select_for_call(destination="+79261234556")
+        assert chosen is None
+
+    def test_is_all_busy(self, pool):
+        assert pool.is_all_busy() is False
+        pool.select_for_call(destination="+79261234555")
+        assert pool.is_all_busy() is True
+
+    def test_list_modems(self, pool):
+        modems = pool.list_modems()
+        assert len(modems) == 1
+        assert modems[0].modem_id == "gsm"
+
+    def test_atomic_reservation(self):
+        """Two concurrent requests, one modem, exactly one winner."""
+        from core.modem import ModemPool, SingleModemProvider
+
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")
+        provider.update_state("gsm", registered=True)
+        pool = ModemPool(provider=provider)
+
+        results = []
+
+        def select():
+            results.append(pool.select_for_call(destination="+1111111111"))
+
+        import threading
+        t1 = threading.Thread(target=select)
+        t2 = threading.Thread(target=select)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        winners = [r for r in results if r is not None]
+        assert len(winners) == 1
+
+    def test_release_allows_new_selection(self, pool):
+        pool.select_for_call(destination="+79261234555")
+        pool.release("gsm")
+        chosen = pool.select_for_call(destination="+14155552671")
+        assert chosen is not None
+
+
+class TestCallRegistryWithPool:
+    """CallRegistry integration with ModemPool (S05.1)."""
+
+    @pytest.fixture
+    def registry_with_pool(self):
+        from core.modem import ModemPool, SingleModemProvider
+        mock_sms = MagicMock()
+        mock_audit = MagicMock()
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")
+        provider.update_state("gsm", registered=True)
+        pool = ModemPool(provider=provider)
+        return CallRegistry(
+            sms_store=mock_sms,
+            audit=mock_audit,
+            modem_pool=pool,
+        )
+
+    def test_outgoing_uses_pool(self, registry_with_pool):
+        call = registry_with_pool.create_outgoing(
+            callee_number="+14155552671",
+            telegram_user_id=12345,
+        )
+        assert call.modem_id == "gsm"
+        assert call.state == CallState.MODEM_RESERVED
+
+    def test_outgoing_pool_busy_raises(self, registry_with_pool):
+        registry_with_pool.create_outgoing(
+            callee_number="+14155552671",
+            telegram_user_id=12345,
+        )
+        with pytest.raises(ModemBusyError):
+            registry_with_pool.create_outgoing(
+                callee_number="+14155552672",
+                telegram_user_id=12346,
+            )
+
+    def test_cleanup_releases_pool(self, registry_with_pool):
+        call = registry_with_pool.create_outgoing(
+            callee_number="+14155552671",
+            telegram_user_id=12345,
+        )
+        registry_with_pool.transition(call.call_id, CallState.TELEGRAM_CALLING)
+        registry_with_pool.transition(call.call_id, CallState.USER_ACCEPTED)
+        registry_with_pool.transition(call.call_id, CallState.GSM_DIALING)
+        registry_with_pool.transition(call.call_id, CallState.GSM_RINGING)
+        registry_with_pool.transition(call.call_id, CallState.CONNECTED)
+        registry_with_pool.transition(call.call_id, CallState.BRIDGED)
+        registry_with_pool.transition(call.call_id, CallState.HANGUP)
+        registry_with_pool.cleanup(call.call_id)
+        # After cleanup, a new outgoing call should succeed
+        call2 = registry_with_pool.create_outgoing(
+            callee_number="+14155552672",
+            telegram_user_id=12346,
+        )
+        assert call2.state == CallState.MODEM_RESERVED
+
+    def test_provenance_in_dict(self, registry_with_pool):
+        call = registry_with_pool.create_incoming(
+            caller_number="+79261234555",
+            modem_id="gsm",
+        )
+        d = call.to_dict()
+        assert d["modem_id"] == "gsm"
+
+    def test_backwards_compat_no_pool(self):
+        """Without a pool, CallRegistry falls back to direct reservation."""
+        mock_sms = MagicMock()
+        mock_audit = MagicMock()
+        registry = CallRegistry(
+            sms_store=mock_sms,
+            audit=mock_audit,
+            modem_pool=None,
+        )
+        call = registry.create_outgoing(callee_number="+14155552671")
+        assert call.state == CallState.MODEM_RESERVED
+        with pytest.raises(ModemBusyError):
+            registry.create_outgoing(callee_number="+14155552672")

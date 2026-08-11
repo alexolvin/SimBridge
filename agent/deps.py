@@ -143,3 +143,8 @@ def get_call_registry(request: Request):
 def get_acl(request: Request):
     """Get ACLManager from app state (S04.3)."""
     return request.app.state.acl
+
+
+def get_modem_pool(request: Request):
+    """Get ModemPool from app state (S05.1)."""
+    return request.app.state.modem_pool

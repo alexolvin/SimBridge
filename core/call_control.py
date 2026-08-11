@@ -42,6 +42,7 @@ from typing import Dict, List, Optional
 
 from core.audit import AuditLogger
 from core.events import EventType
+from core.modem import ModemPool, ModemInfo
 from core.sms_correlation import SMSCorrelationStore
 
 logger = logging.getLogger("simbridge.call_control")
@@ -274,18 +275,26 @@ class CallRegistry:
     """Thread-safe registry of active calls.
 
     Manages call lifecycle, modem reservation, and timeout handling.
+    S05.1: Uses ModemPool for modem selection and provenance tracking.
     """
 
     def __init__(
         self,
         sms_store: SMSCorrelationStore,
         audit: AuditLogger,
+        modem_pool: Optional[ModemPool] = None,
     ) -> None:
         self._calls: Dict[str, CallMachine] = {}
         self._lock = threading.Lock()
         self._sms_store = sms_store
         self._audit = audit
         self._modems_reserved: int = 0
+        # S05.1: Modem pool for multi-modem support
+        self._modem_pool = modem_pool
+
+    @property
+    def modem_pool(self) -> Optional[ModemPool]:
+        return self._modem_pool
 
     def create_incoming(
         self,
@@ -313,10 +322,11 @@ class CallRegistry:
         with self._lock:
             self._calls[call.call_id] = call
         logger.info(
-            "Incoming call %s from %s (%s)",
+            "Incoming call %s from %s (%s) on %s",
             call.call_id[:8],
             caller_number,
             caller_name or "unknown",
+            modem_id,
         )
         return call
 
@@ -331,17 +341,28 @@ class CallRegistry:
         """Create a new outgoing call (Telegram -> GSM).
 
         Starts in REQUESTED state. ACL check happens before this
-        (in the route handler). Modem is reserved atomically.
+        (in the route handler). Modem is selected via pool (S05.1)
+        or reserved directly (backward compat for single-modem).
         """
-        if self._modems_reserved > 0:
-            raise ModemBusyError("Modem is already in use")
+        # S05.1: Try pool-based selection first
+        selected_modem_id = modem_id
+        if self._modem_pool:
+            chosen = self._modem_pool.select_for_call(destination=callee_number)
+            if chosen is None:
+                raise ModemBusyError("All modems busy — no modem available for this call")
+            selected_modem_id = chosen.modem_id
+        else:
+            # Backward compat: direct modem reservation
+            if self._modems_reserved > 0:
+                raise ModemBusyError("Modem is already in use")
+
         call = CallMachine(
             call_id=uuid.uuid4().hex,
             direction="outgoing",
             caller_number=caller_number,
             callee_number=callee_number,
             callee_name=callee_name,
-            modem_id=modem_id,
+            modem_id=selected_modem_id,
             telegram_user_id=telegram_user_id,
         )
         call._sms_store = self._sms_store
@@ -350,15 +371,17 @@ class CallRegistry:
         # ACL check happens before this (in the route handler).
         # We transition through ACL_CHECKED to record that the check passed.
         call.transition(CallState.ACL_CHECKED)
-        self._modems_reserved += 1
+        if not self._modem_pool:
+            self._modems_reserved += 1
         call.transition(CallState.MODEM_RESERVED)
         with self._lock:
             self._calls[call.call_id] = call
         logger.info(
-            "Outgoing call %s to %s (user %s)",
+            "Outgoing call %s to %s (user %s) on %s",
             call.call_id[:8],
             callee_number,
             telegram_user_id or "unknown",
+            selected_modem_id,
         )
         return call
 
@@ -383,7 +406,11 @@ class CallRegistry:
         with self._lock:
             call = self._calls.pop(call_id, None)
             if call and call.direction == "outgoing":
-                self._modems_reserved = max(0, self._modems_reserved - 1)
+                # S05.1: Release via pool if available
+                if self._modem_pool:
+                    self._modem_pool.release(call.modem_id)
+                else:
+                    self._modems_reserved = max(0, self._modems_reserved - 1)
             if call:
                 logger.info("Cleaned up call %s (was %s)", call.call_id[:8], call.state.value)
 

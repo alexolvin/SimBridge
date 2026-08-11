@@ -20,6 +20,7 @@ from core.blacklist import BlacklistManager
 from core.sms_correlation import SMSCorrelationStore
 from core.call_control import CallRegistry
 from core.acl import ACLManager
+from core.modem import ModemPool, SingleModemProvider
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
@@ -89,8 +90,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     sms_store = SMSCorrelationStore()
     app.state.sms_store = sms_store
 
+    # Initialize modem pool (S05.1)
+    modem_provider = SingleModemProvider(
+        modem_id=cfg.get("asterisk.dongle", "gsm"),
+        device=cfg.get("asterisk.dongle", "gsm"),
+    )
+    modem_pool = ModemPool(provider=modem_provider)
+    app.state.modem_pool = modem_pool
+
     # Initialize call registry (S04.2)
-    call_registry = CallRegistry(sms_store=sms_store, audit=audit)
+    call_registry = CallRegistry(
+        sms_store=sms_store,
+        audit=audit,
+        modem_pool=modem_pool,
+    )
     app.state.call_registry = call_registry
 
     # Initialize ACL manager (S04.3)
