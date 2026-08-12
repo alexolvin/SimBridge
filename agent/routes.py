@@ -31,6 +31,8 @@ from agent.deps import (
     get_call_registry,
     get_acl,
     get_call_limiter,
+    get_metrics,
+    get_health_checker,
 )
 from core.call_control import CallRegistry, CallState, InvalidTransition, ModemBusyError
 
@@ -71,6 +73,8 @@ class HealthResponse(BaseModel):
     asterisk_reachable: bool
     dongle_registered: Optional[bool] = None
     timestamp: str
+    components: Optional[dict] = None
+    metrics: Optional[dict] = None
 
 
 class BlockRequest(BaseModel):
@@ -765,8 +769,14 @@ async def list_calls(
 @router.get("/health", response_model=HealthResponse)
 async def health(
     ami: AMIClient = Depends(get_ami),
+    checker: "HealthChecker" = Depends(get_health_checker),
+    metrics_collector: "MetricsCollector" = Depends(get_metrics),
 ):
-    """Liveness check + Asterisk reachability + dongle state."""
+    """Comprehensive health check + Asterisk reachability + dongle state + metrics.
+
+    S06.2: Uses HealthChecker for component-level status and MetricsCollector
+    for aggregated SMS/call counts.
+    """
     asterisk_ok = False
     dongle_registered = None
 
@@ -777,9 +787,18 @@ async def health(
     except (ConnectionError, OSError):
         asterisk_ok = False
 
+    # Update metrics with current component state
+    if asterisk_ok is not None:
+        metrics_collector.set_modem_registered(dongle_registered)
+
+    # Run comprehensive health checks
+    health_status = await checker.check_all()
+
     return HealthResponse(
         status="ok" if asterisk_ok else "degraded",
         asterisk_reachable=asterisk_ok,
         dongle_registered=dongle_registered,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        components=health_status.to_dict(),
+        metrics=metrics_collector.get_all(),
     )

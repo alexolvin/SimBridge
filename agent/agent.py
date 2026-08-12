@@ -21,6 +21,11 @@ from core.sms_correlation import SMSCorrelationStore
 from core.call_control import CallRegistry
 from core.acl import ACLManager
 from core.modem import ModemPool, SingleModemProvider
+from core.logging_config import setup_logging
+from core.metrics import MetricsCollector
+from core.health import HealthChecker
+from core.alerting import AlertManager
+from core.recovery import BackoffReconnector, ModemWatchdog
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
@@ -34,12 +39,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     config_path = os.environ.get("SIMBRIDGE_CONFIG", "/etc/simbridge/simbridge.yaml")
     cfg = load_config(config_path)
 
+    # S06.2: Setup structured JSON logging
+    log_level = os.environ.get("SIMBRIDGE_LOG_LEVEL", "INFO")
+    setup_logging(level=log_level, json_format=True)
+
     # Log effective config with secrets redacted
     redacted = redact_config(cfg)
     logger.info("Agent started with config: %s", redacted)
 
     # Store config on app.state for dependency injection
     app.state.cfg = cfg
+
+    # S06.2: Initialize metrics collector
+    metrics = MetricsCollector()
+    app.state.metrics = metrics
+
+    # S06.2: Initialize health checker
+    # (AMI client will be set after initialization below)
+    health_checker = HealthChecker(ami=None, cfg=cfg)
+    app.state.health_checker = health_checker
 
     # Initialize audit logger
     audit = AuditLogger(cfg["paths.audit_log"])
@@ -69,6 +87,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error(
             "AMI connection failed: %s — SMS will fail until Asterisk is reachable", e
         )
+
+    # S06.2: Wire health checker with actual AMI client
+    health_checker._ami = ami
+    app.state.health_checker = health_checker
 
     # Initialize rate limiters
     from core.ratelimit import RateLimiter

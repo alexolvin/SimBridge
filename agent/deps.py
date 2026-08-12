@@ -170,3 +170,13 @@ def get_call_limiter(request: Request):
 def get_modem_pool(request: Request):
     """Get ModemPool from app state (S05.1)."""
     return request.app.state.modem_pool
+
+
+def get_metrics(request: Request):
+    """Get MetricsCollector from app state (S06.2)."""
+    return request.app.state.metrics
+
+
+def get_health_checker(request: Request):
+    """Get HealthChecker from app state (S06.2)."""
+    return request.app.state.health_checker
