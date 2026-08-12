@@ -2,8 +2,15 @@
 
 Bridge between Telegram and GSM telephony (Asterisk + chan_dongle).
 
-SMS, voicemail, and voice calls — managed via Telegram commands on a
-personal user account (MTProto, not Bot API).
+SMS, voicemail, and live voice calls — managed via Telegram commands on a
+personal user account (MTProto, not Bot API). Built to financial-grade standards:
+failures can cost real money, so correctness takes priority over speed.
+
+**Requirements:** Asterisk 18+ on EL9/Ubuntu, `chan_dongle` + USB GSM modem (Huawei E173 tested),
+a Telegram user account (Bot API cannot place voice calls), Tailscale for distributed deployments.
+
+**⚠️  Account risk:** This uses a Telegram user account. Telegram's Terms of Service may
+restrict automation. You are responsible for the consequences of account suspension.
 
 ## Architecture
 
@@ -98,14 +105,36 @@ simbridge/
 - Agent API: bearer token + IP allowlist (both required)
 - Replay protection: duplicate correlation_ids rejected within a time window
 - SMS text passed as structured AMI fields — never shell-interpolated
+- Timing-safe secret comparisons (`hmac.compare_digest`)
+- Bind-address validation: refuses `0.0.0.0` at startup
+
+## Observability
+
+- Structured JSON logs with UTC timestamps and correlation IDs
+- Health endpoint: `/v1/health` — component status (asterisk, modem, peer, bridge) + metrics
+- Metrics: SMS in/out, delivery rate, call outcomes, modem registration state
+- Alerting: Telegram notifications for critical events (dongle offline, session invalid, etc.)
+- Automatic recovery: AMI reconnect with exponential backoff, modem watchdog
+
+## Limitations
+
+- **Voice bridge requires `foobar26/tg2sip`** — a third-party Docker service. Must be deployed separately.
+- **Single SIM per GSM node** — multi-modem pools are implemented but tested with one member.
+- **No Bot API for voice calls** — uses a Telegram user account (see account risk above).
+- **Real-device evidence required** — SMS/voice acceptance criteria need physical modem access.
+- **No gRPC** — HTTP+JSON is used for all inter-node communication.
 
 ## Stages
 
 | Stage | Status | Description |
 |---|---|---|
-| 01 — Foundation | In Progress | Repo, config, secrets, agent API, ACL |
-| 02 — SMS | Planned | Contacts, blacklist write, reply routing |
-| 03 — Voicemail | Planned | Hardening + early-hangup gap |
-| 04 — Voice Bridge | Planned | Live bidirectional voice |
-| 05 — Multi-Modem | Planned | Modem pools, routing |
-| 06 — Release | Planned | Hardening, monitoring, docs |
+| 01 — Foundation | ✅ Complete | Repo, config, secrets, agent API, ACL |
+| 02 — SMS | ✅ Complete | Contacts, blacklist, correlation, reply routing |
+| 03 — Voicemail | ✅ Complete | Hardening, early-hangup, temp cleanup |
+| 04 — Voice Bridge | ✅ Complete | tg2sip fork, call state machines, distributed |
+| 05 — Multi-Modem | ⚠️ Partial | Modem abstraction + pools (S05.1+S05.2). S05.3 deferred — no second node. |
+| 06 — Release | 🔄 In Progress | Security review, observability, resilience, docs |
+
+## License
+
+SimBridge is licensed under the [MIT License](LICENSE). See `LICENSE` for details.
