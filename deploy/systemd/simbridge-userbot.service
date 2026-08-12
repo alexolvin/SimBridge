@@ -11,6 +11,9 @@ WorkingDirectory=/opt/simbridge
 ExecStart=/opt/simbridge-venv/bin/python -m userbot.main
 Restart=on-failure
 RestartSec=5
+WatchdogSec=120
+TimeoutStartSec=30
+TimeoutStopSec=15
 
 # Secrets via environment — NEVER in the unit file
 EnvironmentFile=/etc/simbridge/env

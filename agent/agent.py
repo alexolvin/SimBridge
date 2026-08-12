@@ -92,6 +92,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     health_checker._ami = ami
     app.state.health_checker = health_checker
 
+    # S06.3: AMI auto-reconnect on failure
+    async def ami_reconnect() -> None:
+        await ami.connect()
+
+    async def on_ami_give_up() -> None:
+        logger.critical(
+            "AMI reconnect gave up after %d attempts — agent non-functional",
+            10,
+        )
+
+    ami_reconnector = BackoffReconnector(
+        operation=ami_reconnect,
+        label="AMI",
+        min_delay=2.0,
+        max_delay=60.0,
+        max_retries=10,
+        on_give_up=on_ami_give_up,
+    )
+    app.state.ami_reconnector = ami_reconnector
+
     # Initialize rate limiters
     from core.ratelimit import RateLimiter
 
