@@ -49,5 +49,8 @@ dist/
 build/
 *.o
 
+# Handoff documents (local coordination only)
+handoff/
+
 # Claude Code
 .claude/
