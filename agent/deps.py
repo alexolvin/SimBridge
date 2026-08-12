@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import time
 import threading
 from typing import Optional
@@ -37,7 +38,7 @@ def init_deps(app) -> None:
 # ---------------------------------------------------------------------------
 
 async def check_auth(request: Request) -> None:
-    """Verify bearer token."""
+    """Verify bearer token (timing-safe comparison via hmac.compare_digest)."""
     auth_header = request.headers.get("authorization", "")
     token = auth_header.replace("Bearer ", "").strip()
     if not _agent_token:
@@ -45,16 +46,32 @@ async def check_auth(request: Request) -> None:
             status_code=500,
             detail="Agent token not configured",
         )
-    if not token or token != _agent_token:
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
+    # Timing-safe comparison — prevent remote token-length inference
+    if not hmac.compare_digest(token, _agent_token):
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
 async def check_ip(request: Request) -> None:
-    """Verify client IP is in allowlist."""
-    if not _allowed_peers:
-        return  # no allowlist configured — allow all (dev mode)
+    """Verify client IP is in allowlist.
 
+    If _allowed_peers is empty, reject non-localhost connections.
+    Localhost (127.0.0.1) is always allowed for single-node deployments.
+    """
     client_host = request.client.host if request.client else None
+
+    # Always allow localhost (single-node mode)
+    if client_host in ("127.0.0.1", "::1", "localhost"):
+        return
+
+    # No allowlist configured — reject non-localhost (not dev console)
+    if not _allowed_peers:
+        raise HTTPException(
+            status_code=403,
+            detail=f"IP {client_host} rejected — no allowed_peers configured and not localhost",
+        )
+
     if client_host not in _allowed_peers:
         raise HTTPException(
             status_code=403,
@@ -143,6 +160,11 @@ def get_call_registry(request: Request):
 def get_acl(request: Request):
     """Get ACLManager from app state (S04.3)."""
     return request.app.state.acl
+
+
+def get_call_limiter(request: Request):
+    """Get call RateLimiter from app state (S06.1)."""
+    return request.app.state.call_limiter
 
 
 def get_modem_pool(request: Request):

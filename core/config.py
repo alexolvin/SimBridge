@@ -71,6 +71,15 @@ _ENV_RE = re.compile(
 )
 
 
+def _split_listen(value: str) -> tuple[str, str]:
+    """Split a ``host:port`` string into (host, port). Returns ("", "") on failure."""
+    try:
+        host, port = value.rsplit(":", 1)
+        return (host, port)
+    except (ValueError, TypeError):
+        return ("", "")
+
+
 def _expand(obj: Any) -> Any:
     """Expand ``$VAR`` / ``${VAR}`` references in string values.
 
@@ -280,6 +289,28 @@ def load_config(path: Optional[str] = None) -> DotDict:
             errors.append(
                 f"Secret env var {env_name!r} (referenced by {entry.key}) is not set"
             )
+
+    # S06.1: Validate bind addresses — refuse 0.0.0.0 (binds all interfaces)
+    for listen_key in ("agent.listen", "userbot_http.listen"):
+        parts = listen_key.split(".")
+        obj: Any = cfg
+        found = True
+        for part in parts:
+            if isinstance(obj, dict) and part in obj:
+                obj = obj[part]
+            else:
+                found = False
+                break
+        if not found:
+            continue
+
+        if isinstance(obj, str):
+            host, _ = _split_listen(obj)
+            if host == "0.0.0.0":
+                errors.append(
+                    f"Key {listen_key}: bind address 0.0.0.0 binds all interfaces. "
+                    f"Use the Tailscale interface or 127.0.0.1 instead."
+                )
 
     if errors:
         raise ConfigError("Config validation failed:\n  - " + "\n  - ".join(errors))

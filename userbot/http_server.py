@@ -6,6 +6,7 @@ POST to this server over Tailscale. Replaces the shell-command reverse path.
 
 from __future__ import annotations
 
+import hmac
 import os
 from logging import getLogger
 from typing import Optional
@@ -44,9 +45,9 @@ def create_http_server(
 
             {"phone_number": "+7...", "text": "...", "modem_id": "gsm"}
         """
-        # Auth: check secret header
+        # Auth: check secret (timing-safe comparison)
         received_secret = req.headers.get("x-simbridge-secret", "")
-        if received_secret != secret:
+        if not hmac.compare_digest(received_secret, secret):
             raise HTTPException(status_code=401, detail="Invalid secret")
 
         # IP allowlist
@@ -110,7 +111,7 @@ def create_http_server(
         S03.3: Uses ContactResolver for caller display name.
         """
         received_secret = req.headers.get("x-simbridge-secret", "")
-        if received_secret != secret:
+        if not hmac.compare_digest(received_secret, secret):
             raise HTTPException(status_code=401, detail="Invalid secret")
 
         # Parse multipart form-data

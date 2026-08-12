@@ -30,6 +30,7 @@ from agent.deps import (
     get_sms_store,
     get_call_registry,
     get_acl,
+    get_call_limiter,
 )
 from core.call_control import CallRegistry, CallState, InvalidTransition, ModemBusyError
 
@@ -355,12 +356,25 @@ async def call_outgoing(
     blacklist: BlacklistManager = Depends(get_blacklist),
     acl: ACLManager = Depends(get_acl),
     audit: AuditLogger = Depends(get_audit),
+    call_limiter: RateLimiter = Depends(get_call_limiter),
 ):
     """Register an outgoing Telegram → GSM call.
 
     S04.3: ACL is checked BEFORE any call session is created.
     Never call the user first and authorize afterwards.
+
+    S06.1: Rate-limited per user via limits.calls_per_minute.
     """
+    # S06.1: Rate limit calls per user
+    limiter_key = f"call:{req.telegram_user_id or 0}"
+    if not call_limiter.allow(limiter_key):
+        cfg = get_cfg(request)
+        limit_val = cfg.get("limits.calls_per_minute", 3)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {limit_val} calls per minute",
+        )
+
     # ACL check — before any call session (GPT §26)
     if req.telegram_user_id and not acl.check(req.telegram_user_id, "out_call"):
         audit.log(

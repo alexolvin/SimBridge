@@ -78,6 +78,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         window_seconds=3600,
     )
 
+    # S06.1: Call rate limiter per user (limits.calls_per_minute)
+    app.state.call_limiter = RateLimiter(
+        max_requests=cfg["limits.calls_per_minute"],
+        window_seconds=60,
+    )
+
     # Initialize contact resolver (S02.1)
     contacts = ContactResolver(csv_path=cfg["paths.contacts_cache"])
     app.state.contacts = contacts
