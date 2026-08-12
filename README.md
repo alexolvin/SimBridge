@@ -74,6 +74,103 @@ See `docs/install-single-node.md` or `docs/install-distributed.md` for full guid
 
 Incoming SMS and voicemail are forwarded automatically to users with `in_sms` / `in_call` rights.
 
+## Removal
+
+### Single-node (all-in-one)
+
+```bash
+# 1. Stop services
+sudo systemctl stop simbridge-userbot simbridge-agent
+
+# 2. Disable services (no auto-start on reboot)
+sudo systemctl disable simbridge-userbot simbridge-agent
+
+# 3. Remove systemd units
+sudo rm -f /etc/systemd/system/simbridge-userbot.service
+sudo rm -f /etc/systemd/system/simbridge-agent.service
+sudo systemctl daemon-reload
+
+# 4. Remove configuration
+sudo rm -rf /etc/simbridge/
+
+# 5. Remove data (recordings, sessions, cache)
+sudo rm -rf /var/lib/simbridge/
+
+# 6. Remove logs
+sudo rm -rf /var/log/simbridge/
+
+# 7. Clean up Asterisk chan_dongle (if installed separately)
+#    Uncomment in /etc/asterisk/modules.conf:
+#    noload => chan_dongle.so
+#    Then: sudo systemctl restart asterisk
+
+# 8. Remove Tailscale (if installed for SimBridge only)
+sudo tailscale down
+sudo systemctl stop tailscaled
+sudo systemctl disable tailscaled
+sudo apt remove tailscale   # Ubuntu
+# OR
+sudo yum remove tailscale   # EL9
+
+# 9. Remove project directory
+cd /home/user/myhub
+rm -rf SimBridge
+```
+
+### Distributed (two-node)
+
+**GSM Node (Asterisk + agent):**
+```bash
+# 1. Stop service
+sudo systemctl stop simbridge-agent
+sudo systemctl disable simbridge-agent
+
+# 2. Remove systemd unit
+sudo rm -f /etc/systemd/system/simbridge-agent.service
+sudo systemctl daemon-reload
+
+# 3. Remove configuration
+sudo rm -rf /etc/simbridge/
+
+# 4. Remove data
+sudo rm -rf /var/lib/simbridge/
+
+# 5. Remove logs
+sudo rm -rf /var/log/simbridge/
+
+# 6. Clean up Asterisk chan_dongle (see single-node above)
+```
+
+**Telegram Node (userbot + tg-bridge):**
+```bash
+# 1. Stop services
+sudo systemctl stop simbridge-userbot
+# If using Docker for tg-bridge:
+sudo docker compose -f /home/user/myhub/SimBridge/deploy/docker-compose.yml down --remove-orphans
+
+# 2. Disable services
+sudo systemctl disable simbridge-userbot
+
+# 3. Remove systemd unit
+sudo rm -f /etc/systemd/system/simbridge-userbot.service
+sudo systemctl daemon-reload
+
+# 4. Remove configuration
+sudo rm -rf /etc/simbridge/
+
+# 5. Remove data
+sudo rm -rf /var/lib/simbridge/
+
+# 6. Remove logs
+sudo rm -rf /var/log/simbridge/
+
+# 7. Remove project directory
+cd /home/user/myhub
+rm -rf SimBridge
+```
+
+> **⚠️ Warning:** Removal is irreversible. Ensure no users are actively using the system before proceeding. Back up `/etc/simbridge/env` if you plan to re-deploy later (it contains API keys and tokens).
+
 ## Project Structure
 
 ```

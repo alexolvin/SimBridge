@@ -70,6 +70,103 @@ sudo systemctl restart simbridge-agent simbridge-userbot
 
 Входящие SMS и голосовые сообщения пересылаются автоматически пользователям с правами `in_sms` / `in_call`.
 
+## Удаление
+
+### Единый узел (all-in-one)
+
+```bash
+# 1. Остановить сервисы
+sudo systemctl stop simbridge-userbot simbridge-agent
+
+# 2. Отключить автозапуск
+sudo systemctl disable simbridge-userbot simbridge-agent
+
+# 3. Удалить файлы systemd
+sudo rm -f /etc/systemd/system/simbridge-userbot.service
+sudo rm -f /etc/systemd/system/simbridge-agent.service
+sudo systemctl daemon-reload
+
+# 4. Удалить конфигурацию
+sudo rm -rf /etc/simbridge/
+
+# 5. Удалить данные (записи, сессии, кэш)
+sudo rm -rf /var/lib/simbridge/
+
+# 6. Удалить логи
+sudo rm -rf /var/log/simbridge/
+
+# 7. Очистить Asterisk chan_dongle (если устанавливался отдельно)
+#    Раскомментировать в /etc/asterisk/modules.conf:
+#    noload => chan_dongle.so
+#    Затем: sudo systemctl restart asterisk
+
+# 8. Удалить Tailscale (если устанавливался только для SimBridge)
+sudo tailscale down
+sudo systemctl stop tailscaled
+sudo systemctl disable tailscaled
+sudo apt remove tailscale   # Ubuntu
+# ИЛИ
+sudo yum remove tailscale   # EL9
+
+# 9. Удалить директорию проекта
+cd /home/user/myhub
+rm -rf SimBridge
+```
+
+### Распределённая установка (две ноды)
+
+**GSM Node (Asterisk + agent):**
+```bash
+# 1. Остановить сервис
+sudo systemctl stop simbridge-agent
+sudo systemctl disable simbridge-agent
+
+# 2. Удалить файл systemd
+sudo rm -f /etc/systemd/system/simbridge-agent.service
+sudo systemctl daemon-reload
+
+# 3. Удалить конфигурацию
+sudo rm -rf /etc/simbridge/
+
+# 4. Удалить данные
+sudo rm -rf /var/lib/simbridge/
+
+# 5. Удалить логи
+sudo rm -rf /var/log/simbridge/
+
+# 6. Очистить Asterisk chan_dongle (см. единый узел выше)
+```
+
+**Telegram Node (userbot + tg-bridge):**
+```bash
+# 1. Остановить сервисы
+sudo systemctl stop simbridge-userbot
+# Если tg-bridge через Docker:
+sudo docker compose -f /home/user/myhub/SimBridge/deploy/docker-compose.yml down --remove-orphans
+
+# 2. Отключить автозапуск
+sudo systemctl disable simbridge-userbot
+
+# 3. Удалить файл systemd
+sudo rm -f /etc/systemd/system/simbridge-userbot.service
+sudo systemctl daemon-reload
+
+# 4. Удалить конфигурацию
+sudo rm -rf /etc/simbridge/
+
+# 5. Удалить данные
+sudo rm -rf /var/lib/simbridge/
+
+# 6. Удалить логи
+sudo rm -rf /var/log/simbridge/
+
+# 7. Удалить директорию проекта
+cd /home/user/myhub
+rm -rf SimBridge
+```
+
+> **⚠️ Внимание:** Удаление необратимо. Убедитесь, что никто не пользуется системой. Если планируете повторную установку — сохраните `/etc/simbridge/env` (в нём API-ключи и токены).
+
 ## Структура проекта
 
 ```
