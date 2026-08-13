@@ -48,7 +48,7 @@ The interactive script asks:
 | Modem model | e.g. `Huawei E173` (optional) |
 | SIM phone number | `+79991234567` |
 | chan_dongle device | `gsm` (default OK) |
-| AMI password | leave empty for auto-generated |
+| AMI password | auto-detected from manager.conf (press Enter to keep) |
 | Telegram API_ID | from my.telegram.org |
 | Telegram API_HASH | from my.telegram.org |
 | Telegram username | your handle without `@` |

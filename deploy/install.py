@@ -429,21 +429,10 @@ def phase_gather() -> None:
         s.sim_phone = ask("SIM phone number (e.g. +79991234567)")
         s.dongle_name = ask("chan_dongle device name", default="gsm")
 
-        ami = Path("/etc/asterisk/manager.conf")
-        if not ami.exists():
-            pw = ask("AMI password (leave empty for auto-generated)", required=False)
-            if not pw:
-                pw = _rand(24)
-                warn(f"Auto-generated AMI password: {pw}")
-            s.ami_pw = pw
-        else:
-            cur = _read_ami_pw(ami)
-            if cur:
-                info("Current AMI password: set")
-                pw = ask("New AMI password (empty = keep)", required=False)
-                s.ami_pw = pw or cur
-            else:
-                s.ami_pw = ask("AMI password (Asterisk Management Interface)", required=True)
+        s.ami_pw = _ensure_ami()
+        new_pw = ask("AMI password (empty = use auto-detected)", required=False)
+        if new_pw:
+            s.ami_pw = new_pw
 
     if tg:
         info("", "--- Telegram ---")
@@ -642,17 +631,33 @@ def _clone_repo() -> None:
 
 def _setup_ami() -> None:
     ami = Path("/etc/asterisk/manager.conf")
+    cur = _read_ami_pw(ami)
+    if cur and cur == s.ami_pw:
+        ok("AMI configured.", str(ami))
+        return
+
     if not ami.exists():
         ami.parent.mkdir(parents=True, exist_ok=True)
-        ami.write_text(
-            f"[general]\nenabled = yes\nport = 5038\nbindaddr = 127.0.0.1\n\n"
-            f"[simbridge]\nsecret = {s.ami_pw}\n"
-            f"read = system,call,log,verbose,command,agent,user\n"
-            f"write = system,call,log,verbose,command,agent,user\n")
-        ami.chmod(0o640)
-        ok("AMI configured.")
-    else:
-        info(f"{ami} exists — keeping current config.")
+
+    cfg = (
+        "[general]\n"
+        "enabled = yes\n"
+        "port = 5038\n"
+        "bindaddr = 127.0.0.1\n\n"
+        "[simbridge]\n"
+        f"secret = {s.ami_pw}\n"
+        "deny = 0.0.0.0/0.0.0.0\n"
+        "permit = 127.0.0.1/255.255.255.0\n"
+        "read = all\n"
+        "write = all\n"
+    )
+    ami.write_text(cfg)
+    ami.chmod(0o640)
+    try:
+        ami.chown(30, 30)  # asterisk:asterisk
+    except OSError:
+        pass
+    ok("AMI configured.", str(ami))
 
 def _write_config() -> None:
     heading("Writing Configuration")
@@ -984,19 +989,94 @@ def _rand(n: int) -> str:
     return secrets.token_hex(n // 2)
 
 def _read_ami_pw(p: Path) -> str:
+    """Read the first 'secret' value from any section in manager.conf."""
     try:
         sec = False
         for ln in p.read_text().splitlines():
             s = ln.strip()
-            if s == "[simbridge]":
-                sec = True; continue
-            if sec and s.startswith("["):
-                break
+            if s.startswith("[") and s.endswith("]"):
+                sec = True
+                continue
             if sec and s.startswith("secret"):
-                return s.partition("=")[2].strip()
+                val = s.partition("=")[2].strip()
+                if val:
+                    return val
     except OSError:
         pass
     return ""
+
+
+def _ensure_ami() -> str:
+    """Ensure manager.conf exists with a valid secret. Auto-generate if needed."""
+    ami = Path("/etc/asterisk/manager.conf")
+    pw = _read_ami_pw(ami)
+    if pw:
+        ok("AMI password:", " found in manager.conf")
+        return pw
+
+    pw = _rand(24)
+    if not ami.exists():
+        ami.parent.mkdir(parents=True, exist_ok=True)
+        ami.write_text(
+            "[general]\n"
+            "enabled = yes\n"
+            "port = 5038\n"
+            "bindaddr = 127.0.0.1\n\n"
+            "[simbridge]\n"
+            f"secret = {pw}\n"
+            "deny = 0.0.0.0/0.0.0.0\n"
+            "permit = 127.0.0.1/255.255.255.0\n"
+            "read = all\n"
+            "write = all\n")
+        ami.chmod(0o640)
+        try:
+            ami.chown(30, 30)  # asterisk:asterisk
+        except OSError:
+            pass
+        ok("AMI configured:", str(ami))
+    else:
+        warn("manager.conf exists but no secret found — generating one.")
+        info("To customize, edit", str(ami))
+        # Inject password into existing config (after [general])
+        try:
+            text = ami.read_text()
+            lines = text.split("\n")
+            new_lines = []
+            inserted = False
+            for i, line in enumerate(lines):
+                new_lines.append(line)
+                if not inserted and line.strip() == "[general]":
+                    # insert after [general] block — find next section or end
+                    for j in range(i + 1, len(lines)):
+                        if lines[j].strip().startswith("["):
+                            break
+                        new_lines.append(lines[j])
+                    # Insert our section
+                    new_lines.append("")
+                    new_lines.append("[simbridge]")
+                    new_lines.append(f"secret = {pw}")
+                    new_lines.append("deny = 0.0.0.0/0.0.0.0")
+                    new_lines.append("permit = 127.0.0.1/255.255.255.0")
+                    new_lines.append("read = all")
+                    new_lines.append("write = all")
+                    # Add remaining lines
+                    for k in range(j, len(lines)):
+                        new_lines.append(lines[k])
+                    inserted = True
+                    break
+            if not inserted:
+                new_lines.append("")
+                new_lines.append("[simbridge]")
+                new_lines.append(f"secret = {pw}")
+                new_lines.append("deny = 0.0.0.0/0.0.0.0")
+                new_lines.append("permit = 127.0.0.1/255.255.255.0")
+                new_lines.append("read = all")
+                new_lines.append("write = all")
+            ami.write_text("\n".join(new_lines))
+            ami.chmod(0o640)
+        except OSError:
+            warn("Could not write to", str(ami))
+    return pw
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
