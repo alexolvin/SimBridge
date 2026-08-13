@@ -359,6 +359,8 @@ def phase_existing() -> None:
         info("Aborted."); sys.exit(0)
     else:
         s.action = "update"
+        info("Loading existing configuration for defaults...")
+        _load_existing_config()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 3 — Diagnostics
@@ -415,7 +417,8 @@ def phase_diag() -> None:
 
 def phase_gather() -> None:
     heading("4 / 8 — Configuration")
-    s.node_id = ask("Node ID", default=os.uname().nodename)
+    _nid = s.node_id or os.uname().nodename
+    s.node_id = ask("Node ID", default=_nid)
 
     gsm = s.node_role in ("gsm", "all-in-one")
     tg = s.node_role in ("telegram", "all-in-one")
@@ -432,7 +435,7 @@ def phase_gather() -> None:
             warn("No USB modems detected via lsusb.")
             s.modem_model = ask("Enter modem model manually", required=True)
         s.sim_phone = ask("SIM phone number (e.g. +79991234567)")
-        s.dongle_name = ask("chan_dongle device name", default="gsm")
+        s.dongle_name = ask("chan_dongle device name", default=s.dongle_name or "gsm")
 
         s.ami_pw = _ensure_ami()
         new_pw = ask("AMI password (empty = use auto-detected)", required=False)
@@ -441,13 +444,17 @@ def phase_gather() -> None:
 
     if tg:
         info("", "--- Telegram ---")
-        s.tg_api_id = ask("Telegram API_ID (my.telegram.org/apps)")
-        s.tg_api_hash = ask("Telegram API_HASH")
-        s.tg_username = ask("Telegram username (without @)")
+        s.tg_api_id = ask("Telegram API_ID (my.telegram.org/apps)",
+                          default=s.tg_api_id)
+        s.tg_api_hash = ask("Telegram API_HASH",
+                            default=s.tg_api_hash)
+        s.tg_username = ask("Telegram username (without @)",
+                            default=s.tg_username)
 
     info("", "--- Secrets ---")
     if s.node_role in ("gsm", "all-in-one"):
-        tok = ask("Agent token (empty = auto)", required=False)
+        tok = ask("Agent token (empty = auto)",
+                  required=False, default=s.agent_token)
         if not tok:
             tok = _rand(32)
             warn(f"Agent token: {tok}")
@@ -456,8 +463,10 @@ def phase_gather() -> None:
 
     if tg:
         if s.node_role == "telegram":
-            s.agent_token = ask("Agent token (must match GSM node)")
-        sec = ask("HTTP secret (empty = auto)", required=False)
+            s.agent_token = ask("Agent token (must match GSM node)",
+                                default=s.agent_token)
+        sec = ask("HTTP secret (empty = auto)",
+                  required=False, default=s.http_secret)
         if not sec:
             sec = _rand(32)
             warn(f"HTTP secret: {sec}")
@@ -465,17 +474,24 @@ def phase_gather() -> None:
 
     if s.install_type == "distributed":
         info("", "--- Network ---")
-        s.own_ip = s.ts_ip if s.ts_ip else ask("This node's Tailscale IP")
+        _own = s.ts_ip or s.own_ip or ""
+        if not _own:
+            _own = ask("This node's Tailscale IP")
+        s.own_ip = _own
         if s.node_role == "gsm":
-            s.peer_ip = ask("Telegram node Tailscale IP", required=True)
+            s.peer_ip = ask("Telegram node Tailscale IP",
+                            required=True, default=s.peer_ip)
         else:
-            s.peer_ip = ask("GSM node Tailscale IP", required=True)
+            s.peer_ip = ask("GSM node Tailscale IP",
+                            required=True, default=s.peer_ip)
     else:
         s.own_ip = "127.0.0.1"
         s.peer_ip = "127.0.0.1"
 
     info("", "--- ACL ---")
-    s.acl_ids = ask("Telegram user ID(s) (space-separated, e.g. 123456789; each gets admin access to all ops)", required=True)
+    s.acl_ids = ask(
+        "Telegram user ID(s) (space-separated, e.g. 123456789; each gets admin access to all ops)",
+        required=True, default=s.acl_ids)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 5 — Remove / Install
@@ -1213,6 +1229,110 @@ def _handoff() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _load_existing_config() -> None:
+    """Load existing configuration from simbridge.yaml and env file.
+
+    Populates s.* fields so phase_gather can offer them as defaults
+    during update-in-place installations.
+    """
+    # ── Parse simbridge.yaml (simple key: value parser, no PyYAML needed) ──
+    cfg_path = Path(CONF_FILE)
+    if not cfg_path.exists():
+        return
+
+    yaml: Dict[str, str] = {}
+    try:
+        for raw_line in cfg_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("*"):
+                continue
+            if ":" in line:
+                key, _, val = line.partition(":")
+                yaml[key.strip()] = val.strip().strip('"')
+    except OSError:
+        return
+
+    # ── Parse env file (KEY=VALUE secrets) ──
+    env: Dict[str, str] = {}
+    env_path = Path(ENV_FILE)
+    if env_path.exists():
+        try:
+            for raw_line in env_path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+        except OSError:
+            pass
+
+    # ── Parse ACL file (extract Telegram user IDs) ──
+    acl_path = Path(ACL_FILE)
+    if acl_path.exists():
+        try:
+            ids = []
+            for raw_line in acl_path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if parts and parts[0].isdigit():
+                    ids.append(parts[0])
+            if ids:
+                s.acl_ids = " ".join(ids)
+                info("Loaded existing ACL:", f" {s.acl_ids}")
+        except OSError:
+            pass
+
+    # ── Populate state from config ──
+    if "node.id" in yaml and not s.node_id:
+        s.node_id = yaml["node.id"]
+        info("Loaded existing node_id:", s.node_id)
+
+    if "asterisk.dongle" in yaml and s.dongle_name == "gsm":
+        s.dongle_name = yaml["asterisk.dongle"]
+        info("Loaded existing dongle_name:", s.dongle_name)
+
+    if "telegram.master_username" in yaml and not s.tg_username:
+        s.tg_username = yaml["telegram.master_username"]
+        info("Loaded existing tg_username:", s.tg_username)
+
+    # ── Secrets from env ──
+    if "SIMBRIDGE_AGENT_TOKEN" in env and not s.agent_token:
+        s.agent_token = env["SIMBRIDGE_AGENT_TOKEN"]
+        info("Loaded existing agent token.")
+
+    if "SIMBRIDGE_TG_API_ID" in env and not s.tg_api_id:
+        s.tg_api_id = env["SIMBRIDGE_TG_API_ID"]
+        s.tg_api_hash = env.get("SIMBRIDGE_TG_API_HASH", "")
+        info("Loaded existing Telegram API credentials.")
+
+    if "SIMBRIDGE_HTTP_SECRET" in env and not s.http_secret:
+        s.http_secret = env["SIMBRIDGE_HTTP_SECRET"]
+        info("Loaded existing HTTP secret.")
+
+    if "SIMBRIDGE_AMI_PASSWORD" in env and not s.ami_pw:
+        s.ami_pw = env["SIMBRIDGE_AMI_PASSWORD"]
+        info("Loaded existing AMI password.")
+
+    # ── Network (agent.listen, allowed_peers) ──
+    agent_listen = yaml.get("agent.listen", "")
+    if agent_listen and ":" in agent_listen and not s.own_ip:
+        s.own_ip = agent_listen.rsplit(":", 1)[0]
+
+    userbot_listen = yaml.get("userbot_http.listen", "")
+    if userbot_listen and ":" in userbot_listen and not s.own_ip:
+        s.own_ip = userbot_listen.rsplit(":", 1)[0]
+
+    bridge_host = yaml.get("voice.bridge_host", "")
+    if bridge_host and bridge_host != "127.0.0.1" and not s.peer_ip:
+        s.peer_ip = bridge_host
+
+    if s.own_ip and s.own_ip != "127.0.0.1":
+        info("Loaded existing network:", f" own={s.own_ip}, peer={s.peer_ip}")
+
 
 def _write_default_asterisk_conf() -> None:
     """Create a minimal asterisk.conf when dnf/apt drops the file."""
