@@ -407,7 +407,7 @@ def phase_gather() -> None:
 
     if gsm:
         info("", "--- GSM / Modem ---")
-        s.modem_model = ask("Modem model (e.g. Huawei E173)", required=False)
+        s.modem_model = ask("Modem model (e.g. Huawei E173)", required=True)
         s.sim_phone = ask("SIM phone number (e.g. +79991234567)")
         s.dongle_name = ask("chan_dongle device name", default="gsm")
 
