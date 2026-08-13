@@ -103,16 +103,16 @@ def _w(s: str = "") -> None:
     print(s, file=sys.stderr)
 
 def info(label: str, value: str = "") -> None:
-    _w(f"{C.C}  {label}{C._0}{value}")
+    _w(f"{C.C}  {label} {value}{C._0}")
 
 def warn(label: str, value: str = "") -> None:
-    _w(f"{C.Y}  {label}{C._0}{value}")
+    _w(f"{C.Y}  {label} {value}{C._0}")
 
 def ok(label: str, value: str = "") -> None:
-    _w(f"{C.G}  {label}{C._0}{value}")
+    _w(f"{C.G}  {label} {value}{C._0}")
 
 def fail(label: str, value: str = "") -> None:
-    _w(f"{C.R}  {label}{C._0}{value}")
+    _w(f"{C.R}  {label} {value}{C._0}")
 
 def heading(title: str) -> None:
     _w(f"\n{C.B}=== {title} ==={C._0}\n")
@@ -501,7 +501,7 @@ def phase_install() -> None:
     tg = s.node_role in ("telegram", "all-in-one")
 
     # ── System packages ──
-    run(f"{s.mgr} update")
+    run(f"{s.mgr} update -y")
     run(s.pkg.format("python3 python3-pip python3-venv git curl"))
     if gsm:
         run(s.pkg.format("asterisk"))
@@ -579,7 +579,7 @@ def _install_tailscale() -> None:
         Path("/etc/apt/sources.list.d/tailscale.list").write_text(
             f"deb [signed-by=/etc/apt/keyrings/tailscale.gpg] "
             f"https://pkgs.tailscale.com/stable/{s.os_id} main\n")
-        run(f"{s.mgr} update")
+        run(f"{s.mgr} update -y")
     run(s.pkg.format("tailscale"))
     run_ok("systemctl enable --now tailscaled")
 
