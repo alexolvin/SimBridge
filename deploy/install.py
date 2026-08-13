@@ -505,7 +505,9 @@ def phase_install() -> None:
     # ── System packages ──
     info("Updating package cache... (may take a while, output follows below)")
     run(f"{s.mgr} update -y")
-    run(s.pkg.format("python3 python3-pip python3-venv git curl"))
+    run(s.pkg.format("python3 python3-pip git curl"))
+    # python3-venv: needed on Debian/Ubuntu; bundled with python3 on RHEL 9+
+    run_ok(s.pkg.format("python3-venv"))
     if gsm:
         run(s.pkg.format("asterisk"))
         run_ok(s.pkg.format("asterisk-addons"))
