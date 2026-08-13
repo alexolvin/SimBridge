@@ -224,6 +224,9 @@ class S:
     # Source path — where the repo ends up after clone
     src_dir: str = ""
 
+    # Verification results — populated by phase_verify()
+    verify_issues: List = []
+
 s = S()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -868,71 +871,289 @@ def phase_start() -> None:
     tg = s.node_role in ("telegram", "all-in-one")
 
     if gsm:
-        if run_ok("systemctl is-active --quiet asterisk"):
-            ok("Asterisk running.")
+        # ── Ensure asterisk.conf exists (RHEL/Alma bug: package drops it) ──
+        ast_conf = Path("/etc/asterisk/asterisk.conf")
+        if not ast_conf.exists():
+            warn("Missing /etc/asterisk/asterisk.conf — creating defaults.")
+            _write_default_asterisk_conf()
+
+        # ── Start Asterisk ──
+        if not run_ok("systemctl is-active --quiet asterisk"):
+            info("Starting Asterisk...")
+            if run_ok("systemctl start asterisk"):
+                ok("Asterisk started.")
+            else:
+                fail("Asterisk failed to start.")
+                r = run_q("systemctl status asterisk --no-pager 2>&1 | tail -8")
+                _w(r.stdout)
+                info("Check logs: sudo journalctl -u asterisk --no-pager -n 20")
         else:
-            warn("Asterisk not running — trying start...")
-            if not run_ok("systemctl start asterisk"):
-                warn("Start Asterisk manually.")
-        if not run_ok("systemctl start simbridge-agent"):
-            warn("Agent start deferred.")
+            ok("Asterisk already running.")
+
+        # ── Start simbridge-agent ──
+        if not run_ok("systemctl is-active --quiet simbridge-agent"):
+            info("Starting simbridge-agent...")
+            if not run_ok("systemctl start simbridge-agent"):
+                warn("Agent failed to start — will be rechecked in verification.")
+        else:
+            ok("simbridge-agent already running.")
 
     if tg:
-        if Path(f"{DATA_DIR}/sim_session.session").exists():
-            if not run_ok("systemctl start simbridge-userbot"):
-                warn("Userbot start deferred.")
+        sess = Path(f"{DATA_DIR}/sim_session.session")
+        if not sess.exists():
+            warn("Telegram session file not found — userbot cannot start.")
+            info(f"Re-run installer and choose 'Log in now' in Phase 6.")
         else:
-            warn("Telegram session not found.")
+            if not run_ok("systemctl is-active --quiet simbridge-userbot"):
+                info("Starting simbridge-userbot...")
+                if not run_ok("systemctl start simbridge-userbot"):
+                    warn("Userbot failed to start — will be rechecked in verification.")
+            else:
+                ok("simbridge-userbot already running.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 8 — Verify + Test
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _check(label: str, ok_: bool, detail: str = "", fix: str = "") -> None:
+    """Run one verification check and report result + remediation."""
+    if ok_:
+        ok(f"[OK] {label}")
+    else:
+        fail(f"[FAIL] {label}")
+        if detail:
+            _w(detail)
+        if fix:
+            info("Fix:", fix)
+
+    s.verify_issues.append((label, not ok_, fix))
+
 
 def phase_verify() -> None:
     heading("8 / 8 — Verification")
     gsm = s.node_role in ("gsm", "all-in-one")
     tg = s.node_role in ("telegram", "all-in-one")
 
+    s.verify_issues = []  # (label, failed, fix_command)
+
+    # ═══ GSM checks ═══
     if gsm:
-        r = run_q("systemctl status simbridge-agent --no-pager 2>&1 | head -15")
-        _w(r.stdout[:500])
-        url = "http://127.0.0.1:8090/v1/health" if s.install_type == "single" \
-              else f"http://{s.own_ip}:8090/v1/health"
-        r = run_q(f'curl -sf {url} -H "Authorization: Bearer {s.agent_token}"')
-        ok("Health:", " OK") if not r.returncode else warn("Health check failed.")
-        if s.has_dongle:
-            r = run_q("asterisk -rx 'dongle show status' 2>/dev/null")
-            _w(r.stdout[:500])
+        _w(f"\n  {'─' * 50}")
+        _w(f"  Checking GSM services (node: {s.node_id})")
+        _w(f"  {'─' * 50}\n")
 
-    if tg:
-        r = run_q("systemctl status simbridge-userbot --no-pager 2>&1 | head -15")
-        _w(r.stdout[:500])
-
-    # ── Test guidance ──
-    heading("Testing")
-    if gsm:
-        info("1. Modem:", " asterisk -rx 'dongle show status'")
-        info("2. SMS:", " /sms <phone> <message>")
-        info("3. Call:", f" call {s.sim_phone}")
-    if tg:
-        info("1. Telegram — /status")
-        info("2. SMS: /sms <phone> <msg>")
-    if s.install_type == "distributed" and s.node_role == "telegram":
-        info("Connectivity:",
-             f" curl http://{s.peer_ip}:8090/v1/health "
-             f"-H 'Authorization: Bearer {s.agent_token}'")
-
-    if ask_yn("Tests completed?", False):
-        if ask_yn("All passed?"):
-            ok("SimBridge is operational.")
+        # 1. simbridge-agent
+        r = run_q("systemctl is-active simbridge-agent 2>&1")
+        agent_active = r.stdout.strip() == "active"
+        if not agent_active:
+            r2 = run_q("systemctl status simbridge-agent --no-pager 2>&1 | tail -8")
+            detail = r2.stdout.strip().replace("\n", "\n    ")
+            fix = ("journalctl -u simbridge-agent -n 30 --no-pager\n"
+                   "systemctl start simbridge-agent")
         else:
-            issue = ask("Describe issues", required=False)
-            if issue:
-                warn("Noted:", f" {issue}")
-            warn("Logs:", " journalctl -u simbridge-agent -u simbridge-userbot")
+            detail = ""; fix = ""
+        _check("simbridge-agent service", agent_active,
+               f"    {detail}", fix)
+
+        # 2. Asterisk
+        r = run_q("systemctl is-active asterisk 2>&1")
+        ast_active = r.stdout.strip() == "active"
+        if not ast_active:
+            r2 = run_q("systemctl status asterisk --no-pager 2>&1 | tail -8")
+            detail = r2.stdout.strip().replace("\n", "\n    ")
+            # Check if config file is missing (common RHEL/Alma issue)
+            if not Path("/etc/asterisk/asterisk.conf").exists():
+                fix = ("Create /etc/asterisk/asterisk.conf from package defaults,\n"
+                       "then: systemctl start asterisk")
+            else:
+                fix = ("journalctl -u asterisk -n 30 --no-pager\n"
+                       "systemctl start asterisk")
+        else:
+            detail = ""; fix = ""
+        _check("Asterisk service", ast_active,
+               f"    {detail}", fix)
+
+        # 3. chan_dongle module (only meaningful if Asterisk is running)
+        if ast_active:
+            r = run_q("asterisk -rx 'module show like dongle' 2>/dev/null")
+            dongle_loaded = "dongle" in r.stdout.lower() and "active" in r.stdout.lower()
+            _check("chan_dongle module loaded", dongle_loaded,
+                   f"    Output: {r.stdout.strip()[:200]}",
+                   "asterisk -rx 'module load chan_dongle.so'")
+
+            # 4. Dongle status
+            if dongle_loaded:
+                r = run_q("asterisk -rx 'dongle show status' 2>/dev/null")
+                has_status = r.returncode == 0 and "No such command" not in r.stdout
+                if not has_status:
+                    detail = r.stdout.strip().replace("\n", "\n    ")
+                    fix = ("Check chan_dongle version. Command may be:\n"
+                           "  asterisk -rx 'core show help' | grep dongle")
+                else:
+                    detail = r.stdout.strip().replace("\n", "\n    ")
+                _check("Dongle modem status", has_status,
+                       f"    {detail}", fix)
+        else:
+            warn("[SKIP] chan_dongle / modem status — Asterisk not running")
+            s.verify_issues.append(
+                ("chan_dongle / modem status (SKIP: Asterisk down)", True, ""))
+
+        # 5. Agent health endpoint
+        url = ("http://127.0.0.1:8090/v1/health"
+               if s.install_type == "single"
+               else f"http://{s.own_ip}:8090/v1/health")
+        r = run_q(f'curl -sf --max-time 5 {url} '
+                  f'-H "Authorization: Bearer {s.agent_token}"')
+        health_ok = r.returncode == 0
+        if not health_ok and agent_active:
+            detail = (f"    URL: {url}\n"
+                      f"    Response: {r.stderr.strip()[:300] or r.stdout.strip()[:300]}")
+            fix = ("Check agent logs: journalctl -u simbridge-agent -n 20 --no-pager\n"
+                   "Check config: cat /etc/simbridge/simbridge.yaml")
+        elif not health_ok and not agent_active:
+            detail = "    Agent not running — health check cannot succeed"
+            fix = ""
+        else:
+            detail = ""; fix = ""
+        _check("Agent health endpoint (" + url + ")", health_ok,
+               detail, fix)
+
+    # ═══ Telegram checks ═══
+    if tg:
+        _w(f"\n  {'─' * 50}")
+        _w(f"  Checking Telegram services (node: {s.node_id})")
+        _w(f"  {'─' * 50}\n")
+
+        # 1. Session file
+        sess = Path(f"{DATA_DIR}/sim_session.session")
+        sess_ok = sess.exists()
+        if not sess_ok:
+            fix = ("Re-run installer and complete Telegram login in Phase 6")
+        else:
+            fix = ""
+        _check("Telegram session file", sess_ok,
+               f"    Path: {DATA_DIR}/sim_session.session", fix)
+
+        # 2. simbridge-userbot service
+        r = run_q("systemctl is-active simbridge-userbot 2>&1")
+        bot_active = r.stdout.strip() == "active"
+        if not bot_active and not sess_ok:
+            detail = "    Cannot start — Telegram session missing"
+            fix = ""
+        elif not bot_active:
+            r2 = run_q("systemctl status simbridge-userbot --no-pager 2>&1 | tail -8")
+            detail = r2.stdout.strip().replace("\n", "\n    ")
+            fix = ("journalctl -u simbridge-userbot -n 30 --no-pager\n"
+                   "systemctl start simbridge-userbot")
+        else:
+            detail = ""; fix = ""
+        _check("simbridge-userbot service", bot_active, detail, fix)
+
+    # ═══ Cross-node connectivity (distributed) ═══
+    if s.install_type == "distributed":
+        _w(f"\n  {'─' * 50}")
+        _w(f"  Cross-node connectivity")
+        _w(f"  {'─' * 50}\n")
+
+        if gsm:
+            peer_label = "Telegram"
+        else:
+            peer_label = "GSM"
+
+        info(f"Peer ({peer_label} node):", f" {s.peer_ip}")
+        info("", "  This check requires the peer node to be installed and running.")
+
+        if ask_yn(f"Is the {peer_label} node ({s.peer_ip}) up and running?"):
+            r = run_q(f'curl -sf --max-time 10 http://{s.peer_ip}:8090/v1/health '
+                      f'-H "Authorization: Bearer {s.agent_token}"')
+            if r.returncode == 0:
+                _check(f"Connectivity to {peer_label} node ({s.peer_ip})", True)
+            else:
+                detail = (f"    curl returned exit code {r.returncode}\n"
+                          f"    stderr: {r.stderr.strip()[:200]}")
+                fix = (f"1. Verify {peer_label} node is on Tailscale: tailscale status\n"
+                       f"2. Check agent is running: systemctl status simbridge-agent\n"
+                       f"3. Verify token matches on both nodes\n"
+                       f"4. Test manually:\n"
+                       f"   curl -v http://{s.peer_ip}:8090/v1/health "
+                       f'-H "Authorization: Bearer {{token}}"')
+                _check(f"Connectivity to {peer_label} node ({s.peer_ip})", False,
+                       detail, fix)
+        else:
+            info("", f"  Skipping — peer node ({peer_label}, {s.peer_ip}) not ready.")
+            s.verify_issues.append(
+                (f"Cross-node connectivity to {peer_label} ({s.peer_ip}) — SKIPPED",
+                 False, ""))
+
+    # ═══ Summary ═══
+    _w()
+    heading("Verification Result")
+
+    failures = [(l, f) for l, failed, f in s.verify_issues if failed]
+    skips = [(l, f) for l, failed, f in s.verify_issues
+             if not failed and "SKIP" in l.upper()]
+    passes = [(l, f) for l, failed, f in s.verify_issues
+              if not failed and "SKIP" not in l.upper()]
+
+    if passes:
+        _w(f"  {C.G}Passed ({len(passes)}):{C._0}")
+        for l, _ in passes:
+            _w(f"    {C.G}+{C._0} {l}")
+
+    if failures:
+        _w(f"\n  {C.R}Failed ({len(failures)}):{C._0}")
+        for l, f in failures:
+            _w(f"    {C.R}x{C._0} {l}")
+            if f:
+                _w(f"       Fix: {f.split(chr(10))[0]}")
+
+    if skips:
+        _w(f"\n  {C.Y}Skipped ({len(skips)}):{C._0}")
+        for l, _ in skips:
+            _w(f"    {C.Y}-{C._0} {l}")
+
+    if not s.verify_issues:
+        info("No checks were performed (role may not require verification).")
+
+    if failures:
+        _w()
+        fail(f"Installation has {len(failures)} issue(s) that need attention.")
+        _w()
+        info("Useful commands:", f" (node: {s.node_id})")
+        if gsm:
+            info("  Agent logs:", " journalctl -u simbridge-agent -f --no-pager")
+            info("  Asterisk logs:", " journalctl -u asterisk -f --no-pager")
+            info("  Asterisk CLI:", " asterisk -cv")
+        if tg:
+            info("  Userbot logs:", " journalctl -u simbridge-userbot -f --no-pager")
+        info("  Config:", f" cat {CONF_FILE}")
+        info("  Secrets:", f" cat {ENV_FILE}")
+    elif skips and not failures:
+        _w()
+        warn("Some checks were skipped — complete them when peer node is ready.")
     else:
-        info("Test at your convenience.")
-        info("Logs:", " journalctl -u simbridge-agent -f / -u simbridge-userbot -f")
+        _w()
+        ok("All automated checks passed.")
+
+    # Manual tests (always shown — these require real SMS/voice)
+    _w()
+    heading("Manual Tests (requires real modem + SIM)")
+    if gsm:
+        info("1. Modem status:",
+             "  sudo asterisk -rx 'module show like dongle'")
+        info("   Expected:", "   chan_dongle.so listed as 'active'")
+        info("")
+        info("2. Send SMS via Telegram:", " /sms +7XXXXXXXXXX test")
+        info("   Expected:", "   SMS delivered confirmation from bot")
+        info("")
+        info("3. Receive call:", f"  Call {s.sim_phone} from any phone")
+        info("   Expected:", "   Telegram notification about incoming call")
+    if tg:
+        info("1. Bot status:", "  Send /status to your Telegram bot")
+        info("   Expected:", "   Bot responds with system status")
+        info("")
+        info("2. Send SMS:", "  /sms +7XXXXXXXXXX test")
+        info("   Expected:", "   Bot confirms SMS sent via GSM node")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary + Handoff
@@ -992,6 +1213,40 @@ def _handoff() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _write_default_asterisk_conf() -> None:
+    """Create a minimal asterisk.conf when dnf/apt drops the file."""
+    p = Path("/etc/asterisk/asterisk.conf")
+    if p.exists():
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "; Asterisk configuration file\n"
+        "\n"
+        "[files]\n"
+        "#astconfig = asterisk.conf\n"
+        "ast_functions = functions.conf\n"
+        "\n"
+        "[cli]\n"
+        ";highlight = yes\n"
+        "update = yes\n"
+        "\n"
+        "[console]\n"
+        "priority = -1\n"
+        "\n"
+        "[logging]\n"
+        "\n"
+        "[netsock2]\n"
+        ";\n"
+        "; This section defines some parameters for the network\n"
+        "; listening socket (manager, IAX2, SIP, etc.)\n"
+        ";\n"
+        "#maxopensock = 4096\n"
+        "\n"
+        "[languages]\n"
+        ";defaultlanguage=en\n"
+        ";language=en,de,fr,it,ja,es\n"
+    )
 
 def _rand(n: int) -> str:
     return secrets.token_hex(n // 2)
