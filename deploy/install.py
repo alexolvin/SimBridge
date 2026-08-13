@@ -443,7 +443,7 @@ def phase_gather() -> None:
                 pw = ask("New AMI password (empty = keep)", required=False)
                 s.ami_pw = pw or cur
             else:
-                s.ami_pw = ask("AMI password")
+                s.ami_pw = ask("AMI password (Asterisk Management Interface)", required=True)
 
     if tg:
         info("", "--- Telegram ---")
@@ -473,15 +473,15 @@ def phase_gather() -> None:
         info("", "--- Network ---")
         s.own_ip = s.ts_ip if s.ts_ip else ask("This node's Tailscale IP")
         if s.node_role == "gsm":
-            s.peer_ip = ask("Telegram node Tailscale IP")
+            s.peer_ip = ask("Telegram node Tailscale IP", required=True)
         else:
-            s.peer_ip = ask("GSM node Tailscale IP")
+            s.peer_ip = ask("GSM node Tailscale IP", required=True)
     else:
         s.own_ip = "127.0.0.1"
         s.peer_ip = "127.0.0.1"
 
     info("", "--- ACL ---")
-    s.acl_ids = ask("Telegram user ID(s) (space-separated)", required=False)
+    s.acl_ids = ask("Telegram user ID(s) (space-separated, e.g. 123456789; each gets admin access to all ops)", required=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 5 — Remove / Install
