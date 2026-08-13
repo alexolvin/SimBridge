@@ -60,6 +60,20 @@ def _ver_tuple(v: str) -> tuple:
     parts = v.split("+")[0].split(".")  # strip metadata
     return tuple(int(p) for p in parts if p.isdigit())
 
+def _short_modem(raw: str) -> str:
+    """'Bus 001 ... ID 12d1:1001 Huawei ... E173 ...' -> short model name.
+
+    lsusb lines contain: Bus XXX Device XXX: ID vendor:product <full name>
+    We extract the words after the ID field and keep the first two
+    (e.g. 'Huawei E173', 'Quectel EC20'). For manual entries the raw
+    string is returned as-is.
+    """
+    m = re.search(r"ID [0-9a-fA-F]+:[0-9a-fA-F]+\s+(.+)", raw)
+    if m:
+        parts = m.group(1).split()
+        return " ".join(parts[:2]) if len(parts) >= 2 else parts[0]
+    return raw  # manual entry — display as-is
+
 INSTALL_DIR   = "/opt/simbridge"
 VENV_DIR      = "/opt/simbridge-venv"
 CONF_DIR      = "/etc/simbridge"
@@ -389,10 +403,6 @@ def phase_diag() -> None:
             ok("USB serial:", f" {', '.join(s.tty_devs)}")
         else:
             warn("No /dev/ttyUSB* or /dev/ttyACM* found.")
-        if s.usb_modems:
-            ok("Modem(s):")
-            for m in s.usb_modems:
-                info("", m.strip())
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 4 — Gather configuration
@@ -407,7 +417,15 @@ def phase_gather() -> None:
 
     if gsm:
         info("", "--- GSM / Modem ---")
-        s.modem_model = ask("Modem model (e.g. Huawei E173)", required=True)
+        modems = s.usb_modems
+        if modems:
+            choices = list(modems) + ["Other (manual entry)"]
+            s.modem_model = pick("Select connected modem:", choices, 0)
+            if s.modem_model == "Other (manual entry)":
+                s.modem_model = ask("Enter modem model manually", required=True)
+        else:
+            warn("No USB modems detected via lsusb.")
+            s.modem_model = ask("Enter modem model manually", required=True)
         s.sim_phone = ask("SIM phone number (e.g. +79991234567)")
         s.dongle_name = ask("chan_dongle device name", default="gsm")
 
@@ -948,7 +966,7 @@ def _handoff() -> None:
         *(["- simbridge-userbot"] if s.node_role in ("telegram", "all-in-one") else []),
         "", "## Details", "",
         *(f"- SIM: {s.sim_phone}" if s.sim_phone else ""),
-        *(f"- Modem: {s.modem_model}" if s.modem_model else ""),
+        *(f"- Modem: {_short_modem(s.modem_model)}" if s.modem_model else ""),
         *(f"- Tailscale: {s.ts_ip}" if s.ts_ip else ""),
         *(f"- Peer: {s.peer_ip}" if s.peer_ip and s.install_type == "distributed" else ""),
         "", "## Action Required", "",
