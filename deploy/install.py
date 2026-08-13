@@ -47,7 +47,7 @@ if _VER_FILE.exists():
     __version__ = _VER_FILE.read_text().strip()
 else:
     # 2. Fallback: read git describe from the repo at runtime
-    _r = run_q("cd /home/user/myhub/SimBridge 2>/dev/null && git describe --tags --always 2>/dev/null")
+    _r = run_q(f"cd {_SCRIPT_DIR.parent} 2>/dev/null && git describe --tags --always 2>/dev/null")
     __version__ = _r.stdout.strip() if _r.returncode == 0 else "0.0.0+unknown"
 
 def _read_ver(dir_: str) -> str:
@@ -135,7 +135,9 @@ def ask_yn(label: str, default: bool = True) -> bool:
     sys.stderr.write(f"{C.C}? {label} {hint}: {C._0}")
     sys.stderr.flush()
     ch = input().strip().lower()
-    return {True: ("y", "yes"), False: ("n", "no")}[default].__contains__(ch) or default
+    if not ch:
+        return default
+    return ch in ("y", "yes")
 
 def pick(label: str, options: List[str], default_idx: int = 0) -> str:
     _w(f"{C.C}  {label}{C._0}")
@@ -161,18 +163,13 @@ def pick(label: str, options: List[str], default_idx: int = 0) -> str:
 # Shell helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run(cmd: str, **kw: Any) -> subprocess.CompletedProcess[str]:
+def run(cmd: str, **kw: Any) -> subprocess.CompletedProcess[None]:
+    """Run a command, output streamed to the terminal."""
     _w(f"    $ {cmd}")
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                          check=True, **kw)
+    return subprocess.run(cmd, shell=True, check=True, **kw)
 
 def run_ok(cmd: str) -> bool:
     return run_q(cmd).returncode == 0
-
-def run_verbose(cmd: str) -> None:
-    """Run a command with output streamed to the user (not captured)."""
-    _w(f"    $ {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
 
 def has_cmd(name: str) -> bool:
     return shutil.which(name) is not None
@@ -373,8 +370,8 @@ def phase_diag() -> None:
         detect_asterisk(); detect_dongle()
     detect_tailscale(); detect_usb()
 
-    info(f"OS:", f" {s.os_id} {s.os_ver}")
-    info(f"Packages:", f" {s.mgr}")
+    info("OS:", f" {s.os_id} {s.os_ver}")
+    info("Packages:", f" {s.mgr}")
 
     ok("Python", f" {s.python_ver}") if s.python_ok \
         else warn("Python 3.9+ needed (got", f" {s.python_ver})")
@@ -507,7 +504,7 @@ def phase_install() -> None:
 
     # ── System packages ──
     info("Updating package cache... (may take a while, output follows below)")
-    run_verbose(f"{s.mgr} update -y")
+    run(f"{s.mgr} update -y")
     run(s.pkg.format("python3 python3-pip python3-venv git curl"))
     if gsm:
         run(s.pkg.format("asterisk"))
@@ -585,7 +582,7 @@ def _install_tailscale() -> None:
         Path("/etc/apt/sources.list.d/tailscale.list").write_text(
             f"deb [signed-by=/etc/apt/keyrings/tailscale.gpg] "
             f"https://pkgs.tailscale.com/stable/{s.os_id} main\n")
-        run_verbose(f"{s.mgr} update -y")
+        run(f"{s.mgr} update -y")
     run(s.pkg.format("tailscale"))
     run_ok("systemctl enable --now tailscaled")
 
@@ -597,7 +594,7 @@ def _clone_repo() -> None:
     """
     heading("Cloning SimBridge Repository")
     s.src_dir = tempfile.mkdtemp(prefix="simbridge-clone-", suffix=str(os.getpid()))
-    info(f"Staging:", f" {s.src_dir}")
+    info("Staging:", f" {s.src_dir}")
 
     # Prefer HTTPS — works without SSH keys
     repo = REPO
@@ -843,9 +840,12 @@ def phase_telegram() -> None:
         subprocess.run(
             ["sudo", "-u", SVC_USER, "--preserve-env=HOME,PYTHONUNBUFFERED",
              f"{VENV_DIR}/bin/python", tmp],
-            env=env, timeout=300)
+            env=env, timeout=300, check=True)
+        ok("Telegram login successful.")
     except subprocess.TimeoutExpired:
         warn("Telegram login timed out.")
+    except subprocess.CalledProcessError as e:
+        warn(f"Telegram login failed (exit code {e.returncode}).")
     except FileNotFoundError:
         warn("sudo not found.")
     finally:
@@ -964,7 +964,7 @@ def _handoff() -> None:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     f = HANDOFF_DIR / f"install-{ts}-{s.node_id}.md"
     f.write_text("\n".join([
-        f"# Handoff — SimBridge Installation", "",
+        "# Handoff — SimBridge Installation", "",
         f"- **Date:** {datetime.now(timezone.utc).isoformat()}",
         f"- **Node ID:** {s.node_id}",
         f"- **Role:** {s.node_role}", f"- **Type:** {s.install_type}",
@@ -1052,12 +1052,15 @@ def _ensure_ami() -> str:
             for i, line in enumerate(lines):
                 new_lines.append(line)
                 if not inserted and line.strip() == "[general]":
-                    # insert after [general] block — find next section or end
+                    # find end of [general] block (next section header or EOF)
+                    end = len(lines)
                     for j in range(i + 1, len(lines)):
                         if lines[j].strip().startswith("["):
+                            end = j
                             break
-                        new_lines.append(lines[j])
-                    # Insert our section
+                    # Copy [general] block contents
+                    new_lines.extend(lines[i + 1: end])
+                    # Insert our section after [general] block
                     new_lines.append("")
                     new_lines.append("[simbridge]")
                     new_lines.append(f"secret = {pw}")
@@ -1065,9 +1068,8 @@ def _ensure_ami() -> str:
                     new_lines.append("permit = 127.0.0.1/255.255.255.0")
                     new_lines.append("read = all")
                     new_lines.append("write = all")
-                    # Add remaining lines
-                    for k in range(j, len(lines)):
-                        new_lines.append(lines[k])
+                    # Add remaining lines (from next section onward)
+                    new_lines.extend(lines[end:])
                     inserted = True
                     break
             if not inserted:
