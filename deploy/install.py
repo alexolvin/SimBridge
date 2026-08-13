@@ -169,6 +169,11 @@ def run(cmd: str, **kw: Any) -> subprocess.CompletedProcess[str]:
 def run_ok(cmd: str) -> bool:
     return run_q(cmd).returncode == 0
 
+def run_verbose(cmd: str) -> None:
+    """Run a command with output streamed to the user (not captured)."""
+    _w(f"    $ {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
 def has_cmd(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -501,7 +506,8 @@ def phase_install() -> None:
     tg = s.node_role in ("telegram", "all-in-one")
 
     # ── System packages ──
-    run(f"{s.mgr} update -y")
+    info("Updating package cache... (may take a while, output follows below)")
+    run_verbose(f"{s.mgr} update -y")
     run(s.pkg.format("python3 python3-pip python3-venv git curl"))
     if gsm:
         run(s.pkg.format("asterisk"))
@@ -579,7 +585,7 @@ def _install_tailscale() -> None:
         Path("/etc/apt/sources.list.d/tailscale.list").write_text(
             f"deb [signed-by=/etc/apt/keyrings/tailscale.gpg] "
             f"https://pkgs.tailscale.com/stable/{s.os_id} main\n")
-        run(f"{s.mgr} update -y")
+        run_verbose(f"{s.mgr} update -y")
     run(s.pkg.format("tailscale"))
     run_ok("systemctl enable --now tailscaled")
 
