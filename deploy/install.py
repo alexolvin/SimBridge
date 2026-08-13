@@ -37,6 +37,9 @@ SSH_REPO   = "git@github.com:alexolvin/SimBridge.git"
 BRANCH     = os.environ.get("SIMBRIDGE_BRANCH", "main")
 
 # ── Version ─────────────────────────────────────────────────────────────────
+def run_q(cmd: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
 # 1. Try VERSION file from the source (deploy/ is inside the repo)
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _VER_FILE   = _SCRIPT_DIR.parent / "VERSION"
@@ -148,9 +151,6 @@ def run(cmd: str, **kw: Any) -> subprocess.CompletedProcess[str]:
     _w(f"    $ {cmd}")
     return subprocess.run(cmd, shell=True, capture_output=True, text=True,
                           check=True, **kw)
-
-def run_q(cmd: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
 def run_ok(cmd: str) -> bool:
     return run_q(cmd).returncode == 0
