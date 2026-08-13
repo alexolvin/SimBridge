@@ -1,6 +1,9 @@
 # Tasks (local only — never committed)
 .tasks/
 
+# Handoff documents (local coordination only)
+.handoff/
+
 # Environment & secrets
 .env
 .env.*
@@ -48,9 +51,6 @@ Thumbs.db
 dist/
 build/
 *.o
-
-# Handoff documents (local coordination only)
-handoff/
 
 # Claude Code
 .claude/

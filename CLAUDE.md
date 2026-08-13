@@ -28,8 +28,13 @@ Claude Code (Anthropic CLI). Проект — telephony-система клас�
   1. Статус в файле задания → `done` (локально).
   2. Осмысленный commit.
   3. Push в GitHub (`origin main`).
-  4. HANDOFF документ для каждого stage.
+  4. HANDOFF документ для каждого stage → писать в `.handoff/` (никогда не коммитить).
   5. «ОТЧЁТ О ЧЕСТНОСТИ»: что реализовано, что нет, где допущения.
+
+## HANDOFF — `.handoff/`
+
+- Документы-передач между stage пишутся в папку `.handoff/`.
+- Папка `.handoff/` **никогда** не коммитится и не пушится в git (уже есть в `.gitignore`).
 
 ## Standing Rules (из OVERVIEW)
 

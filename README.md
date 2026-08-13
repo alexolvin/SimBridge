@@ -37,32 +37,28 @@ restrict automation. You are responsible for the consequences of account suspens
 
 ## Quick Start
 
+Download and run the single-file interactive installer:
+
 ```bash
-# Clone
-git clone git@github.com:alexolvin/SimBridge.git
-cd SimBridge
-
-# Single-node install (Asterisk + agent + userbot on one machine)
-sudo deploy/install.sh all-in-one
-
-# Configure
-sudo cp config/simbridge.example.yaml /etc/simbridge/simbridge.yaml
-sudo vim /etc/simbridge/simbridge.yaml
-
-# Set secrets (NEVER commit these)
-sudo tee /etc/simbridge/env <<'EOF'
-SIMBRIDGE_TG_API_ID=12345
-SIMBRIDGE_TG_API_HASH=...
-SIMBRIDGE_AGENT_TOKEN=...
-SIMBRIDGE_HTTP_SECRET=...
-EOF
-sudo chmod 0600 /etc/simbridge/env
-
-# Start
-sudo systemctl restart simbridge-agent simbridge-userbot
+curl -L https://raw.githubusercontent.com/alexolvin/SimBridge/main/deploy/install.py -o install.py
+sudo python3 install.py
 ```
 
-See `docs/install-single-node.md` or `docs/install-distributed.md` for full guides.
+The installer will:
+- Detect OS, Python, Asterisk, chan\_dongle, Tailscale, USB modems
+- Prompt for missing configuration (Telegram credentials, modem type, secrets)
+- Clone the SimBridge repository, install dependencies, create systemd units
+- Configure the selected deployment (single-node or distributed)
+- Guide you through Telegram login and first SMS/call tests
+
+Or from a cloned repository:
+
+```bash
+git clone https://github.com/alexolvin/SimBridge.git && cd SimBridge
+sudo python3 deploy/install.py
+```
+
+See `docs/quick-start.md` or `docs/install-distributed.md` for full guides.
 
 ## Commands
 
