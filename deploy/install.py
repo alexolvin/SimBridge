@@ -723,6 +723,9 @@ asterisk:
   ami_port: 5038
   ami_username: simbridge
   ami_password_env: SIMBRIDGE_AMI_PASSWORD
+sim:
+  phone: {s.sim_phone}
+  modem_model: {s.modem_model}
 voice:
   bridge_endpoint: tg-bridge
   bridge_host: {vh}
@@ -1242,15 +1245,32 @@ def _load_existing_config() -> None:
         return
 
     yaml: Dict[str, str] = {}
+    _section = ""
     try:
         for raw_line in cfg_path.read_text().splitlines():
             line = raw_line.strip()
-            if not line or line.startswith("#") or line.startswith("*"):
+            if not line or line.startswith("#"):
                 continue
+            # Top-level section header (no indentation, ends with ':')
+            if raw_line[0].isspace() == False and line.endswith(":"):
+                _section = line[:-1]
+                continue
+            # List item: `- "value"`
+            if line.startswith("- "):
+                val = line[2:].strip().strip('"')
+                if _section:
+                    yaml[f"{_section}.allowed_peers"] = val
+                continue
+            # Key: value
             if ":" in line:
                 key, _, val = line.partition(":")
-                yaml[key.strip()] = val.strip().strip('"')
-    except OSError:
+                k = key.strip()
+                v = val.strip().strip('"')
+                if _section and "." not in k:
+                    yaml[f"{_section}.{k}"] = v
+                else:
+                    yaml[k] = v
+    except (OSError, IndexError):
         return
 
     # ── Parse env file (KEY=VALUE secrets) ──
@@ -1299,6 +1319,14 @@ def _load_existing_config() -> None:
         s.tg_username = yaml["telegram.master_username"]
         info("Loaded existing tg_username:", s.tg_username)
 
+    if "sim.phone" in yaml and not s.sim_phone:
+        s.sim_phone = yaml["sim.phone"]
+        info("Loaded existing sim_phone:", s.sim_phone)
+
+    if "sim.modem_model" in yaml and not s.modem_model:
+        s.modem_model = yaml["sim.modem_model"]
+        info("Loaded existing modem_model:", s.modem_model)
+
     # ── Secrets from env ──
     if "SIMBRIDGE_AGENT_TOKEN" in env and not s.agent_token:
         s.agent_token = env["SIMBRIDGE_AGENT_TOKEN"]
@@ -1326,9 +1354,14 @@ def _load_existing_config() -> None:
     if userbot_listen and ":" in userbot_listen and not s.own_ip:
         s.own_ip = userbot_listen.rsplit(":", 1)[0]
 
-    bridge_host = yaml.get("voice.bridge_host", "")
-    if bridge_host and bridge_host != "127.0.0.1" and not s.peer_ip:
-        s.peer_ip = bridge_host
+    # Peer IP — try bridge_host first, then allowed_peers
+    if not s.peer_ip:
+        for src in ("voice.bridge_host", "agent.allowed_peers",
+                     "userbot_http.allowed_peers"):
+            val = yaml.get(src, "")
+            if val and val != "127.0.0.1":
+                s.peer_ip = val
+                break
 
     if s.own_ip and s.own_ip != "127.0.0.1":
         info("Loaded existing network:", f" own={s.own_ip}, peer={s.peer_ip}")
