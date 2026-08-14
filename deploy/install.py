@@ -726,7 +726,7 @@ asterisk:
   ami_username: simbridge
   ami_password_env: SIMBRIDGE_AMI_PASSWORD
 sim:
-  phone: {s.sim_phone}
+  phone: "{s.sim_phone}"
   modem_model: "{s.modem_model}"
 voice:
   bridge_endpoint: tg-bridge
@@ -815,7 +815,7 @@ def _set_perms() -> None:
     heading("Setting Permissions")
     _chown(INSTALL_DIR, rec=True)
     _chown(VENV_DIR, rec=True)
-    _chown(CONF_DIR); _chown(DATA_DIR); _chown(LOG_DIR)
+    _chown(CONF_DIR, rec=True); _chown(DATA_DIR, rec=True); _chown(LOG_DIR, rec=True)
     Path(CONF_FILE).chmod(0o640)
     Path(ENV_FILE).chmod(0o600)
     sess = Path(f"{DATA_DIR}/sim_session.session")
