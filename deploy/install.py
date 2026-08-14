@@ -786,11 +786,19 @@ def _install_systemd() -> None:
     gsm = s.node_role in ("gsm", "all-in-one")
     tg = s.node_role in ("telegram", "all-in-one")
 
+    # Render placeholders (e.g. __SVC_GROUP__ -> nogroup/nobody/simbridge)
+    def _render(src: Path, dst: str) -> None:
+        text = src.read_text()
+        text = text.replace("__SVC_GROUP__", s.svc_grp)
+        Path(dst).write_text(text)
+
     if gsm and (sd / "simbridge-agent.service").exists():
-        shutil.copy(sd / "simbridge-agent.service", "/etc/systemd/system/")
+        _render(sd / "simbridge-agent.service",
+                "/etc/systemd/system/simbridge-agent.service")
         ok("simbridge-agent.service")
     if tg and (sd / "simbridge-userbot.service").exists():
-        shutil.copy(sd / "simbridge-userbot.service", "/etc/systemd/system/")
+        _render(sd / "simbridge-userbot.service",
+                "/etc/systemd/system/simbridge-userbot.service")
         ok("simbridge-userbot.service")
     run_ok("systemctl daemon-reload")
 

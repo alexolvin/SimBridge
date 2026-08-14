@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=simbridge
-Group=nogroup
+Group=__SVC_GROUP__
 WorkingDirectory=/opt/simbridge
 ExecStart=/opt/simbridge-venv/bin/python -m userbot.main
 Restart=on-failure
