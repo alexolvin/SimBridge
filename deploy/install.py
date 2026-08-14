@@ -727,7 +727,7 @@ asterisk:
   ami_password_env: SIMBRIDGE_AMI_PASSWORD
 sim:
   phone: {s.sim_phone}
-  modem_model: {s.modem_model}
+  modem_model: "{s.modem_model}"
 voice:
   bridge_endpoint: tg-bridge
   bridge_host: {vh}

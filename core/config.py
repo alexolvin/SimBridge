@@ -119,15 +119,15 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("telegram.master_username", str),
     _SchemaEntry("telegram.session_path", str),
     _SchemaEntry("telegram.acl_file", str),
-    _SchemaEntry("telegram.api_id_env", str, env=True),
-    _SchemaEntry("telegram.api_hash_env", str, env=True),
+    _SchemaEntry("telegram.api_id_env", str, env=True, required=False),
+    _SchemaEntry("telegram.api_hash_env", str, env=True, required=False),
     # -- agent --
     _SchemaEntry("agent.listen", str),
     _SchemaEntry("agent.token_env", str, env=True),
     _SchemaEntry("agent.allowed_peers", list, required=False),
     # -- userbot_http --
     _SchemaEntry("userbot_http.listen", str),
-    _SchemaEntry("userbot_http.secret_env", str, env=True),
+    _SchemaEntry("userbot_http.secret_env", str, env=True, required=False),
     _SchemaEntry("userbot_http.allowed_peers", list, required=False),
     # -- asterisk --
     _SchemaEntry("asterisk.ari_url", str),
@@ -139,6 +139,9 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("asterisk.ami_port", int, required=False),
     _SchemaEntry("asterisk.ami_username", str, required=False),
     _SchemaEntry("asterisk.ami_password_env", str, env=True, required=False),
+    # -- sim --
+    _SchemaEntry("sim.phone", str, required=False),
+    _SchemaEntry("sim.modem_model", str, required=False),
     # -- voice --
     _SchemaEntry("voice.bridge_endpoint", str),
     _SchemaEntry("voice.bridge_host", str),
@@ -286,9 +289,10 @@ def load_config(path: Optional[str] = None) -> DotDict:
 
         env_name = obj
         if isinstance(env_name, str) and env_name not in os.environ:
-            errors.append(
-                f"Secret env var {env_name!r} (referenced by {entry.key}) is not set"
-            )
+            if entry.required:
+                errors.append(
+                    f"Secret env var {env_name!r} (referenced by {entry.key}) is not set"
+                )
 
     # S06.1: Validate bind addresses — refuse 0.0.0.0 (binds all interfaces)
     for listen_key in ("agent.listen", "userbot_http.listen"):
