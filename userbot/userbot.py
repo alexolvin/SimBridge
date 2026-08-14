@@ -199,7 +199,7 @@ class Userbot:
             # TODO: iterate users with out_sms right and send
             await evt.reply("Broadcast sent.")
 
-        @self._client.on(events.NewMessage(file="voice"))
+        @self._client.on(events.NewMessage(func=lambda e: e.voice is not None))
         async def handle_voice_note(evt):
             """Handle incoming voice notes from Telegram."""
             sender_id = evt.sender_id or 0

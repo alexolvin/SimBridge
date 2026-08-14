@@ -188,7 +188,7 @@ def _validate(cfg: DotDict, schema: list[_SchemaEntry]) -> list[str]:
                 errors.append(f"Missing required key: {entry.key}")
             continue
 
-        if entry.type and not isinstance(obj, entry.type):
+        if entry.type and obj is not None and not isinstance(obj, entry.type):
             errors.append(
                 f"Key {entry.key}: expected {entry.type.__name__}, "
                 f"got {type(obj).__name__}"
