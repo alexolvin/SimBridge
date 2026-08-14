@@ -42,16 +42,28 @@ class AMIClient:
         self._writer: Optional[asyncio.StreamWriter] = None
 
     async def connect(self) -> None:
-        """Open AMI TCP connection and log in."""
+        """Open AMI TCP connection and log in.
+
+        AMI protocol: server sends greeting line, then waits for Login.
+        Do NOT wait for a blank line after greeting — some Asterisk versions
+        (chan_dongle configurations) close idle connections before sending it.
+        Send Login immediately after reading the greeting to avoid timeout.
+        """
         self._reader, self._writer = await asyncio.open_connection(
             self._host, self._port
         )
 
-        # Read login prompt
-        await self._read_response()
+        # Read greeting line (e.g. "Asterisk Call Manager/7.0.3")
+        greeting = await self._reader.readline()
+        if not greeting:
+            raise ConnectionError("AMI server closed connection immediately")
 
-        # Send login
-        await self._send_action({"Action": "Login"})
+        # Send login immediately — do NOT wait for blank line
+        await self._send_action({
+            "Action": "Login",
+            "UserName": self._username,
+            "Secret": self._password,
+        })
         resp = await self._read_response()
         if resp.get("Response") not in ("Success", "Followed"):
             raise ConnectionError(f"AMI login failed: {resp}")
