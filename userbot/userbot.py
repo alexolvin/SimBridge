@@ -333,11 +333,14 @@ class Userbot:
         return self._master_id
 
     async def start(self) -> None:
-        """Start the userbot and connect to Telegram."""
-        await self._client.connect()
+        """Start the userbot and connect to Telegram.
+
+        start() must come BEFORE resolve_master() — resolve_master() calls
+        get_entity() which requires an authenticated session.
+        """
+        await self._client.start()
         await self.resolve_master()
         logger.info("Userbot started, connected to Telegram")
-        await self._client.start()
 
     async def run_until_disconnected(self) -> None:
         """Block until the client disconnects."""
