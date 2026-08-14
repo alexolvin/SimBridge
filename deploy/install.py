@@ -656,20 +656,28 @@ def _clone_repo() -> None:
     ok("Application deployed.", f" v{s.src_version}")
 
 def _setup_ami() -> None:
-    ami = Path("/etc/asterisk/manager.conf")
-    cur = _read_ami_pw(ami)
-    if cur and cur == s.ami_pw:
-        ok("AMI configured.", str(ami))
-        return
+    """Configure Asterisk AMI for simbridge user.
 
-    if not ami.exists():
-        ami.parent.mkdir(parents=True, exist_ok=True)
+    Writes manager_custom.conf (survives package updates to manager.conf)
+    and ensures manager.conf enables AMI with an Include directive.
+    """
+    custom = Path("/etc/asterisk/manager_custom.conf")
+    main_conf = Path("/etc/asterisk/manager.conf")
 
-    cfg = (
-        "[general]\n"
-        "enabled = yes\n"
-        "port = 5038\n"
-        "bindaddr = 127.0.0.1\n\n"
+    # Skip if our custom config is already set up with matching password
+    try:
+        existing = custom.read_text()
+        if f"secret = {s.ami_pw}" in existing:
+            ok("AMI configured.", str(custom))
+            return
+    except OSError:
+        pass
+
+    # Ensure /etc/asterisk exists
+    main_conf.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write user config in a separate file (won't be overwritten by package)
+    custom_cfg = (
         "[simbridge]\n"
         f"secret = {s.ami_pw}\n"
         "deny = 0.0.0.0/0.0.0.0\n"
@@ -677,13 +685,41 @@ def _setup_ami() -> None:
         "read = all\n"
         "write = all\n"
     )
-    ami.write_text(cfg)
-    ami.chmod(0o640)
+    custom.write_text(custom_cfg)
+    custom.chmod(0o640)
     try:
-        ami.chown(30, 30)  # asterisk:asterisk
+        custom.chown(30, 30)  # asterisk:asterisk
     except OSError:
         pass
-    ok("AMI configured.", str(ami))
+    ok("AMI user configured.", str(custom))
+
+    # Ensure manager.conf exists with enabled=yes and Include
+    if not main_conf.exists():
+        main_conf.write_text(
+            "[general]\n"
+            "enabled = yes\n"
+            "port = 5038\n"
+            "bindaddr = 127.0.0.1\n"
+            "Include manager_custom.conf\n"
+        )
+        main_conf.chmod(0o640)
+        try:
+            main_conf.chown(30, 30)
+        except OSError:
+            pass
+        return
+
+    # Existing manager.conf — patch it
+    txt = main_conf.read_text()
+
+    if "enabled = yes" not in txt:
+        txt = re.sub(r"^enabled\s*=\s*\S+", "enabled = yes", txt, count=1, flags=re.MULTILINE)
+
+    include_line = "Include manager_custom.conf"
+    if include_line not in txt:
+        txt += "\n" + include_line + "\n"
+
+    main_conf.write_text(txt)
 
 def _write_config() -> None:
     heading("Writing Configuration")
