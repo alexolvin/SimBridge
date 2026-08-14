@@ -433,8 +433,10 @@ def phase_gather() -> None:
                 s.modem_model = ask("Enter modem model manually", required=True)
         else:
             warn("No USB modems detected via lsusb.")
-            s.modem_model = ask("Enter modem model manually", required=True)
-        s.sim_phone = ask("SIM phone number (e.g. +79991234567)")
+            s.modem_model = ask("Enter modem model manually",
+                                required=True, default=s.modem_model)
+        s.sim_phone = ask("SIM phone number (e.g. +79991234567)",
+                          default=s.sim_phone)
         s.dongle_name = ask("chan_dongle device name", default=s.dongle_name or "gsm")
 
         s.ami_pw = _ensure_ami()
