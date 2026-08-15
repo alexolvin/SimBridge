@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import grp
+import pwd
 import secrets
 import subprocess
 import shutil
@@ -85,6 +86,20 @@ ACL_FILE      = f"{CONF_DIR}/acl.conf"
 BLACKLIST_FILE = f"{CONF_DIR}/blacklist.txt"
 SVC_USER      = "simbridge"
 HANDOFF_DIR   = Path(".handoff")
+
+# ── Asterisk (GSM nodes) ────────────────────────────────────────────────────
+AST_DIR        = "/etc/asterisk"
+AST_GLOBALS    = f"{AST_DIR}/asterisk-globals.conf"   # generated
+AST_EXTENSIONS = f"{AST_DIR}/extensions.conf"         # from the repo
+AST_PROMPT     = "/var/lib/asterisk/sounds/custom/vm-prompt.ulaw"
+# Drop-in giving the Asterisk process SimBridge's env — the AGI hooks
+# inherit their secrets from it (Rule 5: no secrets in units or dialplan).
+AST_DROPIN     = "/etc/systemd/system/asterisk.service.d/simbridge-env.conf"
+# Asterisk's AGI application dir is a compile-time constant — detect it
+AGI_BIN_DIRS   = ("/usr/lib64/asterisk/agi-bin", "/usr/lib/asterisk/agi-bin")
+# AGI hook scripts linked into the AGI dir (called by extensions.conf)
+AGI_SCRIPTS    = ("tg-sms-agi.py", "tg-voice-agi.py",
+                  "tg-blacklist-agi.py", "notify-agent-agi.py")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Terminal I/O
@@ -226,6 +241,11 @@ class S:
 
     # Verification results — populated by phase_verify()
     verify_issues: List = []
+
+    # Asterisk change tracking — set by _setup_ami() / _install_asterisk_dialplan()
+    # so phase_start() can reload or restart Asterisk with the right urgency.
+    ast_env_changed: bool = False     # unit EnvironmentFile changed -> restart
+    ast_config_changed: bool = False  # dialplan/globals/AMI changed -> core reload
 
 s = S()
 
@@ -503,14 +523,21 @@ def phase_remove() -> None:
     if s.action != "remove":
         return
     heading("5a / 8 — Remove Existing")
-    for svc in ("simbridge-agent", "simbridge-userbot"):
+    for svc in ("simbridge-agent", "simbridge-userbot", "simbridge-sweep"):
         if run_ok(f"systemctl is-active --quiet {svc}"):
             info(f"Stopping {svc}...")
             run_q(f"systemctl stop {svc}"); run_q(f"systemctl disable {svc}")
-    for u in ("simbridge-agent.service", "simbridge-userbot.service"):
+    for u in ("simbridge-agent.service", "simbridge-userbot.service",
+              "simbridge-sweep.service", "simbridge-sweep.timer"):
         p = Path(f"/etc/systemd/system/{u}")
         if p.exists():
             p.unlink(); info("Removed:", f" {u}")
+    # Our asterisk env drop-in (package files like extensions.conf stay)
+    dropin = Path(AST_DROPIN)
+    if dropin.exists():
+        dropin.unlink()
+        info("Removed:", AST_DROPIN)
+        run_ok(f"rmdir {dropin.parent} 2>/dev/null")
     run_ok("systemctl daemon-reload")
     for d in (CONF_DIR, DATA_DIR, LOG_DIR, INSTALL_DIR, VENV_DIR):
         if Path(d).exists():
@@ -532,6 +559,8 @@ def phase_install() -> None:
     if gsm:
         run(s.pkg.format("asterisk"))
         run_ok(s.pkg.format("asterisk-addons"))
+        # ffmpeg — voicemail loudnorm in core/voicemail_forward.py
+        run_ok(s.pkg.format("ffmpeg"))
 
     # ── Tailscale ──
     if s.do_ts or s.do_ts_opt:
@@ -560,6 +589,9 @@ def phase_install() -> None:
     run_ok(f"id {SVC_USER} || useradd --system --no-create-home "
            f"--shell /usr/sbin/nologin {SVC_USER}")
     run_ok(f"groupadd --system {s.svc_grp} 2>/dev/null")
+    # asterisk reads SimBridge config/blacklist (0640, group-owned) — the
+    # sweep timer and AGI hooks run as the asterisk user
+    run_ok(f"usermod -aG {s.svc_grp} asterisk 2>/dev/null")
 
     # ── Directories ──
     for d in (CONF_DIR, DATA_DIR, LOG_DIR, f"{DATA_DIR}/recordings"):
@@ -582,6 +614,10 @@ def phase_install() -> None:
 
     # ── Config ──
     _write_config()
+
+    # ── Asterisk dialplan, globals, AGI hooks, prompt (GSM nodes) ──
+    if gsm:
+        _install_asterisk_dialplan()
 
     # ── systemd ──
     _install_systemd()
@@ -641,7 +677,8 @@ def _clone_repo() -> None:
     info("Deploying to", f" {INSTALL_DIR}...")
     Path(INSTALL_DIR).mkdir(parents=True, exist_ok=True)
     # Copy sub-directories
-    for sub in ("agent", "userbot", "core", "bridge", "config", "deploy"):
+    for sub in ("agent", "userbot", "core", "bridge", "config", "deploy",
+                "scripts", "asterisk", "sounds"):
         src = Path(s.src_dir) / sub
         if src.exists():
             dst = Path(INSTALL_DIR) / sub
@@ -656,27 +693,18 @@ def _clone_repo() -> None:
     ok("Application deployed.", f" v{s.src_version}")
 
 def _setup_ami() -> None:
-    """Configure Asterisk AMI for simbridge user.
+    """Configure Asterisk AMI for the simbridge user.
 
-    Writes manager_custom.conf (survives package updates to manager.conf)
-    and ensures manager.conf enables AMI with an Include directive.
+    The secret lives ONLY in manager_custom.conf (survives package updates
+    to manager.conf). manager.conf is patched to enable AMI and Include the
+    custom file; a legacy inline [simbridge] section (written by older
+    installer versions) is removed so the password has one source of truth.
     """
-    custom = Path("/etc/asterisk/manager_custom.conf")
-    main_conf = Path("/etc/asterisk/manager.conf")
-
-    # Skip if our custom config is already set up with matching password
-    try:
-        existing = custom.read_text()
-        if f"secret = {s.ami_pw}" in existing:
-            ok("AMI configured.", str(custom))
-            return
-    except OSError:
-        pass
-
-    # Ensure /etc/asterisk exists
+    custom = Path(f"{AST_DIR}/manager_custom.conf")
+    main_conf = Path(f"{AST_DIR}/manager.conf")
     main_conf.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write user config in a separate file (won't be overwritten by package)
+    # ── Secret: manager_custom.conf (single source of truth) ──
     custom_cfg = (
         "[simbridge]\n"
         f"secret = {s.ami_pw}\n"
@@ -685,15 +713,23 @@ def _setup_ami() -> None:
         "read = all\n"
         "write = all\n"
     )
-    custom.write_text(custom_cfg)
-    custom.chmod(0o640)
     try:
-        custom.chown(30, 30)  # asterisk:asterisk
-    except OSError:
-        pass
-    ok("AMI user configured.", str(custom))
+        if custom.read_text() == custom_cfg:
+            ok("AMI configured.", str(custom))
+        else:
+            custom.write_text(custom_cfg)
+            _chown_asterisk(custom)
+            custom.chmod(0o640)
+            s.ast_config_changed = True
+            ok("AMI user configured.", str(custom))
+    except FileNotFoundError:
+        custom.write_text(custom_cfg)
+        _chown_asterisk(custom)
+        custom.chmod(0o640)
+        s.ast_config_changed = True
+        ok("AMI user configured.", str(custom))
 
-    # Ensure manager.conf exists with enabled=yes and Include
+    # ── manager.conf: enabled=yes + Include, no legacy inline section ──
     if not main_conf.exists():
         main_conf.write_text(
             "[general]\n"
@@ -702,24 +738,35 @@ def _setup_ami() -> None:
             "bindaddr = 127.0.0.1\n"
             "Include manager_custom.conf\n"
         )
+        _chown_asterisk(main_conf)
         main_conf.chmod(0o640)
-        try:
-            main_conf.chown(30, 30)
-        except OSError:
-            pass
+        s.ast_config_changed = True
+        ok("manager.conf created.")
         return
 
-    # Existing manager.conf — patch it
     txt = main_conf.read_text()
-
+    orig = txt
+    # Older installers put the secret inline in manager.conf — drop it.
+    txt = _strip_section(txt, "simbridge")
     if "enabled = yes" not in txt:
-        txt = re.sub(r"^enabled\s*=\s*\S+", "enabled = yes", txt, count=1, flags=re.MULTILINE)
-
+        if re.search(r"^enabled\s*=", txt, flags=re.MULTILINE):
+            txt = re.sub(r"^enabled\s*=\s*\S+", "enabled = yes",
+                         txt, count=1, flags=re.MULTILINE)
+        elif "[general]" in txt:
+            txt = txt.replace("[general]", "[general]\nenabled = yes", 1)
+        else:
+            txt = txt.rstrip("\n") + "\n[general]\nenabled = yes\n"
     include_line = "Include manager_custom.conf"
     if include_line not in txt:
-        txt += "\n" + include_line + "\n"
-
-    main_conf.write_text(txt)
+        txt = txt.rstrip("\n") + "\n" + include_line + "\n"
+    if txt != orig:
+        main_conf.write_text(txt)
+        _chown_asterisk(main_conf)
+        main_conf.chmod(0o640)
+        s.ast_config_changed = True
+        ok("manager.conf patched.")
+    else:
+        ok("manager.conf OK.")
 
 def _write_config() -> None:
     heading("Writing Configuration")
@@ -756,7 +803,9 @@ asterisk:
   dongle: {s.dongle_name}
   ring_wait_seconds: 24
   max_record_seconds: 90
-  prompt: /var/lib/asterisk/sounds/custom/vm-prompt.ulaw
+  early_hangup_max_seconds: 3
+  sweep_max_age_seconds: 300
+  prompt: {AST_PROMPT}
   ami_host: 127.0.0.1
   ami_port: 5038
   ami_username: simbridge
@@ -780,6 +829,14 @@ paths:
   audit_log: {LOG_DIR}/audit.jsonl
   recordings_dir: {DATA_DIR}/recordings
 """
+    # Back up a different existing config on updates (Rule 4 — the file
+    # may hold hand-tuned values the round-trip parser cannot preserve).
+    if s.action == "update" and Path(CONF_FILE).exists():
+        old_cfg = Path(CONF_FILE).read_text()
+        if old_cfg != yaml:
+            bak = f"{CONF_FILE}.bak-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            Path(bak).write_text(old_cfg)
+            warn("Existing config backed up:", f" {bak}")
     Path(CONF_FILE).write_text(yaml); Path(CONF_FILE).chmod(0o640)
 
     # ACL
@@ -792,27 +849,214 @@ paths:
         ok("ACL:", ACL_FILE)
 
     # Blacklist
-    if not Path(BLACKLIST_FILE).exists():
+    bl = Path(BLACKLIST_FILE)
+    old_bl = Path("/etc/asterisk/blacklist/numbers.txt")  # pre-AGI dialplan
+    if not bl.exists() and old_bl.exists():
+        shutil.copy(str(old_bl), str(bl))
+        info("Migrated blacklist:", f" {old_bl} -> {bl}")
+    if not bl.exists():
         ex = Path(f"{s.src_dir}/config/blacklist.example.txt")
         if ex.exists():
-            shutil.copy(ex, BLACKLIST_FILE)
+            shutil.copy(str(ex), str(bl))
         else:
-            Path(BLACKLIST_FILE).write_text("# Blocked numbers (E.164, one/line)\n")
-        Path(BLACKLIST_FILE).chmod(0o600)
+            bl.write_text("# Blocked numbers (E.164, one/line)\n")
+    # 0640: the AGI blacklist check runs as asterisk (service-group member)
+    bl.chmod(0o640)
 
-    # Secrets
-    env = ["# SimBridge secrets — NEVER commit", "",
-           f"SIMBRIDGE_AGENT_TOKEN={s.agent_token}"]
-    if s.tg_api_id:
-        env += [f"SIMBRIDGE_TG_API_ID={s.tg_api_id}",
-                f"SIMBRIDGE_TG_API_HASH={s.tg_api_hash}"]
-    if s.http_secret:
-        env.append(f"SIMBRIDGE_HTTP_SECRET={s.http_secret}")
-    if s.ami_pw:
-        env.append(f"SIMBRIDGE_AMI_PASSWORD={s.ami_pw}")
-    Path(ENV_FILE).write_text("\n".join(env) + "\n"); Path(ENV_FILE).chmod(0o600)
+    # Secrets — merge, never clobber (host may carry keys added by hand)
+    _merge_env()
     ok("Config:", CONF_FILE)
     ok("Secrets:", ENV_FILE)
+
+def _merge_env() -> None:
+    """Merge collected secrets into ENV_FILE — never clobber.
+
+    Existing keys (including ones added by hand) keep their position,
+    extra keys survive, collected values update their keys in place,
+    and new keys are appended at the end. Stays chmod 0600 (Rule 5).
+    """
+    p = Path(ENV_FILE)
+    wanted: Dict[str, str] = {}
+    if s.agent_token:
+        wanted["SIMBRIDGE_AGENT_TOKEN"] = s.agent_token
+    if s.tg_api_id and s.tg_api_hash:
+        wanted["SIMBRIDGE_TG_API_ID"] = s.tg_api_id
+        wanted["SIMBRIDGE_TG_API_HASH"] = s.tg_api_hash
+    if s.http_secret:
+        wanted["SIMBRIDGE_HTTP_SECRET"] = s.http_secret
+    if s.ami_pw:
+        wanted["SIMBRIDGE_AMI_PASSWORD"] = s.ami_pw
+    # notify-agent-agi.py (S04) reads the agent URL from the environment —
+    # the same value the YAML template gives to agent.listen (Rule 1).
+    if s.node_role in ("gsm", "all-in-one"):
+        if s.install_type == "single":
+            wanted["AGENT_URL"] = "http://127.0.0.1:8090"
+        elif s.own_ip:
+            wanted["AGENT_URL"] = f"http://{s.own_ip}:8090"
+
+    raw = p.read_text().splitlines() if p.exists() else []
+    if not raw:
+        lines = ["# SimBridge secrets — NEVER commit (Rule 5)", ""]
+        lines += [f"{k} = {v}" for k, v in wanted.items()]
+        p.write_text("\n".join(lines) + "\n")
+        p.chmod(0o600)
+        ok("Secrets written.", ENV_FILE)
+        return
+
+    seen: set = set()
+    lines: List[str] = []
+    changed = 0
+    for line in raw:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k, _, v = stripped.partition("=")
+            k = k.strip()
+            if k in wanted:
+                seen.add(k)
+                if v.strip() != wanted[k]:
+                    changed += 1
+                lines.append(f"{k} = {wanted[k]}")
+                continue
+        lines.append(line)
+
+    added = [k for k in wanted if k not in seen]
+    if added:
+        if lines and lines[-1].strip():
+            lines.append("")
+        for k in added:
+            lines.append(f"{k} = {wanted[k]}")
+
+    p.write_text("\n".join(lines) + "\n")
+    p.chmod(0o600)
+    if changed or added:
+        info("Secrets updated:",
+             f" {changed} changed, {len(added)} new -> {ENV_FILE}")
+    else:
+        ok("Secrets unchanged.", ENV_FILE)
+
+def _chown_asterisk(p: Path) -> None:
+    """Chown a file to the asterisk user (uid/gid looked up by name)."""
+    try:
+        st = pwd.getpwnam("asterisk")
+        p.chown(st.pw_uid, st.pw_gid)
+    except (KeyError, OSError):
+        pass
+
+def _agi_bin_dir() -> str:
+    """Asterisk's AGI application dir (compile-time constant per package)."""
+    for d in AGI_BIN_DIRS:
+        if Path(d).is_dir():
+            return d
+    return AGI_BIN_DIRS[0]
+
+def _strip_section(txt: str, name: str) -> str:
+    """Remove a '[name]' section from Asterisk config text (legacy cleanup)."""
+    out: List[str] = []
+    skip = False
+    for ln in txt.splitlines():
+        s = ln.strip()
+        if s.startswith("[") and s.endswith("]"):
+            skip = s[1:-1].strip().lower() == name
+        if not skip:
+            out.append(ln)
+    return "\n".join(out) + "\n"
+
+def _install_asterisk_dialplan() -> None:
+    """Install dialplan, generated globals, VM prompt and AGI hooks.
+
+    Everything is written BEFORE Asterisk is (re)loaded: extensions.conf
+    #includes asterisk-globals.conf, which must exist at load time.
+    phase_start() applies the reload (config) or restart (environment).
+    """
+    heading("Installing Asterisk Dialplan")
+
+    # 1. Dialplan — extensions.conf from the repo
+    ext_src = Path(s.src_dir) / "asterisk" / "extensions.conf"
+    if not ext_src.exists():
+        fail("Dialplan missing in repo:", str(ext_src))
+        return
+    dst = Path(AST_EXTENSIONS)
+    new_txt = ext_src.read_text()
+    old_txt = dst.read_text() if dst.exists() else None
+    if old_txt != new_txt:
+        if old_txt is not None:
+            bak = (f"{AST_EXTENSIONS}.bak-"
+                   f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+            Path(bak).write_text(old_txt)
+            warn("Existing dialplan backed up:", bak)
+        dst.write_text(new_txt)
+        dst.chmod(0o644)
+        _chown_asterisk(dst)
+        s.ast_config_changed = True
+        ok("Dialplan:", AST_EXTENSIONS)
+    else:
+        ok("Dialplan unchanged.", AST_EXTENSIONS)
+
+    # 2. Globals — generated from the config _write_config() just wrote
+    gen = (f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/"
+           f"generate_asterisk_config.py {CONF_FILE} -o {AST_GLOBALS}")
+    old_globals = (Path(AST_GLOBALS).read_text()
+                   if Path(AST_GLOBALS).exists() else None)
+    if run_ok(gen):
+        _chown_asterisk(Path(AST_GLOBALS))
+        if Path(AST_GLOBALS).read_text() != old_globals:
+            s.ast_config_changed = True
+            ok("Globals:", AST_GLOBALS)
+        else:
+            ok("Globals unchanged.", AST_GLOBALS)
+    else:
+        fail("Globals generation failed — needs the agent venv (PyYAML).")
+        fail("Command:", gen)
+
+    # 3. Voicemail prompt — only overwritten when content differs
+    snd_src = Path(s.src_dir) / "sounds" / "vm-prompt.ulaw"
+    snd_dst = Path(AST_PROMPT)
+    if snd_src.exists():
+        snd_dst.parent.mkdir(parents=True, exist_ok=True)
+        if not snd_dst.exists() or snd_dst.read_bytes() != snd_src.read_bytes():
+            shutil.copy(str(snd_src), str(snd_dst))
+            ok("Prompt:", str(snd_dst))
+        snd_dst.chmod(0o644)
+        _chown_asterisk(snd_dst)
+    else:
+        warn("Prompt missing in repo:", str(snd_src))
+
+    # 4. AGI hooks — exec bit + symlink into Asterisk's AGI bin dir
+    agi_dir = _agi_bin_dir()
+    Path(agi_dir).mkdir(parents=True, exist_ok=True)
+    for name in AGI_SCRIPTS:
+        app = Path(INSTALL_DIR) / "scripts" / name
+        if not app.exists():
+            warn("AGI script missing:", str(app))
+            continue
+        app.chmod(0o755)
+        link = Path(agi_dir) / name
+        if link.is_symlink() and link.resolve() == app.resolve():
+            continue
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(str(app))
+            ok("AGI linked:", name)
+        except OSError as e:
+            warn(f"AGI link {name} failed:", str(e))
+
+    # 5. Asterisk env drop-in — AGI hooks inherit /etc/simbridge/env
+    #    (Rule 5: secrets never in unit files or dialplan)
+    dropin_txt = ("[Service]\n"
+                  "EnvironmentFile=/etc/simbridge/env\n"
+                  "Environment=SIMBRIDGE_CONFIG=/etc/simbridge/simbridge.yaml\n")
+    dropin = Path(AST_DROPIN)
+    if not dropin.exists() or dropin.read_text() != dropin_txt:
+        dropin.parent.mkdir(parents=True, exist_ok=True)
+        dropin.write_text(dropin_txt)
+        run_ok("systemctl daemon-reload")
+        s.ast_env_changed = True
+        ok("Asterisk env drop-in:", AST_DROPIN)
+        warn("AGI hooks now read secrets from Asterisk's process environment.")
+        warn("Phase 7 will restart Asterisk — active calls will be dropped.")
+    else:
+        ok("Asterisk env drop-in unchanged.")
 
 def _install_systemd() -> None:
     heading("Installing systemd Units")
@@ -832,6 +1076,14 @@ def _install_systemd() -> None:
         _render(sd / "simbridge-agent.service",
                 "/etc/systemd/system/simbridge-agent.service")
         ok("simbridge-agent.service")
+    if gsm and (sd / "simbridge-sweep.service").exists():
+        _render(sd / "simbridge-sweep.service",
+                "/etc/systemd/system/simbridge-sweep.service")
+        ok("simbridge-sweep.service")
+    if gsm and (sd / "simbridge-sweep.timer").exists():
+        _render(sd / "simbridge-sweep.timer",
+                "/etc/systemd/system/simbridge-sweep.timer")
+        ok("simbridge-sweep.timer")
     if tg and (sd / "simbridge-userbot.service").exists():
         _render(sd / "simbridge-userbot.service",
                 "/etc/systemd/system/simbridge-userbot.service")
@@ -852,6 +1104,11 @@ def _set_perms() -> None:
     _chown(INSTALL_DIR, rec=True)
     _chown(VENV_DIR, rec=True)
     _chown(CONF_DIR, rec=True); _chown(DATA_DIR, rec=True); _chown(LOG_DIR, rec=True)
+    # Recordings: written by Asterisk (MixMonitor) and swept by the
+    # simbridge-sweep timer — both run as the asterisk user, so the
+    # recursive simbridge chown above must not stick (see the unit docs).
+    if s.node_role in ("gsm", "all-in-one"):
+        _chown_asterisk(Path(f"{DATA_DIR}/recordings"))
     Path(CONF_FILE).chmod(0o640)
     Path(ENV_FILE).chmod(0o600)
     sess = Path(f"{DATA_DIR}/sim_session.session")
@@ -865,10 +1122,12 @@ def _enable() -> None:
     tg = s.node_role in ("telegram", "all-in-one")
     if s.node_role == "all-in-one":
         run_ok("systemctl enable simbridge-agent")
+        run_ok("systemctl enable --now simbridge-sweep.timer")
         run_ok("systemctl enable simbridge-userbot")
         info("Enabled but NOT started — after Telegram login.")
     elif gsm:
         run_ok("systemctl enable simbridge-agent")
+        run_ok("systemctl enable --now simbridge-sweep.timer")
         if not run_ok("systemctl start simbridge-agent"):
             warn("Agent start deferred (Asterisk/chan_dongle?).")
     elif tg:
@@ -934,6 +1193,7 @@ def phase_start() -> None:
     heading("7 / 8 — Starting Services")
     gsm = s.node_role in ("gsm", "all-in-one")
     tg = s.node_role in ("telegram", "all-in-one")
+    update = s.action == "update"
 
     if gsm:
         # ── Ensure asterisk.conf exists (RHEL/Alma bug: package drops it) ──
@@ -942,7 +1202,7 @@ def phase_start() -> None:
             warn("Missing /etc/asterisk/asterisk.conf — creating defaults.")
             _write_default_asterisk_conf()
 
-        # ── Start Asterisk ──
+        # ── Asterisk ──
         if not run_ok("systemctl is-active --quiet asterisk"):
             info("Starting Asterisk...")
             if run_ok("systemctl start asterisk"):
@@ -952,11 +1212,33 @@ def phase_start() -> None:
                 r = run_q("systemctl status asterisk --no-pager 2>&1 | tail -8")
                 _w(r.stdout)
                 info("Check logs: sudo journalctl -u asterisk --no-pager -n 20")
+        elif s.ast_env_changed:
+            # EnvironmentFile is read at process start — a full restart is
+            # required. Active calls will be dropped.
+            warn("Asterisk environment changed — restarting "
+                 "(active calls will be dropped).")
+            if run_ok("systemctl restart asterisk"):
+                ok("Asterisk restarted.")
+            else:
+                fail("Asterisk restart failed — "
+                     "journalctl -u asterisk --no-pager -n 30")
+        elif s.ast_config_changed:
+            # Config-only change: core reload keeps active calls alive.
+            info("Reloading Asterisk config (non-disruptive)...")
+            r = run_q("asterisk -rx 'core reload' 2>&1")
+            if r.returncode == 0:
+                ok("Asterisk config reloaded.")
+            else:
+                warn("core reload failed:", r.stdout.strip()[:120])
         else:
             ok("Asterisk already running.")
 
-        # ── Start simbridge-agent ──
-        if not run_ok("systemctl is-active --quiet simbridge-agent"):
+        # ── simbridge-agent ──
+        if update and run_ok("systemctl is-active --quiet simbridge-agent"):
+            info("Restarting simbridge-agent (update)...")
+            if not run_ok("systemctl restart simbridge-agent"):
+                warn("Agent restart failed — will be rechecked in verification.")
+        elif not run_ok("systemctl is-active --quiet simbridge-agent"):
             info("Starting simbridge-agent...")
             if not run_ok("systemctl start simbridge-agent"):
                 warn("Agent failed to start — will be rechecked in verification.")
@@ -968,13 +1250,16 @@ def phase_start() -> None:
         if not sess.exists():
             warn("Telegram session file not found — userbot cannot start.")
             info(f"Re-run installer and choose 'Log in now' in Phase 6.")
+        elif update and run_ok("systemctl is-active --quiet simbridge-userbot"):
+            info("Restarting simbridge-userbot (update)...")
+            if not run_ok("systemctl restart simbridge-userbot"):
+                warn("Userbot restart failed — will be rechecked in verification.")
+        elif not run_ok("systemctl is-active --quiet simbridge-userbot"):
+            info("Starting simbridge-userbot...")
+            if not run_ok("systemctl start simbridge-userbot"):
+                warn("Userbot failed to start — will be rechecked in verification.")
         else:
-            if not run_ok("systemctl is-active --quiet simbridge-userbot"):
-                info("Starting simbridge-userbot...")
-                if not run_ok("systemctl start simbridge-userbot"):
-                    warn("Userbot failed to start — will be rechecked in verification.")
-            else:
-                ok("simbridge-userbot already running.")
+            ok("simbridge-userbot already running.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 8 — Verify + Test
@@ -1082,6 +1367,34 @@ def phase_verify() -> None:
             detail = ""; fix = ""
         _check("Agent health endpoint (" + url + ")", health_ok,
                detail, fix)
+
+        # 6. Sweep timer — orphan voicemail recording safety net
+        r = run_q("systemctl is-active simbridge-sweep.timer 2>&1")
+        timer_ok = r.stdout.strip() == "active"
+        if timer_ok:
+            detail = ""; fix = ""
+        else:
+            detail = "    Orphan voicemail recordings will not be forwarded."
+            fix = "systemctl enable --now simbridge-sweep.timer"
+        _check("simbridge-sweep.timer (orphan recordings)", timer_ok,
+               detail, fix)
+
+        # 7. Generated globals — the dialplan #includes this file
+        globals_ok = Path(AST_GLOBALS).exists()
+        if globals_ok:
+            detail = ""; fix = ""
+        else:
+            detail = f"    {AST_EXTENSIONS} #includes asterisk-globals.conf"
+            fix = (f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/"
+                   f"generate_asterisk_config.py {CONF_FILE} -o {AST_GLOBALS}")
+        _check("Asterisk globals file", globals_ok, detail, fix)
+
+        # 8. AGI hooks reachable from Asterisk
+        agi_dir = _agi_bin_dir()
+        missing = [n for n in AGI_SCRIPTS if not (Path(agi_dir) / n).exists()]
+        _check(f"AGI hooks in {agi_dir}", not missing,
+               f"    Missing: {', '.join(missing)}" if missing else "",
+               "Re-run the installer (AGI link step)")
 
     # ═══ Telegram checks ═══
     if tg:
@@ -1237,7 +1550,7 @@ def phase_summary() -> None:
     gsm = s.node_role in ("gsm", "all-in-one")
     tg = s.node_role in ("telegram", "all-in-one")
     if gsm:
-        info("Services:", " simbridge-agent")
+        info("Services:", " simbridge-agent, simbridge-sweep.timer")
     if tg:
         info("Services:", " simbridge-userbot")
 
@@ -1469,77 +1782,27 @@ def _read_ami_pw(p: Path) -> str:
 
 
 def _ensure_ami() -> str:
-    """Ensure manager.conf exists with a valid secret. Auto-generate if needed."""
-    ami = Path("/etc/asterisk/manager.conf")
-    pw = _read_ami_pw(ami)
-    if pw:
-        ok("AMI password:", " found in manager.conf")
-        return pw
+    """Resolve the AMI password — read-only, never writes Asterisk config.
+
+    Precedence: /etc/simbridge/env (loaded into s.ami_pw on updates) ->
+    manager_custom.conf (current location, written by _setup_ami) ->
+    manager.conf (legacy inline section) -> generate fresh.
+    _setup_ami() is responsible for actually writing manager_custom.conf.
+    """
+    if s.ami_pw:
+        ok("AMI password:", " from /etc/simbridge/env")
+        return s.ami_pw
+
+    for p in (Path(f"{AST_DIR}/manager_custom.conf"),
+              Path(f"{AST_DIR}/manager.conf")):
+        pw = _read_ami_pw(p)
+        if pw:
+            ok("AMI password:", f" found in {p.name}")
+            return pw
 
     pw = _rand(24)
-    if not ami.exists():
-        ami.parent.mkdir(parents=True, exist_ok=True)
-        ami.write_text(
-            "[general]\n"
-            "enabled = yes\n"
-            "port = 5038\n"
-            "bindaddr = 127.0.0.1\n\n"
-            "[simbridge]\n"
-            f"secret = {pw}\n"
-            "deny = 0.0.0.0/0.0.0.0\n"
-            "permit = 127.0.0.1/255.255.255.0\n"
-            "read = all\n"
-            "write = all\n")
-        ami.chmod(0o640)
-        try:
-            ami.chown(30, 30)  # asterisk:asterisk
-        except OSError:
-            pass
-        ok("AMI configured:", str(ami))
-    else:
-        warn("manager.conf exists but no secret found — generating one.")
-        info("To customize, edit", str(ami))
-        # Inject password into existing config (after [general])
-        try:
-            text = ami.read_text()
-            lines = text.split("\n")
-            new_lines = []
-            inserted = False
-            for i, line in enumerate(lines):
-                new_lines.append(line)
-                if not inserted and line.strip() == "[general]":
-                    # find end of [general] block (next section header or EOF)
-                    end = len(lines)
-                    for j in range(i + 1, len(lines)):
-                        if lines[j].strip().startswith("["):
-                            end = j
-                            break
-                    # Copy [general] block contents
-                    new_lines.extend(lines[i + 1: end])
-                    # Insert our section after [general] block
-                    new_lines.append("")
-                    new_lines.append("[simbridge]")
-                    new_lines.append(f"secret = {pw}")
-                    new_lines.append("deny = 0.0.0.0/0.0.0.0")
-                    new_lines.append("permit = 127.0.0.1/255.255.255.0")
-                    new_lines.append("read = all")
-                    new_lines.append("write = all")
-                    # Add remaining lines (from next section onward)
-                    new_lines.extend(lines[end:])
-                    inserted = True
-                    break
-            if not inserted:
-                new_lines.append("")
-                new_lines.append("[simbridge]")
-                new_lines.append(f"secret = {pw}")
-                new_lines.append("deny = 0.0.0.0/0.0.0.0")
-                new_lines.append("permit = 127.0.0.1/255.255.255.0")
-                new_lines.append("read = all")
-                new_lines.append("write = all")
-            ami.write_text("\n".join(new_lines))
-            ami.chmod(0o640)
-        except OSError:
-            warn("Could not write to", str(ami))
+    warn("No AMI password found — generated one (saved to /etc/simbridge/env).")
+    warn("AMI password:", pw)
     return pw
 
 # ══════════════════════════════════════════════════════════════════════════════
