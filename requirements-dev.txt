@@ -1,0 +1,9 @@
+# Development/test dependencies (CI and local test runs).
+#
+# Role-specific runtime dependencies live in agent/requirements.txt and
+# userbot/requirements.txt — deploy/install.py installs those into the
+# service venvs. This file is only for running the test suite.
+
+-r agent/requirements.txt
+-r userbot/requirements.txt
+pytest>=7.0

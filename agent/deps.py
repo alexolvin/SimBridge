@@ -3,21 +3,62 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
+import socket
 import time
 import threading
+from logging import getLogger
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
+
+logger = getLogger("simbridge.agent")
 
 # ---------------------------------------------------------------------------
 # Global state — initialized at app startup
 # ---------------------------------------------------------------------------
 
 _agent_token: Optional[str] = None
-_allowed_peers: Optional[list[str]] = None
+_allowed_peers: set[str] = set()
 _replay_window: int = 300  # seconds
 _seen_ids: dict[str, float] = {}
 _replay_lock = threading.Lock()
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_peers(peers: list[str]) -> set[str]:
+    """Normalize allowed_peers entries for runtime comparison.
+
+    The agent compares the peer's remote *address* (always an IP) against
+    this set, so hostname entries (MagicDNS FQDN or short name) are
+    resolved to their IP once at startup. Unresolvable entries are kept
+    as-is (they simply never match) with a warning logged.
+    """
+    result: set[str] = set()
+    for entry in peers or []:
+        if not isinstance(entry, str):
+            continue  # e.g. YAML `~` entries
+        entry = entry.strip()
+        if not entry:
+            continue
+        result.add(entry)
+        if not _is_ip(entry):
+            try:
+                result.add(socket.gethostbyname(entry))
+            except OSError:
+                logger.warning(
+                    "allowed_peers entry %r does not resolve to an IP — "
+                    "entries should be Tailscale IPs or resolvable FQDNs",
+                    entry,
+                )
+    return result
 
 
 def init_deps(app) -> None:
@@ -29,7 +70,7 @@ def init_deps(app) -> None:
 
     token_env = cfg.get("agent.token_env", "SIMBRIDGE_AGENT_TOKEN")
     _agent_token = os.environ.get(token_env)
-    _allowed_peers = cfg.get("agent.allowed_peers", [])
+    _allowed_peers = _normalize_peers(cfg.get("agent.allowed_peers", []))
     _replay_window = cfg.get("limits.replay_window_seconds", 300)
 
 

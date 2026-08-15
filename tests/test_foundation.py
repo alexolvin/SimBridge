@@ -27,10 +27,12 @@ class TestSecretDetection:
     """TS01-1: secrets_check.py detects all pattern classes."""
 
     def _write_and_scan(self, content: str) -> list:
+        # allowlist=[] — these tests verify the pattern engine itself,
+        # not the allowlist (which covers the fixtures below).
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(content)
             f.flush()
-            return scan_file(f.name)
+            return scan_file(f.name, allowlist=[])
 
     def test_detects_telegram_api_hash(self):
         matches = self._write_and_scan(
@@ -83,15 +85,16 @@ class TestPreCommitHook:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write('API_HASH = "0123456789abcdef0123456789abcdef"\n')
             f.flush()
-            matches = scan_file(f.name)
+            matches = scan_file(f.name, allowlist=[])
         assert matches, "Expected secret detection, got none"
+        assert all(m.severity == "block" for m in matches)
 
     def test_hook_allows_clean_file(self):
         """A file with no secrets should pass."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write("x = 1 + 2\nprint(x)\n")
             f.flush()
-            matches = scan_file(f.name)
+            matches = scan_file(f.name, allowlist=[])
         assert not matches, f"False positive: {matches}"
 
 

@@ -134,6 +134,11 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("asterisk.dongle", str),
     _SchemaEntry("asterisk.ring_wait_seconds", int),
     _SchemaEntry("asterisk.max_record_seconds", int),
+    # S03.1: recording shorter than this means the caller hung up right
+    # after the greeting (early_hangup). Default 3 (voicemail_forward).
+    _SchemaEntry("asterisk.early_hangup_max_seconds", int, required=False),
+    # Sweep timer: a *.wav older than this is an orphan, safe to forward.
+    _SchemaEntry("asterisk.sweep_max_age_seconds", int, required=False),
     _SchemaEntry("asterisk.prompt", str),
     _SchemaEntry("asterisk.ami_host", str, required=False),
     _SchemaEntry("asterisk.ami_port", int, required=False),

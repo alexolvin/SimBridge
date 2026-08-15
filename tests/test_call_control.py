@@ -628,56 +628,15 @@ class TestConfigGeneratorBridge:
 # =========================================================================
 # Dialplan — tg-bridge + S04.3 contexts
 # =========================================================================
-
-class TestDialplanBridge:
-    """Dialplan structure for tg-bridge (S04.2) and S04.3 contexts."""
-
-    @pytest.fixture(autouse=True)
-    def load_dialplan(self):
-        dp = Path(__file__).parent.parent / "asterisk" / "extensions.conf.example"
-        self.dialplan = dp.read_text()
-
-    def test_tg_bridge_context_exists(self):
-        """[tg-bridge] context exists for bridge inbound calls."""
-        assert "[tg-bridge]" in self.dialplan
-
-    def test_tg_bridge_has_route(self):
-        """tg-bridge context has a routing extension."""
-        lines = self.dialplan.split("\n")
-        in_ctx = False
-        for line in lines:
-            if "[tg-bridge]" in line:
-                in_ctx = True
-            elif line.strip().startswith("[") and in_ctx:
-                break
-            if in_ctx and "exten" in line and not line.strip().startswith(";"):
-                return
-        pytest.fail("No extension found in [tg-bridge] context")
-
-    def test_tg_bridge_sip_context_exists(self):
-        """[tg-bridge-sip] context exists for outgoing GSM dial (S04.3)."""
-        assert "[tg-bridge-sip]" in self.dialplan
-
-    def test_incoming_mobile_telegram_flow(self):
-        """incoming-mobile context uses TG_ACCEPTED variable for S04.3 flow."""
-        assert "TG_ACCEPTED" in self.dialplan
-
-    def test_incoming_mobile_notifies_agent(self):
-        """incoming-mobile notifies agent via AGI."""
-        assert "notify-agent-agi" in self.dialplan
-
-    def test_tg_bridge_sip_dials_dongle(self):
-        """tg-bridge-sip context dials via Dongle."""
-        lines = self.dialplan.split("\n")
-        in_ctx = False
-        for line in lines:
-            if "[tg-bridge-sip]" in line:
-                in_ctx = True
-            elif line.strip().startswith("[") and in_ctx:
-                break
-            if in_ctx and "Dongle" in line and not line.strip().startswith(";"):
-                return
-        pytest.fail("No Dongle dial found in [tg-bridge-sip] context")
+# NOTE (S01 rebaseline, 2026-08-15): TestDialplanBridge was removed. It
+# asserted the structure of the old example dialplan, which was never
+# deployable: the MixMonitor @ option does not exist in Asterisk 18,
+# TG_ACCEPTED was never set by anything (every call timed out), and the
+# System() calls with interpolated user data were an RCE (P0-3). The S04
+# bridge stage must re-introduce bridge contexts AND re-add structural
+# tests against a design that actually loads in Asterisk. The core
+# call-control logic tested below (state machine, registry, modem pool)
+# is design-independent and stays.
 
 
 # =========================================================================

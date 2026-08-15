@@ -69,6 +69,60 @@ class TestIPAllowlist:
         assert "import hmac" in source
 
 
+class TestPeerNormalization:
+    """allowed_peers entries: IPs kept as-is, hostnames resolved at startup.
+
+    The agent compares the peer's remote address (always an IP) against the
+    allowlist, so a hostname entry like a Tailscale MagicDNS FQDN must be
+    resolved to its IP or it can never match (P0-2).
+    """
+
+    def test_ip_entry_kept_as_is(self):
+        from agent.deps import _normalize_peers
+        result = _normalize_peers(["100.124.155.106"])
+        assert result == {"100.124.155.106"}
+
+    def test_hostname_resolved_to_ip(self, monkeypatch):
+        import agent.deps as deps_module
+        monkeypatch.setattr(
+            deps_module.socket, "gethostbyname", lambda h: "100.95.195.40"
+        )
+        result = deps_module._normalize_peers(["vzu5-claw"])
+        # Both the original entry and its resolved IP are kept, so
+        # comparison by remote IP works either way.
+        assert "100.95.195.40" in result
+        assert "vzu5-claw" in result
+
+    def test_unresolvable_hostname_kept_without_error(self, monkeypatch):
+        import agent.deps as deps_module
+
+        def boom(h):
+            raise OSError("no such host")
+
+        monkeypatch.setattr(deps_module.socket, "gethostbyname", boom)
+        result = deps_module._normalize_peers(["no-such-host.example"])
+        # Kept as-is (never matches an IP) instead of raising at startup.
+        assert result == {"no-such-host.example"}
+
+    def test_blank_and_non_string_entries_skipped(self):
+        from agent.deps import _normalize_peers
+        assert _normalize_peers(["", "   "]) == set()
+        # YAML `allowed_peers: [~]` yields None entries — must not crash.
+        assert _normalize_peers([None]) == set()
+        assert _normalize_peers([]) == set()
+        assert _normalize_peers(None) == set()
+
+    def test_mixed_entries(self, monkeypatch):
+        import agent.deps as deps_module
+        monkeypatch.setattr(
+            deps_module.socket, "gethostbyname", lambda h: "10.0.0.2"
+        )
+        result = deps_module._normalize_peers(["10.0.0.1", "node-b", "10.0.0.1"])
+        assert "10.0.0.1" in result
+        assert "10.0.0.2" in result
+        assert "node-b" in result
+
+
 # =========================================================================
 # TS06-S03 — Bind-address validation
 # =========================================================================

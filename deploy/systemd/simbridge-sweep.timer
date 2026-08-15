@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the SimBridge voicemail sweeper periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -27,95 +27,102 @@ if str(_PROJECT_ROOT) not in sys.path:
 # =========================================================================
 
 class TestDialplanStructure:
-    """Verify dialplan fixes via static analysis of extensions.conf.example."""
+    """Static analysis of the deployed dialplan (asterisk/extensions.conf).
+
+    S01 rebaseline (2026-08-15): the old example encoded an S03/S04 design
+    that was never deployable — it used a MixMonitor ``@`` option that does
+    not exist in Asterisk 18, a TG_ACCEPTED variable nothing ever set, and
+    System() calls with interpolated user data (P0-3 RCE). The dialplan is
+    now the production-parity flow with the RCE fixes; the S03/S04
+    structural specs are re-verified in their stages against a working
+    design.
+    """
 
     @pytest.fixture(autouse=True)
     def load_dialplan(self):
-        """Load the example dialplan for testing."""
-        dialplan_path = Path(__file__).parent.parent / "asterisk" / "extensions.conf.example"
+        """Load the dialplan for testing."""
+        dialplan_path = Path(__file__).parent.parent / "asterisk" / "extensions.conf"
         self.dialplan = dialplan_path.read_text()
 
-    def test_mixmonitor_before_playback(self):
-        """TS03-1: MixMonitor must start before Playback in voicemail context."""
-        # Find voicemail-ctx section and verify MixMonitor comes before Playback
-        lines = self.dialplan.split("\n")
-        in_vm_context = False
-        mixmonitor_line = None
-        playback_line = None
-
-        for i, line in enumerate(lines):
+    def test_no_shell_or_system(self):
+        """P0-3: no SHELL()/System() in executable dialplan lines — user
+        data (caller IDs, SMS texts) must never reach a shell. (Comment
+        lines are skipped — Asterisk comments start with ';' at the
+        beginning of the line, and the header documents the removed
+        mechanisms.)"""
+        for line in self.dialplan.splitlines():
             stripped = line.strip()
-            if "[voicemail-ctx]" in stripped:
-                in_vm_context = True
-            elif stripped.startswith("[") and in_vm_context:
-                break
-            if in_vm_context:
-                # Skip comments — Asterisk comments start with ;
-                if stripped.startswith(";") or not stripped:
-                    continue
-                if "MixMonitor" in line and mixmonitor_line is None:
-                    mixmonitor_line = i
-                if "Playback" in line and playback_line is None:
-                    playback_line = i
+            if not stripped or stripped.startswith(";"):
+                continue
+            assert "SHELL(" not in stripped, (
+                f"SHELL() in dialplan — RCE surface: {stripped}"
+            )
+            assert "System(" not in stripped, (
+                f"System() in dialplan — RCE surface: {stripped}"
+            )
 
-        assert mixmonitor_line is not None, "MixMonitor not found in voicemail-ctx"
-        assert playback_line is not None, "Playback not found in voicemail-ctx"
-        assert mixmonitor_line < playback_line, (
-            f"MixMonitor (line {mixmonitor_line}) must come before Playback (line {playback_line})"
-        )
+    def test_generated_globals_included(self):
+        """S03.2: timings/paths come from the generated globals file."""
+        assert "#include => asterisk-globals.conf" in self.dialplan
 
-    def test_no_timing_literals_in_dialplan(self):
-        """TS03-2: No hardcoded Wait(N) with timing literals in voicemail context."""
-        # Check that voicemail-ctx uses channel variables, not literals
-        lines = self.dialplan.split("\n")
-        in_vm_context = False
+    def test_blacklist_via_agi(self):
+        """Blacklist check is an AGI script (fail-open), not a shell grep
+        of the caller ID."""
+        assert "AGI(tg-blacklist-agi.py)" in self.dialplan
+        assert "BL_BLOCKED" in self.dialplan
 
-        for line in lines:
-            if "[voicemail-ctx]" in line:
-                in_vm_context = True
-            elif line.strip().startswith("[") and in_vm_context:
-                break
-            if in_vm_context and "WaitExten" in line:
-                # Should use variable, not literal
-                assert "${MAX_RECORD_SECONDS}" in line, (
-                    f"WaitExten should use ${'{'}MAX_RECORD_SECONDS{'}'} not literal: {line.strip()}"
+    def test_no_timing_literals(self):
+        """S03.2: every Wait() uses a generated global, not a literal."""
+        for line in self.dialplan.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(";"):
+                continue
+            for m in re.finditer(r"Wait\(([^)]*)\)", stripped):
+                arg = m.group(1)
+                assert arg.startswith("${"), (
+                    f"Wait() with a literal timing — must be a generated "
+                    f"global: {stripped}"
                 )
 
-    def test_hangup_handler_defined(self):
-        """TS03-1: hangup-handler extension exists for post-recording processing."""
-        assert "hangup-handler" in self.dialplan, (
-            "hangup-handler extension not found in dialplan"
-        )
+    def test_h_exten_finalizes_then_forwards(self):
+        """Voicemail forwarding happens in the h-exten: StopMixMonitor()
+        (synchronous WAV finalization, verified in Asterisk 18 source)
+        then AGI — never System() with the caller ID."""
+        section = self._incoming_mobile()
+        m = re.search(r"exten => h,1,.*?(?=\nexten =>|\Z)", section, re.S)
+        assert m, "h extension not found in [incoming-mobile]"
+        h_body = m.group(0)
+        assert "StopMixMonitor()" in h_body
+        assert "AGI(tg-voice-agi.py)" in h_body
+        assert "STAT(e,${VMFILE})" in h_body
 
-    def test_voicemail_is_reusable_context(self):
-        """TS03-4: voicemail-ctx is a separate context, callable from other contexts."""
-        assert "[voicemail-ctx]" in self.dialplan, (
-            "voicemail-ctx context not found — voicemail must be a separate context"
-        )
-        assert "voicemail-fallback" in self.dialplan, (
-            "voicemail-fallback extension not found — entry point missing"
-        )
+    def test_recordings_dir_from_globals(self):
+        """Recording path comes from VM_REC_DIR (config), not a /tmp literal."""
+        assert "Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)" in self.dialplan
+        assert "/tmp/vm-" not in self.dialplan
 
-    def test_no_recording_of_live_conversations(self):
-        """TS03-3: MixMonitor only in voicemail context, not in general dialplan."""
-        lines = self.dialplan.split("\n")
-        in_vm_context = False
-        in_general = False
+    def test_event_forwarding_via_agi(self):
+        """All event paths (ring/sms/report/ussd) forward via AGI scripts."""
+        for event in ("ring", "sms", "report", "ussd"):
+            assert f"AGI(tg-sms-agi.py,{event})" in self.dialplan, (
+                f"AGI(tg-sms-agi.py,{event}) missing from dialplan"
+            )
 
+    def test_mixmonitor_only_in_incoming_mobile(self):
+        """MixMonitor only in the voicemail path of incoming-mobile."""
+        lines = self.dialplan.splitlines()
+        in_ctx = False
         for line in lines:
-            if "[incoming-mobile]" in line:
-                in_general = True
-                in_vm_context = False
-            elif "[voicemail-ctx]" in line:
-                in_vm_context = True
-                in_general = False
-            elif line.strip().startswith("["):
-                in_general = False
-                in_vm_context = False
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_ctx = (stripped == "[incoming-mobile]")
+            elif "MixMonitor" in stripped and not stripped.startswith(";"):
+                assert in_ctx, f"MixMonitor outside incoming-mobile: {stripped}"
 
-            # MixMonitor should only appear in voicemail context
-            if "MixMonitor" in line and not in_vm_context:
-                pytest.fail(f"MixMonitor found outside voicemail context: {line.strip()}")
+    def _incoming_mobile(self) -> str:
+        m = re.search(r"\[incoming-mobile\](.*?)(?=\n\[\w|\Z)", self.dialplan, re.S)
+        assert m, "[incoming-mobile] context not found"
+        return m.group(1)
 
 
 # =========================================================================
@@ -320,41 +327,43 @@ class TestVoicemailHandler:
 # =========================================================================
 
 class TestVoicemailFallback:
-    """TS03-7: Voicemail is a reusable branch, not the only outcome."""
+    """S01: voicemail is the outcome of the ring timeout (production
+    parity: ring → prompt → record → forward on hangup). The old
+    'reusable voicemail-ctx + Gosub' spec encoded the never-deployed
+    example design and is re-verified in S03/S04 with a working
+    mechanism."""
 
-    def test_voicemail_context_structure(self):
-        """Dialplan has voicemail-ctx with voicemail-fallback entry point."""
-        dialplan_path = Path(__file__).parent.parent / "asterisk" / "extensions.conf.example"
-        dialplan = dialplan_path.read_text()
+    @pytest.fixture(autouse=True)
+    def load_dialplan(self):
+        dialplan_path = Path(__file__).parent.parent / "asterisk" / "extensions.conf"
+        self.dialplan = dialplan_path.read_text()
+        m = re.search(r"\[incoming-mobile\](.*?)(?=\n\[\w|\Z)", self.dialplan, re.S)
+        assert m, "[incoming-mobile] context not found"
+        self.section = m.group(1)
 
-        assert "[voicemail-ctx]" in dialplan
-        assert "voicemail-fallback" in dialplan
-        assert "voicemail-record" in dialplan
-        assert "Gosub" in dialplan
+    def test_ring_timeout_goes_to_voicemail(self):
+        """s-exten order: ring wait → answer → prompt → record → stop."""
+        order = [
+            "AGI(tg-sms-agi.py,ring)",
+            "Wait(${RING_WAIT_SECONDS})",
+            "Answer()",
+            "Playback(${VM_PROMPT})",
+            "Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)",
+            "MixMonitor(${VMFILE})",
+            "Wait(${MAX_RECORD_SECONDS})",
+            "StopMixMonitor()",
+        ]
+        pos = -1
+        for step in order:
+            i = self.section.find(step)
+            assert i != -1, f"{step} not found in incoming-mobile"
+            assert i > pos, f"{step} appears out of order in incoming-mobile"
+            pos = i
 
-    def test_incoming_calls_route_to_voicemail(self):
-        """Current behavior: all calls go to voicemail (pre-Stage-04)."""
-        dialplan_path = Path(__file__).parent.parent / "asterisk" / "extensions.conf.example"
-        dialplan = dialplan_path.read_text()
-
-        # incoming-mobile calls voicemail-fallback
-        lines = dialplan.split("\n")
-        in_incoming = False
-
-        for line in lines:
-            if "[incoming-mobile]" in line:
-                in_incoming = True
-            elif line.strip().startswith("[") and in_incoming:
-                break
-
-            if in_incoming:
-                assert "voicemail-fallback" in line or "Dial" not in line or True, (
-                    "incoming-mobile should route to voicemail-fallback"
-                )
-
-        # S04.3: incoming-mobile now routes via Telegram ring flow
-        # Voicemail is the fallback when the Telegram ring times out
-        assert "TG_ACCEPTED" in dialplan or "voicemail-ctx" in dialplan
+    def test_blacklisted_caller_gets_busy(self):
+        """Blacklisted numbers get Busy(5), not the voicemail path."""
+        assert 'GotoIf($["${BL_BLOCKED}" = "1"]?blacklisted)' in self.section
+        assert "Busy(5)" in self.section
 
 
 # =========================================================================

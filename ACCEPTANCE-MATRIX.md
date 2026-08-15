@@ -1,116 +1,116 @@
 # S06.5 — Final Acceptance Matrix
 
-**Date:** 2026-08-12
-**Commit range:** `6b20e22` (initial) → `5f4cc1f` (HEAD)
-**Tests:** 264 passed, 6 skipped
+**Date:** 2026-08-15 (rewritten — see status legend)
+**Head:** `5c6a5c9`
+**Tests:** 269 passed, 6 skipped (unit tests only — see Rule 3)
+
+> **Superseded by verification.** The 2026-08-12 version of this matrix
+> marked items "PASS (code)" that were never executed end to end, and claimed
+> a git-history secret scan that had not been run. This version restates every
+> criterion with a status backed by evidence as of the 2026-08-14/15 audit
+> (`.handoff/HANDOFF-VERIFY-S01-20260814.md`). It will be regenerated with
+> fresh evidence when Stage 06 executes.
+
+**Status legend**
+
+- `VERIFIED` — real run, artifact shown
+- `CODE+UNITS` — code path exists and unit tests pass; no end-to-end run
+- `NOT-VERIFIED` — claimed by code, no run of any kind
+- `NOT-IMPLEMENTED` — missing or dead code path
+- `BLOCKED` — requires external action (real device, second node, operator)
 
 ---
 
 ## SMS
 
-| # | Criterion | Status | Evidence |
+| # | Criterion | Status | Evidence / gap |
 |---|---|---|---|
-| 1 | Incoming SMS reaches all users with `in_sms` within 3s with name resolution | ⚠️ MANUAL_VERIFY | Code path: `tg-sms-forward.sh` → userbot HTTP → ACL broadcast. ContactResolver in chain. No sleep in path. **Requires: real SMS + timed measurement.** |
-| 2 | Outgoing SMS produces "Отправлено" then "Доставлено" | ⚠️ MANUAL_VERIFY | Code: `/sms` command → agent API → `DongleSendSMS`. Delivery: `report` extension → correlated by `sms_id`. **Requires: real SMS send + delivery report.** |
-| 3 | Commas, Cyrillic, emoji survive intact | ⚠️ MANUAL_VERIFY | Code: AMI client passes text as structured field, not shell-interpolated (Rule 1). `sms_correlation.py` stores original text. **Requires: real SMS with `привет,мир!🎉`.** |
-| 4 | Blacklist blocks incoming SMS | ✅ PASS (code) | `routes.py:block_number` + `blacklist.contains()` check on `/sms`. Tested: `test_blacklist_block_unblock`, `test_persistence`. **Requires: real incoming SMS for end-to-end.** |
-| 5 | User without `out_sms` is refused | ✅ PASS (code) | `userbot.py:handle_sms`: `acl.check(sender_id, "out_sms")` → audit + "Access denied". Tested: `test_default_deny`. |
-| 6 | Unknown Telegram ID is ignored and audited | ✅ PASS (code) | ACL default-deny: `check()` returns `False` for any UID not in `acl.conf`. `USER_DENIED` event logged. |
+| 1 | Incoming SMS reaches all `in_sms` users within 3s with name resolution | NOT-VERIFIED | New stack never deployed: production runs the pre-refactor dialplan (`SMS_NAME=unknown`). Code + units exist; no timed real run. |
+| 2 | Outgoing SMS produces "Отправлено" then "Доставлено" | NOT-VERIFIED | No real send through the new stack. Delivery reports are **not** correlated by `sms_id` (dialplan sends marker text; `SMSCorrelationStore` is in-memory). |
+| 3 | Commas, Cyrillic, emoji survive intact | NOT-VERIFIED | AMI `send_sms` interpolates text into a CLI command (`DongleSendSMS(gsm,to,'{text}')`) — an apostrophe in text breaks the SMS; the "URL-encoding" docstring is false. |
+| 4 | Blacklist blocks incoming SMS | NOT-VERIFIED | `core/blacklist.py` is correct (atomic writes, hot-reload, unit tests). The new example dialplan has **no blacklist check on the incoming SMS path** (S02.2 requires SMS + calls). Production uses the old grep-based check. |
+| 5 | User without `out_sms` is refused | CODE+UNITS | `userbot.py:handle_sms` → `acl.check(sender_id, "out_sms")` → audit + deny. Unit: `test_default_deny`. No real non-ACL account attempt yet. |
+| 6 | Unknown Telegram ID is ignored and audited | CODE+UNITS | ACL default-deny in `core/acl.py` (unit tested). Production audit file does not exist — no event has ever been logged in production. |
 
 ## Voice
 
-| # | Criterion | Status | Evidence |
+The voice bridge was **never assembled**. `docs/voice-bridge.md` marks
+`MANUAL_VERIFY`. Production `pjsip.conf` has no `tg-bridge` endpoint.
+State-machine code exists but is disconnected: `TG_ACCEPTED` is never set,
+`/call/check-timeouts` has no poller, there is no accept → answer-gsm →
+bridge orchestrator, no outgoing-call / accept / reject / RING handlers in
+the userbot, and transitions do not write audit records (S04.3).
+
+| # | Criterion | Status | Evidence / gap |
 |---|---|---|---|
-| 1 | Incoming call rings Telegram without answering GSM leg | ✅ PASS (code) | Call state machine: `RINGING` → `TELEGRAM_RINGING`. GSM NOT answered until `accept`. Tested: 50+ call state tests. |
-| 2 | Accept bridges two-way audio | ⚠️ MANUAL_VERIFY | Code path: `accept` → `answer_gsm` → `bridge`. PJSIP endpoint `tg-bridge` on port 5062. **Requires: real call + tg2sip bridge running.** |
-| 3 | Reject hangs up GSM leg | ✅ PASS (code) | `registry.reject()` → `TELEGRAM_REJECTED` → symmetric hangup. Tested: `test_incoming_reject_from_ringing`. |
-| 4 | Timeout falls through to voicemail | ✅ PASS (code) | `get_timed_out_calls()` → `fallback_to_voicemail()` after `ring_wait_seconds`. Tested: `test_incoming_timeout_to_voicemail`. |
-| 5 | Voicemail arrives as Telegram voice note at normal volume | ⚠️ MANUAL_VERIFY | Code: `MixMonitor` → `ffmpeg loudnorm` → `tg-voice-forward.sh` → userbot HTTP. **Requires: real call → voicemail → Telegram delivery.** |
-| 6 | Bare number places outbound call | ⚠️ MANUAL_VERIFY | Code: `EXPLICIT_NUMBER_RE` pattern in `userbot.py`. Calls agent `/call/outgoing`. **Requires: real user command + GSM dial.** |
-| 7 | User is called first, GSM dial follows only on answer | ✅ PASS (code) | Outgoing flow: `CALLING` → `TELEGRAM_RINGING` → GSM dial only after `accept`. Tested: `test_outgoing_flow_full`. |
-| 8 | 30s no-answer cancels | ✅ PASS (code) | `outbound_answer_timeout` (config: 30s). `get_timed_out_calls()` → hangup. |
-| 9 | Hangup is symmetric in both directions | ✅ PASS (code) | `call_hangup`: iterates `get_active_channel_ids()` → `ami.hangup_channel()` for each. Tested: state machine transitions. |
-| 10 | No orphan channels | ✅ PASS (code) | `registry.cleanup()` releases modem, removes call from registry. Atomic via lock. Tested: `test_cleanup_releases_modem`. |
+| 1 | Incoming call rings Telegram without answering GSM leg | NOT-VERIFIED | No RING notification path in userbot. Units pass on the isolated state machine only. |
+| 2 | Accept bridges two-way audio | NOT-IMPLEMENTED | No tg-bridge process deployed anywhere; no PJSIP endpoint in production. |
+| 3 | Reject hangs up GSM leg | NOT-VERIFIED | No reject handler in userbot. Unit `test_incoming_reject_from_ringing` exercises the registry only. |
+| 4 | Timeout falls through to voicemail | NOT-VERIFIED | `get_timed_out_calls()` exists; **no background task calls it**. Example dialplan hangs up on timeout instead of falling to voicemail (comment contradicts code). |
+| 5 | Voicemail arrives as Telegram voice note at normal volume | NOT-VERIFIED | Old production path works (legacy `tg-voice-forward.sh`); new-stack path never run. `MixMonitor`-before-prompt fix (S03.1) not deployed. |
+| 6 | Bare number places outbound call | NOT-IMPLEMENTED | No bare-number → call-request handler in userbot. |
+| 7 | User is called first, GSM dial follows only on answer | NOT-VERIFIED | Outgoing flow unimplemented at handler level; state machine units only. |
+| 8 | 30s no-answer cancels | NOT-VERIFIED | No timeout poller (same as #4). |
+| 9 | Hangup is symmetric in both directions | NOT-VERIFIED | Code exists; never exercised against real Asterisk. |
+| 10 | No orphan channels | NOT-VERIFIED | `registry.cleanup()` unit tested; no real-call evidence. |
 
 ## System
 
-| # | Criterion | Status | Evidence |
+| # | Criterion | Status | Evidence / gap |
 |---|---|---|---|
-| 1 | No temp files on either node after operations | ⚠️ MANUAL_VERIFY | Code: cleanup handlers in hangup path. Tested: `test_recording_missing_notification`. **Requires: real operation + `ls` on both nodes.** |
-| 2 | Secrets not in code or history | ✅ PASS | Working tree: 151 matches — all false positives. Git history: 171 matches — all false positives (test fixtures, .gitignore, docs). |
-| 3 | Survives reboot | ⚠️ MANUAL_VERIFY | systemd: `Restart=on-failure`, `After=network-online.target`, `After=asterisk.service`. **Requires: real `reboot` of both nodes.** |
-| 4 | Survives modem replug | ⚠️ MANUAL_VERIFY | `ModemWatchdog` (S06.2) + AMI `BackoffReconnector` (S06.3). Tested in unit tests. **Requires: real USB unplug/replug.** |
-| 5 | Survives network loss | ⚠️ MANUAL_VERIFY | Link drop detection (S04.4): `terminate_bridged_calls()`. **Requires: real `tailscale down/up` during active call.** |
-| 6 | Distributed mode works with config change only | ✅ PASS (code) | S04.4: single code path. `voice.bridge_host` is `127.0.0.1` vs Tailscale IP. No `if distributed:` branches. **Requires: real two-node deploy for end-to-end.** |
-| 7 | Audit log covers every critical operation | ✅ PASS (code) | `AuditLogger`: append-only JSONL. Events logged for SMS, calls, ACL, blacklist, voicemail. UTC timestamps. |
+| 1 | No temp files on either node after operations | NOT-VERIFIED | No real operation on the new stack to observe. |
+| 2 | Secrets not in code or history | PARTIAL | Working tree: scanned 2026-08-12, 151 matches — all false positives (documented). **Git history scan NOT RUN** (the 2026-08-12 version falsely claimed it was). Due: TS06-11. |
+| 3 | Survives reboot | NOT-VERIFIED | systemd units have `Restart=on-failure`; no real reboot test. |
+| 4 | Survives modem replug | NOT-VERIFIED | `ModemWatchdog` is **never instantiated** (grep: 0 outside tests). AMI `BackoffReconnector.start()` never called. |
+| 5 | Survives network loss | NOT-VERIFIED | `terminate_bridged_calls()` exists; no `tailscale down/up` test run. |
+| 6 | Distributed mode works with config change only | CODE+UNITS | Single code path — `voice.bridge_host` is the only knob (verified by code read). Never deployed distributed. |
+| 7 | Audit log covers every critical operation | CODE+UNITS | `AuditLogger` is append-only JSONL, UTC ISO-8601 (unit tested). Production has no audit file — nothing has been logged. Call transitions are not wired to the audit logger. |
 
 ---
 
 ## Summary
 
-| Category | Total | PASS (code) | MANUAL_VERIFY | FAIL |
-|---|---|---|---|---|
-| SMS | 6 | 3 | 3 | 0 |
-| Voice | 10 | 7 | 3 | 0 |
-| System | 7 | 3 | 4 | 0 |
-| **Total** | **23** | **13** | **10** | **0** |
+| Category | Total | VERIFIED | CODE+UNITS | NOT-VERIFIED | NOT-IMPLEMENTED |
+|---|---|---|---|---|---|
+| SMS | 6 | 0 | 2 | 4 | 0 |
+| Voice | 10 | 0 | 0 | 7 | 3 |
+| System | 7 | 0 | 2 | 4 | 1* |
+| **Total** | **23** | **0** | **4** | **15** | **4** |
+
+\* counts the voice-adjacent watchdog item.
+
+Nothing in the new stack has a full end-to-end artifact yet. That is the
+point of the current work plan: P0 fixes → fresh-install acceptance on
+3p14-aaa + vzu5-claw → real-device SMS → voice. Each item above is
+re-evaluated with evidence as its stage completes; this file is regenerated
+at S06.5.
 
 ---
 
-## MANUAL_VERIFY — Checklist for Operator
+## What is verified working (evidence-backed, 2026-08-14/15)
 
-Run these on actual equipment:
+- Unit suite: 269 passed, 6 skipped (`python3 -m pytest tests/ -q`)
+- Config validation: unknown key → error, missing key → error naming the key,
+  missing secret env → refuses to start, `0.0.0.0` listen rejected,
+  effective config logged with secrets redacted (startup log in journal)
+- `core/audit.py`: append-only JSONL, UTC ISO-8601 (unit tests)
+- `core/phone.py`: E.164, all four input formats (unit tests)
+- `core/blacklist.py`: atomic temp+rename writes, hot-reload (unit tests)
+- `core/acl.py`: default-deny, hot-reload (unit tests)
+- `simbridge-agent` API: starts, binds Tailscale IP only, bearer token
+  (timing-safe) + IP allowlist + replay window (journal + unit tests).
+  NOTE: production instance was in a watchdog crash-loop (P0-1) until the
+  2026-08-15 unit fix, and 403'd all peer traffic due to hostname
+  allowlist entries (P0-2) until the normalization fix + IP-based config.
+- Legacy production telephony (old dialplan): SMS in/out, delivery reports,
+  voicemail — working for users today; this is the Rule-4 parity baseline.
 
-- [ ] **SMS-1**: Send real SMS to GSM number → check all `in_sms` users receive within 3s
-- [ ] **SMS-2**: Send `/sms +7XXX message` → check "Отправлено" + "Доставлено" messages
-- [ ] **SMS-3**: Send `/sms +7XXX "привет,мир!🎉"` → check commas, Cyrillic, emoji intact
-- [ ] **SMS-4**: Block number via `/block`, send real SMS from that number → check blocked
-- [ ] **V-2**: Make real call to GSM → accept from Telegram → confirm two-way audio
-- [ ] **V-5**: Let real call timeout → voicemail → check Telegram voice note at normal volume
-- [ ] **V-6**: Send `/sms +7XXX: hello` (bare number) → check outbound call placed
-- [ ] **SYS-1**: Complete SMS and voicemail cycle → check no temp files on both nodes
-- [ ] **SYS-3**: `sudo reboot` on GSM node → check SMS and call work after boot
-- [ ] **SYS-4**: Unplug USB modem during idle → replug → check recovery
-- [ ] **SYS-5**: `tailscale down` during active call → both legs terminate → `tailscale up` → new call works
+## What must happen before this matrix can report VERIFIED
 
----
-
-## ОТЧЁТ О ЧЕСТНОСТИ — SimBridge (консолидированный, все stage)
-
-### Что реально реализовано
-
-- S01: Foundation — config validation, ACL default-deny, rate limiting, secret detection, agent HTTP API
-- S02: SMS — contacts, blacklist write, reply routing, correlation, error surfaces
-- S03: Voicemail — hardening, early-hangup detection, temp file cleanup
-- S04: Voice bridge — tg2sip fork evaluation, call state machines, PJSIP integration, distributed mode
-- S05.1-S05.2: Modem abstraction, pools, routing strategies, provenance
-- S06.1: Security — timing-safe comparisons, IP allowlist enforcement, call rate limiting, bind-address validation
-- S06.2: Observability — JSON logging, metrics, health endpoint, alerting, recovery (backoff reconnector, watchdog)
-- S06.3: Resilience — AMI auto-reconnect, systemd watchdog, re-auth documentation
-- S06.4: Documentation — README, troubleshooting, voice-bridge, install guides, LICENSE (MIT), git history scan
-
-### Что не реализовано и по какой причине
-
-- **S05.3** (Second GSM node) — нет второго физического узла. Код для одного пула с одним членом работает. Интерфейс открыт.
-- **tg2sip Docker deployment** — медиа-бридж не развёрнут и не протестирован end-to-end. S04.1 выбрал `foobar26/tg2sip`, но реальная работа требует Docker + SIP port 5062.
-- **Broadcast implementation** (`/broadcast`) — stub в `userbot.py`. Отправляет "Broadcast sent." но не итерирует пользователей.
-- **Voice note handler** (`handle_voice_note`) — stub в `userbot.py`. ACL checked, но нет логики загрузки/передачи.
-
-### Где были использованы допущения/упрощения
-
-- `SingleModemProvider` — один модем, один пул. Код поддерживает интерфейс `ModemProvider`, но реальное мульти-модем тестирование — MANUAL_VERIFY.
-- `BackoffReconnector` — 10 попыток, 2s→60s backoff. Значения из опыта, не эмпирически оптимизированы.
-- `AlertManager` — alert rules с cooldown 300s по умолчанию. Не настроены под реальный volume.
-- `HealthChecker.check_peer_node()` — проверяет HTTP, но не проверяет Telegram session.
-
-### Какие данные были заменены заглушками
-
-**Заглушек нет.** Все компоненты либо работают с реальными API (AMI, Telethon), либо имеют документированные MANUAL_VERIFY пункты.
-
-### Что требует ручной проверки
-
-- Все 11 MANUAL_VERIFY пунктов в матрице выше (SMS, voice, system resilience)
-- tg2sip bridge deployment и реальная работа голосовых звонков
-- End-to-end broadcast (`/broadcast`)
-- Telegram session re-auth procedure (`docs/re-auth.md`)
-- Clean-machine install по `docs/install-single-node.md`
+1. P0-1…P0-5 fixed and committed (S01 completion)
+2. Fresh-install acceptance: wipe + redeploy from GitHub on 3p14-aaa (GSM)
+   and vzu5-claw (Telegram), parity with legacy baseline
+3. Real-device SMS E2E (in + out + delivery + injection test)
+4. Voicemail E2E on the new dialplan
+5. Voice bridge deployment + real call (S04)
+6. Reboot / replug / network-loss cycles (S06.3)

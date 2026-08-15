@@ -40,6 +40,7 @@ def generate(config: dict, output_path: str) -> None:
 
     ring_wait = int(a.get("ring_wait_seconds", 24))
     max_record = int(a.get("max_record_seconds", 90))
+    early_hangup = int(a.get("early_hangup_max_seconds", 3))
     prompt = a.get("prompt", "/var/lib/asterisk/sounds/custom/vm-prompt")
 
     # Strip codec extension for Playback() — Playback() auto-selects
@@ -58,6 +59,7 @@ def generate(config: dict, output_path: str) -> None:
     content += f"; Timing: ring_wait_seconds={ring_wait} (≈ {ring_wait // 5} ring cycles)\n"
     content += f"RING_WAIT_SECONDS={ring_wait}\n"
     content += f"MAX_RECORD_SECONDS={max_record}\n"
+    content += f"EARLY_HANGUP_MAX_SECONDS={early_hangup}\n"
     content += f"VM_PROMPT={prompt_path}\n"
     content += f"VM_REC_DIR={config.get('paths', {}).get('recordings_dir', '/var/lib/simbridge/recordings')}\n"
     content += f"; Bridge (S04.2): Telegram voice bridge settings\n"
@@ -73,15 +75,30 @@ def generate(config: dict, output_path: str) -> None:
     # S04.4: Distributed mode — Tailscale network settings
     content += f"; Distributed mode (S04.4): Tailscale network\n"
     content += f"TAILNET_CGNAT=100.64.0.0/10\n"
+    # S01: event forwarding targets (P0-3: AGI scripts read these via
+    # channel variables — FWD_URL, MODEM_ID — never hardcode in the dialplan)
+    userbot_listen = config.get("userbot_http", {}).get("listen", "127.0.0.1:8088")
+    content += f"; Userbot HTTP (SMS/voicemail event forwarding)\n"
+    content += f"USERBOT_URL=http://{userbot_listen}\n"
+    paths = config.get("paths", {})
+    blacklist = paths.get("blacklist", "/etc/simbridge/blacklist.txt")
+    content += f"; Blacklist file (S02.2: incoming call/SMS check)\n"
+    content += f"BLACKLIST_PATH={blacklist}\n"
+    content += f"; Modem ID for event payloads (single-dongle S01)\n"
+    content += f"MODEM_ID={a.get('dongle', 'gsm')}\n"
 
     out = Path(output_path)
     out.write_text(content, encoding="utf-8")
     print(f"Written: {output_path}")
     print(f"  RING_WAIT_SECONDS = {ring_wait} ({ring_wait // 5} ring cycles)")
     print(f"  MAX_RECORD_SECONDS = {max_record}")
+    print(f"  EARLY_HANGUP_MAX_SECONDS = {early_hangup}")
     print(f"  VM_PROMPT = {prompt_path}")
     print(f"  BRIDGE_ENDPOINT = {bridge_endpoint}")
     print(f"  OUTBOUND_RING_TIMEOUT = {outbound_timeout}")
+    print(f"  USERBOT_URL = http://{userbot_listen}")
+    print(f"  BLACKLIST_PATH = {blacklist}")
+    print(f"  MODEM_ID = {a.get('dongle', 'gsm')}")
 
 
 def main() -> None:

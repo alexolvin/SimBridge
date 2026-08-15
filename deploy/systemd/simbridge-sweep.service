@@ -1,0 +1,19 @@
+[Unit]
+Description=SimBridge voicemail recording sweeper (orphan forward safety net)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=asterisk
+Group=asterisk
+WorkingDirectory=/opt/simbridge
+EnvironmentFile=/etc/simbridge/env
+Environment=SIMBRIDGE_CONFIG=/etc/simbridge/simbridge.yaml
+ExecStart=/opt/simbridge-venv/bin/python /opt/simbridge/scripts/sweep-recordings.py
+Nice=10
+
+# Needs: recordings dir (owned by asterisk) + the app tree (read-only).
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/simbridge
+PrivateTmp=yes

@@ -1,21 +1,29 @@
 #!/bin/bash
-# Pre-commit hook: refuse to commit secrets, API hashes, phone numbers, etc.
+# Pre-commit hook: refuse commits that contain secrets (Rule 5).
 #
-# Installs to .git/hooks/pre-commit (executable).
-# Called by git before each commit. Exit 1 blocks the commit.
+# Layer 1: filename check — staging a file that IS a secret (*.session,
+#          .env, private key, ...) is always blocked.
+# Layer 2: content scan   — high-confidence secret shapes block the commit;
+#          low-confidence signals (e.g. .session path references) print
+#          warnings.
+#
+# Install:  cp scripts/pre-commit.sh .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#          (or: ln -sf ../../scripts/pre-commit.sh .git/hooks/pre-commit)
+#
+# False positive: put '# SECRET_CHECK_IGNORE' on the line, or add the
+#          verified-fake value to config/secret_check_allowlist.txt.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Works both from scripts/ and once installed in .git/hooks/.
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 
-# Get list of staged files (text files only)
-FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(py|sh|yaml|yml|conf|txt|md|json|toml)$' || true)
+# NOTE: unquoted $STAGED below is intentional word-splitting; filenames
+# containing spaces are not supported by this hook.
+STAGED="$(git diff --cached --name-only --diff-filter=ACM || true)"
 
-if [ -z "$FILES" ]; then
+if [ -z "$STAGED" ]; then
     exit 0
 fi
 
-# Run the Python secret checker
-python3 "$PROJECT_ROOT/core/secrets_check.py" $FILES
-exit $?
+python3 "$PROJECT_ROOT/core/secrets_check.py" $STAGED
