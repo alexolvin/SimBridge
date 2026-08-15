@@ -32,6 +32,7 @@ agent:
   token_env: SIMBRIDGE_AGENT_TOKEN   # bearer token, from env
   allowed_peers:
     - "100.x.x.x"                   # Telegram node Tailscale IP
+  userbot_url: http://100.x.x.x:8088  # userbot HTTP (delivery notifications)
 
 # ---------------------------------------------------------------------------
 # Userbot HTTP server (receives events from Asterisk hooks)
@@ -85,3 +86,4 @@ paths:
   contacts_cache: /var/lib/simbridge/contacts.csv
   audit_log: /var/log/simbridge/audit.jsonl
   recordings_dir: /var/lib/simbridge/recordings
+  sms_correlation: /var/lib/simbridge/sms_correlation.jsonl

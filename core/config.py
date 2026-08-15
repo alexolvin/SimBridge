@@ -142,6 +142,9 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("agent.listen", str),
     _SchemaEntry("agent.token_env", str, env=True),
     _SchemaEntry("agent.allowed_peers", list, required=False),
+    # Base URL of the userbot HTTP server — the agent POSTs delivery
+    # notifications here after matching a carrier report.
+    _SchemaEntry("agent.userbot_url", str),
     # -- userbot_http --
     _SchemaEntry("userbot_http.listen", str),
     # Required for roles that run the userbot HTTP server (event receiver).
@@ -183,6 +186,8 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("paths.contacts_cache", str),
     _SchemaEntry("paths.audit_log", str),
     _SchemaEntry("paths.recordings_dir", str, required=False),
+    # JSONL log of SMS correlation records (delivery reports survive restarts)
+    _SchemaEntry("paths.sms_correlation", str),
 ]
 
 

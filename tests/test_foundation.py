@@ -118,6 +118,7 @@ telegram:
 agent:
   listen: "127.0.0.1:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
+  userbot_url: http://127.0.0.1:8088
   allowed_peers: []
 userbot_http:
   listen: "127.0.0.1:8088"
@@ -144,6 +145,7 @@ paths:
   blacklist: /tmp/b
   contacts_cache: /tmp/c
   audit_log: /tmp/a
+  sms_correlation: /tmp/sc
 """
 
 # Every secret env var a config may reference. New tests clear all of these
@@ -216,6 +218,7 @@ telegram:
 agent:
   listen: "127.0.0.1:8090"
   token_env: NONEXISTENT_ENV_VAR
+  userbot_url: http://127.0.0.1:8088
   allowed_peers: []
 userbot_http:
   listen: "127.0.0.1:8088"
@@ -242,6 +245,7 @@ paths:
   blacklist: /tmp/b
   contacts_cache: /tmp/c
   audit_log: /tmp/a
+  sms_correlation: /tmp/sc
 """)
         # Make sure the env var is NOT set
         os.environ.pop("NONEXISTENT_ENV_VAR", None)

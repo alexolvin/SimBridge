@@ -98,7 +98,8 @@ class Userbot:
                     outcome="denied",
                     details={"right": "out_sms", "command": "sms"},
                 )
-                await evt.reply(SMSErrorType.NUMBER_MISSING.value)
+                # S02.4: an ACL denial is a denial — not "number missing".
+                await evt.reply(SMSErrorType.DENIED.value)
                 return
 
             # S02.3: Check if this is a reply to an incoming SMS
@@ -167,17 +168,25 @@ class Userbot:
                         timeout=30.0,
                     )
                     resp.raise_for_status()
-                    data = resp.json()
-                    await evt.reply(f"Sent to {norm}")
+                    await evt.reply("Отправлено")
             except httpx.HTTPStatusError as e:
-                # S02.4: Map HTTP errors to user-friendly messages
-                detail = e.response.text
+                # S02.4: Map HTTP errors to user-friendly messages.
+                # The agent returns {"detail": "<localized>"} on 4xx/5xx
+                # (e.g. the categorized 502 message) — prefer it over
+                # the raw body.
+                try:
+                    detail = e.response.json().get("detail") or ""
+                except (ValueError, AttributeError):
+                    detail = e.response.text
                 if e.response.status_code == 403:
                     await evt.reply(SMSErrorType.BLACKLISTED.value)
                 elif e.response.status_code == 429:
                     await evt.reply("Слишком много SMS. Попробуйте позже.")
                 else:
-                    await evt.reply(f"Ошибка отправки: {detail}")
+                    await evt.reply(
+                        f"Ошибка отправки: {detail}" if detail
+                        else SMSErrorType.SEND_FAILED.value
+                    )
             except httpx.HTTPError as e:
                 await evt.reply(SMSErrorType.MODEM_UNAVAILABLE.value)
 
@@ -200,11 +209,34 @@ class Userbot:
                     outcome="denied",
                     details={"right": "out_sms", "command": "broadcast"},
                 )
-                await evt.reply("Access denied.")
+                await evt.reply(SMSErrorType.DENIED.value)
                 return
 
-            # TODO: iterate users with out_sms right and send
-            await evt.reply("Broadcast sent.")
+            # D13: send the raw text to every user with out_sms,
+            # including the sender. Per-user isolation.
+            recipients = sorted(self._acl.users_with_right("out_sms"))
+            sent: list[int] = []
+            failed: list[int] = []
+            for uid in recipients:
+                try:
+                    await self._client.send_message(uid, message)
+                    sent.append(uid)
+                except Exception as e:
+                    failed.append(uid)
+                    logger.warning("broadcast: user %s failed: %s", uid, e)
+            self._audit.log(
+                EventType.BROADCAST_SENT,
+                telegram_user_id=sender_id,
+                outcome="ok" if not failed else "partial",
+                details={
+                    "recipients": recipients,
+                    "delivered_to": sent,
+                    "text_len": len(message),
+                },
+            )
+            await evt.reply(
+                f"Рассылка: доставлено {len(sent)} из {len(recipients)}"
+            )
 
         @self._client.on(events.NewMessage(func=lambda e: e.voice is not None))
         async def handle_voice_note(evt):
@@ -239,7 +271,7 @@ class Userbot:
                     outcome="denied",
                     details={"right": "out_sms", "command": "block"},
                 )
-                await evt.reply("Access denied.")
+                await evt.reply(SMSErrorType.DENIED.value)
                 return
 
             phone = parts[1]
@@ -288,7 +320,7 @@ class Userbot:
                     outcome="denied",
                     details={"right": "out_sms", "command": "unblock"},
                 )
-                await evt.reply("Access denied.")
+                await evt.reply(SMSErrorType.DENIED.value)
                 return
 
             phone = parts[1]
@@ -359,6 +391,11 @@ class Userbot:
     async def run_until_disconnected(self) -> None:
         """Block until the client disconnects."""
         await self._client.run_until_disconnected()
+
+    @property
+    def client(self):
+        """Telethon client (exposed for the in-process HTTP server, D1)."""
+        return self._client
 
     @property
     def acl(self) -> ACLManager:

@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from core.acl import ACLManager
 from core.audit import AuditLogger
 from core.contacts import ContactResolver
+from core.errors import SMSErrorType
 from core.events import EventType, SMSEvent
 
 logger = getLogger("simbridge.userbot.http")
@@ -27,8 +28,15 @@ def create_http_server(
     acl: ACLManager,
     audit: AuditLogger,
     contacts: Optional[ContactResolver] = None,
+    client=None,
 ) -> FastAPI:
-    """Create the HTTP server for receiving Asterisk events."""
+    """Create the HTTP server for receiving Asterisk events.
+
+    *client* is the Telethon client (or a test double with an async
+    ``send_message(entity, text)``) used to deliver events to Telegram
+    users. When None, events are accepted and audited but not delivered
+    (standalone/test mode).
+    """
 
     app = FastAPI(title="SimBridge Userbot HTTP")
     app.state.expected_secret = secret
@@ -36,6 +44,7 @@ def create_http_server(
     app.state.acl = acl
     app.state.audit = audit
     app.state.contacts = contacts
+    app.state.client = client
 
     @app.post("/events/sms")
     async def handle_sms_event(req: Request):
@@ -62,38 +71,83 @@ def create_http_server(
             modem_id=body.get("modem_id", "gsm"),
         )
 
-        # S02.1: Format with contact name if available
-        formatted_text = sms_event.text
-        if contacts:
-            from core.phone import normalize_e164
-            name = contacts.resolve(sms_event.phone_number)
-            if name:
-                formatted_text = f"SMS {sms_event.phone_number} ({name}):\n{sms_event.text}"
-            else:
-                formatted_text = f"SMS {sms_event.phone_number}:\n{sms_event.text}"
+        # D2: route by event kind. "RING <number>" is an incoming-call
+        # notification (in_call audience) — production parity with the
+        # old dialplan; everything else is a real SMS (in_sms audience).
+        is_ring = sms_event.text == "RING" or sms_event.text.startswith("RING ")
+        phone = sms_event.phone_number
 
-        # Forward to Telegram users who have in_sms right
-        # (This would call the Telethon client — wired via app state)
+        if is_ring:
+            name = contacts.resolve(phone) if contacts else None
+            formatted_text = (
+                f"📞 Входящий звонок: {name} ({phone})"
+                if name
+                else f"📞 Входящий звонок: {phone}"
+            )
+        else:
+            # S02.1: the sender number is ALWAYS part of the message
+            # (legacy parity — "SMS +7...: text"); the contact name is
+            # added when the resolver has one.
+            name = contacts.resolve(phone) if contacts else None
+            if name:
+                formatted_text = f"SMS {phone} ({name}):\n{sms_event.text}"
+            else:
+                formatted_text = f"SMS {phone}:\n{sms_event.text}"
+
         logger.info(
-            "Received SMS from %s: %s... (len=%d)",
-            sms_event.phone_number,
+            "Received %s from %s: %s... (len=%d)",
+            "RING" if is_ring else "SMS",
+            phone,
             sms_event.text[:30],
             len(sms_event.text),
         )
 
-        # Audit
+        # Deliver to the audience. Per-user isolation: one failing
+        # recipient must not break the rest.
+        audience = sorted(acl.users_with_right("in_call" if is_ring else "in_sms"))
+        delivered: list[int] = []
+        failed: list[int] = []
+        if client is None:
+            logger.warning(
+                "SMS event accepted but no Telethon client is wired — not delivered"
+            )
+        else:
+            for uid in audience:
+                try:
+                    await client.send_message(uid, formatted_text)
+                    delivered.append(uid)
+                except Exception as e:
+                    failed.append(uid)
+                    logger.warning("failed to deliver to user %s: %s", uid, e)
+
+        if delivered and not failed:
+            outcome = "ok"
+        elif delivered:
+            outcome = "partial"
+        elif audience:
+            outcome = "failed"
+        else:
+            outcome = "no_audience"
+
         audit.log(
-            EventType.SMS_SUBMITTED,
-            outcome="ok",
+            EventType.SMS_RECEIVED,
+            outcome=outcome,
             correlation_id=sms_event.correlation_id,
             modem_id=sms_event.modem_id,
-            details={"from": sms_event.phone_number, "text_len": len(sms_event.text)},
+            details={
+                "from": phone,
+                "text_len": len(sms_event.text),
+                "kind": "ring" if is_ring else "sms",
+                "audience": audience,
+                "delivered_to": delivered,
+            },
         )
 
         return {
             "ok": True,
             "correlation_id": sms_event.correlation_id,
             "formatted_text": formatted_text,
+            "delivered_to": delivered,
         }
 
     @app.post("/events/voicemail")
@@ -171,6 +225,77 @@ def create_http_server(
             logger.info("Voicemail audio received: %s (%d bytes)", audio_file.filename, len(audio_file.file.read(0) if hasattr(audio_file.file, 'read') else 0))
 
         return {"ok": True, "voicemail_type": vm_type, "label": vm_label}
+
+    @app.post("/events/delivery")
+    async def handle_delivery_event(req: Request):
+        """Delivery-state notification from the agent (D4).
+
+        The agent resolves a carrier delivery report against its
+        correlation store and POSTs the outcome here. The message goes
+        ONLY to the user who sent the SMS (record.telegram_user_id) —
+        a delivery status is personal, not a broadcast.
+        """
+        received_secret = req.headers.get("x-simbridge-secret", "")
+        if not hmac.compare_digest(received_secret, secret):
+            raise HTTPException(status_code=401, detail="Invalid secret")
+
+        client_host = req.client.host if req.client else None
+        if allowed_peers and client_host not in allowed_peers:
+            raise HTTPException(status_code=403, detail="IP not allowed")
+
+        body = await req.json()
+        sms_id = str(body.get("sms_id", ""))
+        phone = str(body.get("phone_number", ""))
+        uid = int(body.get("telegram_user_id", 0) or 0)
+        status = str(body.get("status", ""))
+        error = body.get("error")
+
+        if status == "delivered":
+            text = f"Доставлено: {phone}"
+        elif status == "failed":
+            text = f"{SMSErrorType.DELIVERY_FAILED.value}: {phone}"
+            if error:
+                text += f"\n{error[:200]}"
+        else:
+            logger.warning(
+                "delivery event with unknown status %r (sms_id=%s)", status, sms_id
+            )
+            audit.log(
+                EventType.SMS_DELIVERY_REPORT,
+                outcome="unknown_status",
+                correlation_id=sms_id,
+                details={"phone": phone, "status": status},
+            )
+            return {"ok": True, "notified": False}
+
+        notified = False
+        if uid == 0:
+            # Sender unknown — audit only, no one to notify.
+            logger.info(
+                "delivery %s for %s: no sender to notify (sms_id=%s)",
+                status, phone, sms_id,
+            )
+        elif client is None:
+            logger.warning(
+                "delivery %s for user %s not notified — no client", status, uid
+            )
+        else:
+            try:
+                await client.send_message(uid, text)
+                notified = True
+            except Exception as e:
+                logger.warning(
+                    "failed to notify user %s of delivery %s: %s", uid, status, e
+                )
+
+        audit.log(
+            EventType.SMS_DELIVERY_REPORT,
+            telegram_user_id=uid,
+            outcome=status,
+            correlation_id=sms_id,
+            details={"phone": phone, "error": error, "notified": notified},
+        )
+        return {"ok": True, "notified": notified}
 
     @app.get("/health")
     async def health():

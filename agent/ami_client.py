@@ -1,13 +1,16 @@
 """Asterisk Manager Interface (AMI) client.
 
-Provides parameterized access to Asterisk commands — user text never becomes
-shell interpolation. Choosen over ARI because:
+Provides parameterized access to Asterisk commands via the chan_dongle
+AMI actions (DongleSendSMS, DongleShowDevices) and core AMI actions
+(Originate, Hangup, SetVariable, Command). Chosen over ARI because:
 1. AMI is available on Asterisk 18 out of the box (no extra config)
-2. DongleSendSMS is an AMI-level action, not exposed via ARI REST
+2. DongleSendSMS / DongleShowDevices are AMI-level actions, not exposed via ARI REST
 3. Simpler dependency: one TCP connection, no HTTP server on Asterisk side
 
-Security: parameters are sent as AMI message fields, not as a constructed
-shell command. The SMS text is a separate AMI field — no injection surface.
+Security: parameters are sent as first-class AMI header fields
+("Message: <text>"), never interpolated into a command string. AMI is a
+line-based protocol, so values containing raw newlines are rejected with
+ValueError instead of corrupting the stream.
 """
 
 from __future__ import annotations
@@ -16,6 +19,14 @@ import asyncio
 import io
 import re
 from typing import Optional
+
+
+class AMISendError(Exception):
+    """AMI action failed with an explicit Error response."""
+
+    def __init__(self, message: str, response: dict) -> None:
+        super().__init__(message)
+        self.response = response
 
 
 class AMIClient:
@@ -78,35 +89,100 @@ class AMIClient:
             self._reader = None
             self._writer = None
 
-    async def send_sms(self, to: str, text: str) -> dict:
-        """Send SMS via DongleSendSMS AMI action.
+    # chan_dongle GSMRegistrationStatus values that mean the modem is usable.
+    _REGISTERED_STATES = {"Registered, home network", "Registered, roaming"}
 
-        *to* and *text* are passed as separate AMI fields — no shell interpolation.
-        The text is URL-encoded for the AMI protocol (commas are significant).
+    async def send_sms(self, to: str, text: str) -> dict:
+        """Send SMS via the native DongleSendSMS AMI action.
+
+        *to* and *text* are first-class AMI header fields (Number /
+        Message) — never interpolated into a command string, so
+        apostrophes, commas and Unicode pass through intact.
+
+        chan_dongle has no multi-line support over AMI, so newlines are
+        flattened to spaces before sending (the legacy dialplan never
+        supported multi-line SMS either).
+
+        Validity (1440 minutes) and Report (yes) mirror the production
+        dialplan's DongleSendSMS application arguments; the delivery
+        report drives the /v1/sms/report correlation path.
+
+        Raises:
+            AMISendError: the action returned an explicit Error response.
         """
-        # DongleSendSMS expects: DongleSendSMS(dongle,to,text)
-        # but via AMI the text field is separate from the action
+        flattened = re.sub(r"[\r\n]+", " ", text)
         action_id = f"sms-{id(self)}-{asyncio.get_event_loop().time()}"
         await self._send_action(
             {
-                "Action": "DongleCommand",
-                "Command": f"DongleSendSMS({self._dongle},{to},'{text}')",
+                "Action": "DongleSendSMS",
+                "Device": self._dongle,
+                "Number": to,
+                "Message": flattened,
+                "Validity": "1440",
+                "Report": "yes",
                 "ActionID": action_id,
             }
         )
-        return await self._read_response()
+        resp = await self._read_response()
+        if resp.get("Response") == "Error" or resp.get("Action") == "failure":
+            raise AMISendError(resp.get("Message", "DongleSendSMS failed"), resp)
+        return resp
 
     async def get_modem_status(self) -> dict:
-        """Query modem registration and signal status."""
+        """Query live modem state via the DongleShowDevices AMI action.
+
+        Returns a normalized dict with the keys the callers expect:
+        device, registered, signal_percent, operator, imei_suffix —
+        mapped from the DongleDeviceEntry fields chan_dongle emits
+        (GSMRegistrationStatus, RSSI, ProviderName, IMEIState).
+        Returns {} if the device is not found.
+        """
         action_id = f"status-{id(self)}-{asyncio.get_event_loop().time()}"
         await self._send_action(
             {
-                "Action": "DongleCommand",
-                "Command": f"DongleStatus({self._dongle})",
+                "Action": "DongleShowDevices",
+                "Device": self._dongle,
                 "ActionID": action_id,
             }
         )
-        return await self._read_response()
+        # Reply shape: a list-ack message, then one DongleDeviceEntry
+        # per matching device, then a list-complete message. Unrelated
+        # events can interleave — skip anything that is not the entry.
+        entry: dict[str, str] = {}
+        for _ in range(32):  # bounded: a device list is short (1-3 entries)
+            resp = await self._read_response()
+            if resp.get("Message") == "DongleDeviceEntry":
+                entry = resp
+                break
+            if resp.get("Message") == "ListComplete":
+                break
+        if not entry:
+            return {}
+        return self._normalize_device_entry(entry)
+
+    @classmethod
+    def _normalize_device_entry(cls, entry: dict[str, str]) -> dict:
+        """Map raw DongleDeviceEntry fields to the normalized status dict."""
+        registered = entry.get("GSMRegistrationStatus", "") in cls._REGISTERED_STATES
+
+        signal = None
+        # chan_dongle emits "RSSI: %d, %s" — the first part is the dBm int.
+        rssi = entry.get("RSSI", "")
+        try:
+            dbm = int(rssi.split(",")[0].strip())
+            # Map -110..-50 dBm onto 0..100 %
+            signal = max(0, min(100, round((dbm + 110) * 100 / 60)))
+        except (ValueError, IndexError):
+            signal = None
+
+        imei = entry.get("IMEIState", "")
+        return {
+            "device": entry.get("Device", ""),
+            "registered": registered,
+            "signal_percent": signal,
+            "operator": entry.get("ProviderName") or None,
+            "imei_suffix": imei[-4:] if imei else None,
+        }
 
     # -------------------------------------------------------------------
     # S04.3: Call control AMI actions
@@ -241,9 +317,20 @@ class AMIClient:
         return await self._read_response()
 
     async def _send_action(self, fields: dict) -> None:
-        """Send an AMI action message."""
+        """Send an AMI action message.
+
+        AMI is a line-based protocol: a raw newline inside a value would
+        terminate the field early and corrupt the stream, so such values
+        are rejected instead of emitting an invalid message.
+        """
         if not self._writer:
             raise ConnectionError("AMI client not connected")
+
+        for k, v in fields.items():
+            if "\r" in v or "\n" in v:
+                raise ValueError(
+                    f"AMI field {k!r} contains a newline — AMI is line-based"
+                )
 
         msg = ""
         for k, v in fields.items():

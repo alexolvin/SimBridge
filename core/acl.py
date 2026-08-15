@@ -73,6 +73,14 @@ class ACLManager:
         with self._lock:
             return self._rules.get(uid, set()).copy()
 
+    def users_with_right(self, right: str) -> set[int]:
+        """Return all user IDs that have *right* (empty set if right invalid)."""
+        if right not in _RIGHTS:
+            return set()
+        self.reload()  # hot-reload: no-op unless the file changed (mtime)
+        with self._lock:
+            return {uid for uid, rights in self._rules.items() if right in rights}
+
     @property
     def user_count(self) -> int:
         with self._lock:

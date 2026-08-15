@@ -5,8 +5,10 @@ Integrates contacts, blacklist, sms_correlation, and error surfaces (Stage 02).
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
+from logging import getLogger
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Request
@@ -17,9 +19,9 @@ from core.events import EventType
 from core.ratelimit import RateLimiter
 from core.blacklist import BlacklistManager
 from core.sms_correlation import SMSCorrelationStore
-from core.errors import SMSErrorType
+from core.errors import SMSErrorType, asterisk_sms_error_to_type
 from core.acl import ACLManager
-from agent.ami_client import AMIClient
+from agent.ami_client import AMIClient, AMISendError
 from agent.deps import (
     require_auth,
     get_ami,
@@ -39,6 +41,8 @@ from core.call_control import CallRegistry, CallState, InvalidTransition, ModemB
 router = APIRouter()
 # Apply auth + IP allowlist + replay protection to all /v1 routes
 router.dependencies.append(Depends(require_auth))
+
+logger = getLogger("simbridge.agent")
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +145,8 @@ async def send_sms(
     **S02:** Checks blacklist, creates correlation record, returns sms_id.
     """
     correlation_id = req.correlation_id or uuid.uuid4().hex
+    cfg = get_cfg(request)
+    dongle = cfg.get("asterisk.dongle", "gsm")
 
     # S02.2: Check if destination is blacklisted
     if blacklist.contains(req.to):
@@ -159,7 +165,6 @@ async def send_sms(
     # Rate limit check (keyed by telegram_user_id or destination)
     limiter_key = f"sms:{req.telegram_user_id or req.to}"
     if not limiter.allow(limiter_key):
-        cfg = get_cfg(request)
         limit_val = cfg.get("limits.sms_per_hour", 30)
         audit.log(
             EventType.SMS_SEND_REQUESTED,
@@ -179,6 +184,7 @@ async def send_sms(
         phone_number=req.to,
         text=req.text,
         telegram_message_id=req.telegram_message_id,
+        modem_id=dongle,
     )
 
     # Audit: request received
@@ -193,6 +199,18 @@ async def send_sms(
     try:
         await ami.send_sms(req.to, req.text)
         sms_store.mark_submitted(record.sms_id)
+    except AMISendError as e:
+        # Asterisk explicitly refused the send (not registered, SIM
+        # error, ...) — map to the categorized user-facing message.
+        sms_store.mark_failed(
+            record.sms_id,
+            error=str(e),
+            submit_failed=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=asterisk_sms_error_to_type(str(e)).message,
+        )
     except ConnectionError:
         sms_store.mark_failed(
             record.sms_id,
@@ -215,7 +233,7 @@ async def send_sms(
         telegram_user_id=req.telegram_user_id,
         outcome="ok",
         correlation_id=correlation_id,
-        modem_id="gsm",
+        modem_id=dongle,
         details={"to": req.to, "sms_id": record.sms_id},
     )
 
@@ -299,6 +317,127 @@ async def report_sms_failed(
     return {"ok": True, "sms_id": sms_id}
 
 
+class SMSReportRequest(BaseModel):
+    phone_number: str = Field("", description="Originator of the report SMS (carrier short code)")
+    text: str = Field(..., min_length=1, description="Raw carrier delivery report text")
+    modem_id: str = Field("gsm", description="Dongle that received the report")
+
+
+@router.post("/sms/report")
+async def sms_delivery_report(
+    req: SMSReportRequest,
+    request: Request,
+    sms_store: SMSCorrelationStore = Depends(get_sms_store),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Carrier delivery report (DongleSendSMS Report=yes).
+
+    The AGI hook (tg-sms-agi.py, report mode) forwards the raw report
+    text here with the bearer token. The record is matched by
+    phone-number hint within the report, else the newest pending record
+    on the same dongle; resolved as delivered/failed by keywords, then
+    announced to the userbot (best effort).
+
+    **S02.3:** Reports are correlated by content + dongle, because
+    chan_dongle delivery reports carry no reference to the original SMS.
+    """
+    cfg = get_cfg(request)
+    record = sms_store.match_report(req.modem_id, req.text)
+    if record is None:
+        audit.log(
+            EventType.SMS_DELIVERY_REPORT,
+            outcome="no_match",
+            details={
+                "modem_id": req.modem_id,
+                "from": req.phone_number,
+                "text_preview": req.text[:120],
+            },
+        )
+        return {"ok": True, "matched": False}
+
+    lowered = req.text.lower()
+    failed_markers = (
+        "not delivered", "не доставлен", "expired", "timeout", "failed",
+    )
+    if any(m in lowered for m in failed_markers):
+        sms_store.mark_failed(record.sms_id, error=req.text[:200])
+        status = "failed"
+    else:
+        sms_store.mark_delivered(record.sms_id)
+        status = "delivered"
+
+    audit.log(
+        EventType.SMS_DELIVERY_REPORT,
+        telegram_user_id=record.telegram_user_id,
+        outcome=status,
+        details={
+            "sms_id": record.sms_id,
+            "phone": record.phone_number,
+            "from": req.phone_number,
+        },
+    )
+
+    await _notify_userbot_delivery(
+        cfg,
+        sms_id=record.sms_id,
+        phone_number=record.phone_number,
+        telegram_user_id=record.telegram_user_id,
+        status=status,
+        error=req.text[:200] if status == "failed" else None,
+    )
+
+    return {"ok": True, "matched": True, "sms_id": record.sms_id, "status": status}
+
+
+async def _notify_userbot_delivery(
+    cfg,
+    *,
+    sms_id: str,
+    phone_number: str,
+    telegram_user_id: int,
+    status: str,
+    error: Optional[str],
+) -> None:
+    """Announce a resolved delivery state to the userbot (best effort).
+
+    The userbot notifies the original sender. Any failure is logged and
+    swallowed — a delivery report must never fail because the
+    notification did.
+    """
+    import httpx
+
+    try:
+        url = cfg["agent.userbot_url"].rstrip("/") + "/events/delivery"
+        secret = os.environ.get(
+            cfg.get("userbot_http.secret_env", "SIMBRIDGE_HTTP_SECRET"), ""
+        )
+    except KeyError:
+        logger.warning("delivery notification skipped: config incomplete")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(
+                url,
+                json={
+                    "sms_id": sms_id,
+                    "phone_number": phone_number,
+                    "telegram_user_id": telegram_user_id,
+                    "status": status,
+                    "error": error,
+                },
+                headers={"X-SimBridge-Secret": secret},
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "userbot delivery notification rejected: %s %s",
+                resp.status_code,
+                resp.text[:120],
+            )
+    except Exception as e:
+        logger.warning("userbot delivery notification failed: %s", e)
+
+
 @router.get("/modems", response_model=list[ModemInfo])
 async def get_modems(
     ami: AMIClient = Depends(get_ami),
@@ -307,7 +446,7 @@ async def get_modems(
     try:
         status = await ami.get_modem_status()
         return [ModemInfo(
-            device=status.get("device", "gsm"),
+            device=status.get("device") or "unknown",
             registered=status.get("registered", False),
             signal_percent=status.get("signal_percent"),
             operator=status.get("operator"),

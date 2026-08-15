@@ -21,6 +21,7 @@ class SMSErrorType(Enum):
     SIM_UNAVAILABLE = "SIM-карта недоступна"
     SEND_FAILED = "Ошибка отправки SMS"
     BLACKLISTED = "Номер в черном списке"
+    DENIED = "Недостаточно прав"
 
     # Delivery-time errors
     DELIVERY_FAILED = "SMS не доставлена"
@@ -41,6 +42,7 @@ class SMSErrorType(Enum):
             SMSErrorType.SIM_UNAVAILABLE,
             SMSErrorType.SEND_FAILED,
             SMSErrorType.BLACKLISTED,
+            SMSErrorType.DENIED,
         }
 
     @property

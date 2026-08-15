@@ -134,8 +134,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     blacklist = BlacklistManager(path=cfg["paths.blacklist"])
     app.state.blacklist = blacklist
 
-    # Initialize SMS correlation store (S02.3)
-    sms_store = SMSCorrelationStore()
+    # Initialize SMS correlation store (S02.3) — persistent: delivery
+    # reports survive restarts via the JSONL log.
+    sms_store = SMSCorrelationStore(log_path=cfg["paths.sms_correlation"])
     app.state.sms_store = sms_store
 
     # Initialize modem pool (S05.1)

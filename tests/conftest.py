@@ -30,6 +30,7 @@ telegram:
 agent:
   listen: "127.0.0.1:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
+  userbot_url: http://127.0.0.1:8088
   allowed_peers:
     - "127.0.0.1"
 
@@ -66,6 +67,7 @@ paths:
   blacklist: /tmp/simbridge_test_blacklist.txt
   contacts_cache: /tmp/simbridge_test_contacts.csv
   audit_log: /tmp/simbridge_test_audit.jsonl
+  sms_correlation: /tmp/simbridge_test_sms_correlation.jsonl
 """
     cfg_path = tmp_path / "simbridge.yaml"
     cfg_path.write_text(cfg_content)

@@ -146,6 +146,7 @@ telegram:
 agent:
   listen: "0.0.0.0:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
+  userbot_url: http://127.0.0.1:8088
   allowed_peers: []
 userbot_http:
   listen: "127.0.0.1:8088"
@@ -172,6 +173,7 @@ paths:
   blacklist: /tmp/b
   contacts_cache: /tmp/c
   audit_log: /tmp/a
+  sms_correlation: /tmp/sc
 """)
         os.environ["SIMBRIDGE_TG_API_ID"] = "12345"
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
@@ -204,6 +206,7 @@ telegram:
 agent:
   listen: "127.0.0.1:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
+  userbot_url: http://127.0.0.1:8088
   allowed_peers: []
 userbot_http:
   listen: "0.0.0.0:8088"
@@ -229,6 +232,7 @@ paths:
   blacklist: /tmp/b
   contacts_cache: /tmp/c
   audit_log: /tmp/a
+  sms_correlation: /tmp/sc
 """)
         os.environ["SIMBRIDGE_TG_API_ID"] = "12345"
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
@@ -259,6 +263,7 @@ telegram:
 agent:
   listen: "127.0.0.1:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
+  userbot_url: http://127.0.0.1:8088
   allowed_peers: []
 userbot_http:
   listen: "127.0.0.1:8088"
@@ -285,6 +290,7 @@ paths:
   blacklist: /tmp/b
   contacts_cache: /tmp/c
   audit_log: /tmp/a
+  sms_correlation: /tmp/sc
 """)
         os.environ["SIMBRIDGE_TG_API_ID"] = "12345"
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
@@ -317,6 +323,7 @@ telegram:
 agent:
   listen: "100.64.1.5:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
+  userbot_url: http://127.0.0.1:8088
   allowed_peers: ["100.64.1.10"]
 userbot_http:
   listen: "100.64.1.5:8088"
@@ -343,6 +350,7 @@ paths:
   blacklist: /tmp/b
   contacts_cache: /tmp/c
   audit_log: /tmp/a
+  sms_correlation: /tmp/sc
 """)
         os.environ["SIMBRIDGE_TG_API_ID"] = "12345"
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
@@ -450,3 +458,46 @@ class TestUserbotCorrelationHeader:
         source = self._userbot_source()
         assert '"correlation_id": cid' in source
         assert "uuid.uuid4().hex" in source
+
+
+# =========================================================================
+# S02.2 — Dialplan: blacklisted senders' SMS never reach Telegram
+# =========================================================================
+
+class TestDialplanSmsBlacklist:
+    """Source-level invariants of the SMS path in extensions.conf.
+
+    A blacklisted sender's SMS must be dropped at the dialplan (same
+    mechanism as the incoming-voice path) — before any AGI forward.
+    The delivery-report exten must carry the raw report text to the
+    agent, not the userbot.
+    """
+
+    DIALPLAN = Path(__file__).resolve().parent.parent / "asterisk" / "extensions.conf"
+
+    @staticmethod
+    def _section(text, start, end):
+        return text.split(start, 1)[1].split(end, 1)[0]
+
+    def test_sms_exten_checks_blacklist_before_forward(self):
+        text = self.DIALPLAN.read_text(encoding="utf-8")
+        seg = self._section(
+            text, "; ---------- SMS ----------",
+            "; ---------- Delivery report ----------",
+        )
+        bl = seg.find("AGI(tg-blacklist-agi.py)")
+        fwd = seg.find("AGI(tg-sms-agi.py,sms)")
+        assert bl != -1, "sms exten must run the blacklist AGI"
+        assert fwd != -1, "sms exten must forward via tg-sms-agi.py"
+        assert bl < fwd, "blacklist check must precede the forward"
+        assert "BL_BLOCKED" in seg
+
+    def test_report_exten_carries_raw_text_to_agent(self):
+        text = self.DIALPLAN.read_text(encoding="utf-8")
+        seg = self._section(
+            text, "; ---------- Delivery report ----------",
+            "; ---------- USSD ----------",
+        )
+        assert "SMS_TEXT=${BASE64_DECODE(${SMS_BASE64})}" in seg
+        assert "AGI(tg-sms-agi.py,report)" in seg
+        assert "FWD_URL" not in seg  # reports go to the agent, not the userbot

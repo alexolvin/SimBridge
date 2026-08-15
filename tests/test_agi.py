@@ -194,15 +194,38 @@ class TestTgSmsAgi:
         }
 
     def test_report_event(self, http_server):
+        """The RAW carrier text goes to the agent's /v1/sms/report with
+        a bearer token (D3) — not the marker to the userbot."""
         final, _ = run_agi(
             "tg-sms-agi.py", ["report"],
-            variables={"SMS_FROM": "+79000000000",
-                       "FWD_URL": http_server.url, "MODEM_ID": "gsm"},
-            extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
+            variables={"SMS_FROM": "carrier",
+                       "SMS_TEXT": "Delivered 2026-08-15 10:00 +79261234555",
+                       "MODEM_ID": "gsm"},
+            extra_env={"AGENT_URL": http_server.url,
+                       "SIMBRIDGE_AGENT_TOKEN": "test-token"},
         )
         assert final.startswith("200 forwarded"), final
-        payload = json.loads(http_server.captured[0]["body"])
-        assert payload["text"] == "__DELIVERY_REPORT__"
+        (req,) = http_server.captured
+        assert req["path"] == "/v1/sms/report"
+        headers = {k.lower(): v for k, v in req["headers"].items()}
+        assert headers["authorization"] == "Bearer test-token"
+        payload = json.loads(req["body"])
+        assert payload == {
+            "phone_number": "carrier",
+            "text": "Delivered 2026-08-15 10:00 +79261234555",
+            "modem_id": "gsm",
+        }
+
+    def test_report_empty_text_is_skipped(self, http_server):
+        final, _ = run_agi(
+            "tg-sms-agi.py", ["report"],
+            variables={"SMS_FROM": "carrier", "SMS_TEXT": "",
+                       "MODEM_ID": "gsm"},
+            extra_env={"AGENT_URL": http_server.url,
+                       "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+        )
+        assert final.startswith("200 skipped"), final
+        assert http_server.captured == []
 
     def test_ring_event(self, http_server):
         """Production parity: the old dialplan sent "RING ${CALLER}"."""

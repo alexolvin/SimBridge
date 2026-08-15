@@ -47,11 +47,30 @@ async def async_main() -> None:
     ub = Userbot(cfg)
     await ub.start()
 
-    # Run HTTP server for Asterisk events in parallel
-    # TODO: start http_server alongside the Telethon client
-    # For now, the HTTP server is started as a separate service
+    # D1/D14: run the Asterisk-event HTTP server in-process, on the
+    # same event loop as the Telethon client. One systemd unit covers
+    # both; the server exits with the process.
+    from userbot.http_server import create_http_server
+
+    app = create_http_server(
+        secret=os.environ[cfg["userbot_http.secret_env"]],
+        allowed_peers=cfg.get("userbot_http.allowed_peers", []),
+        acl=ub.acl,
+        audit=ub.audit,
+        contacts=ub.contacts,
+        client=ub.client,
+    )
+
+    import uvicorn
+
+    host, _, port = cfg["userbot_http.listen"].rpartition(":")
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=int(port)))
+    server_task = asyncio.create_task(server.serve())
 
     await ub.run_until_disconnected()
+
+    server.should_exit = True
+    await server_task
 
 
 def main() -> None:

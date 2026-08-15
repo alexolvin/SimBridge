@@ -7,12 +7,17 @@ Tests: TS02-1 (normalizer), TS02-2 (contacts cache hit/miss),
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
+from agent.ami_client import AMIClient, AMISendError
+from core.acl import ACLManager
+from core.events import EventType
 from core.phone import normalize_e164, is_service_number
 from core.contacts import (
     CSVContactProvider,
@@ -439,3 +444,227 @@ class TestTextFidelity:
         """Mixed Cyrillic, commas, and emoji."""
         text = "Привет, мир! \U0001f600"
         assert text.encode("utf-8").decode("utf-8") == text
+
+
+# =========================================================================
+# S02.3 — Persistent correlation store (restart-safe delivery matching)
+# =========================================================================
+
+class TestSMSCorrelationPersistence:
+    """The store must survive an agent restart via the JSONL log."""
+
+    def test_roundtrip(self, tmp_path):
+        path = str(tmp_path / "correl.jsonl")
+        store = SMSCorrelationStore(log_path=path)
+        rec = store.create(123, "+79261234555", "hello", modem_id="gsm")
+        store.mark_submitted(rec.sms_id)
+        store.mark_delivered(rec.sms_id)
+
+        reloaded = SMSCorrelationStore(log_path=path)
+        again = reloaded.get(rec.sms_id)
+        assert again is not None
+        assert again.phone_number == "+79261234555"
+        assert again.telegram_user_id == 123
+        assert again.modem_id == "gsm"
+        assert again.submit_status == "submitted"
+        assert again.delivery_status == "delivered"
+
+    def test_reloaded_store_mutations_persist(self, tmp_path):
+        path = str(tmp_path / "correl.jsonl")
+        store = SMSCorrelationStore(log_path=path)
+        rec = store.create(123, "+79261234555", "hello")
+        store.mark_submitted(rec.sms_id)
+
+        reloaded = SMSCorrelationStore(log_path=path)
+        assert reloaded.get(rec.sms_id).submit_status == "submitted"
+        assert reloaded.mark_delivered(rec.sms_id) is True
+
+        again = SMSCorrelationStore(log_path=path)
+        assert again.get(rec.sms_id).delivery_status == "delivered"
+
+
+class TestMatchReport:
+    """S02.3: carrier report → record matching (dongle + number hint)."""
+
+    @staticmethod
+    def _submitted(store, phone, modem="gsm", text="m"):
+        rec = store.create(123, phone, text, modem_id=modem)
+        assert store.mark_submitted(rec.sms_id)
+        return rec
+
+    def test_hint_beats_recency(self):
+        store = SMSCorrelationStore()
+        old = self._submitted(store, "+79261234555")
+        time.sleep(0.01)
+        self._submitted(store, "+79000000000")
+        # The report names the OLDER number — the hint must win
+        # over the "newest submitted" fallback.
+        assert store.match_report("gsm", "Delivered 89261234555") is old
+
+    def test_fallback_newest_when_no_number_hint(self):
+        store = SMSCorrelationStore()
+        self._submitted(store, "+79261234555")
+        time.sleep(0.01)
+        new = self._submitted(store, "+79000000000")
+        got = store.match_report("gsm", "Delivered 10:00")
+        assert got is new
+
+    def test_modem_filter(self):
+        store = SMSCorrelationStore()
+        self._submitted(store, "+79261234555", modem="gsm")
+        assert store.match_report("gsm2", "Delivered 79261234555") is None
+        assert store.match_report("gsm", "Delivered 79261234555") is not None
+
+    def test_empty_store(self):
+        assert SMSCorrelationStore().match_report("gsm", "Delivered") is None
+
+    def test_resolved_record_not_matched_again(self):
+        store = SMSCorrelationStore()
+        rec = self._submitted(store, "+79261234555")
+        store.mark_delivered(rec.sms_id)
+        assert store.match_report("gsm", "Delivered 79261234555") is None
+
+    def test_unsubmitted_record_not_matched(self):
+        store = SMSCorrelationStore()
+        store.create(123, "+79261234555", "m")  # submit still pending
+        assert store.match_report("gsm", "Delivered 79261234555") is None
+
+
+# =========================================================================
+# S02.2 — ACL audience selection (broadcast + event routing)
+# =========================================================================
+
+class TestACLUsersWithRight:
+    def test_users_with_right(self, tmp_path):
+        acl_file = tmp_path / "acl.conf"
+        acl_file.write_text(
+            "# comment line\n"
+            "111 in_sms out_sms\n"
+            "222 in_call\n"
+            "333 out_sms\n"
+        )
+        acl = ACLManager(str(acl_file))
+        assert acl.users_with_right("out_sms") == {111, 333}
+        assert acl.users_with_right("in_call") == {222}
+        assert acl.users_with_right("in_sms") == {111}
+
+    def test_unknown_right_returns_empty(self, tmp_path):
+        acl_file = tmp_path / "acl.conf"
+        acl_file.write_text("111 out_sms\n")
+        acl = ACLManager(str(acl_file))
+        assert acl.users_with_right("bogus_right") == set()
+
+
+# =========================================================================
+# P0-1/P0-2 — AMI client: native DongleSendSMS (no shell interpolation)
+# =========================================================================
+
+class _FakeWriter:
+    def __init__(self):
+        self.data = b""
+
+    def write(self, b):
+        self.data += b
+
+    async def drain(self):
+        pass
+
+
+class _ScriptedAmi(AMIClient):
+    """AMIClient with the wire layer replaced by a script."""
+
+    def __init__(self, responses, dongle="gsm"):
+        super().__init__(dongle=dongle)
+        self.actions = []
+        self._responses = list(responses)
+
+    async def _send_action(self, fields):
+        self.actions.append(fields)
+
+    async def _read_response(self):
+        return self._responses.pop(0)
+
+
+class TestAMIClientSendSms:
+    def test_native_donglesendsms_headers(self):
+        """The text travels as a first-class AMI header, untouched."""
+        c = _ScriptedAmi([{"Response": "Success"}])
+        asyncio.run(c.send_sms("+79261234555", "Café, naïve; rm -rf /"))
+        (fields,) = c.actions
+        assert fields["Action"] == "DongleSendSMS"
+        assert fields["Device"] == "gsm"
+        assert fields["Number"] == "+79261234555"
+        assert fields["Message"] == "Café, naïve; rm -rf /"
+        assert fields["Validity"] == "1440"
+        assert fields["Report"] == "yes"
+        assert fields["ActionID"].startswith("sms-")
+
+    def test_newlines_flattened_to_spaces(self):
+        c = _ScriptedAmi([{"Response": "Success"}])
+        asyncio.run(c.send_sms("+79261234555", "line1\nline2\r\nline3"))
+        assert c.actions[0]["Message"] == "line1 line2 line3"
+
+    def test_error_response_raises_amisenderror(self):
+        c = _ScriptedAmi([{"Response": "Error", "Message": "Not registered"}])
+        with pytest.raises(AMISendError) as exc_info:
+            asyncio.run(c.send_sms("+79261234555", "x"))
+        assert str(exc_info.value) == "Not registered"
+        assert exc_info.value.response["Response"] == "Error"
+
+    def test_action_failure_raises_amisenderror(self):
+        c = _ScriptedAmi([{"Action": "failure", "Message": "dongle busy"}])
+        with pytest.raises(AMISendError) as exc_info:
+            asyncio.run(c.send_sms("+79261234555", "x"))
+        assert str(exc_info.value) == "dongle busy"
+
+    def test_send_action_rejects_newline_values(self):
+        c = AMIClient()
+        c._writer = _FakeWriter()
+        with pytest.raises(ValueError, match="newline"):
+            asyncio.run(c._send_action({"Action": "X", "Message": "a\nb"}))
+        asyncio.run(c._send_action({"Action": "X", "Message": "ok"}))
+        assert b"Message: ok\r\n" in c._writer.data
+        assert c._writer.data.endswith(b"\r\n\r\n")
+
+
+class TestAMIClientModemStatus:
+    @staticmethod
+    def _entry(**kw):
+        base = {
+            "Message": "DongleDeviceEntry",
+            "Device": "gsm",
+            "GSMRegistrationStatus": "Registered, home network",
+            "RSSI": "-65, -65",
+            "ProviderName": "MTS",
+            "IMEIState": "Registered 123456789012345",
+        }
+        base.update(kw)
+        return base
+
+    def test_normalize_entry(self):
+        out = AMIClient._normalize_device_entry(self._entry())
+        assert out["device"] == "gsm"
+        assert out["registered"] is True
+        assert out["operator"] == "MTS"
+        assert out["imei_suffix"] == "2345"
+        assert out["signal_percent"] == 75  # (-65+110)*100/60
+
+    def test_roaming_counts_as_registered(self):
+        out = AMIClient._normalize_device_entry(
+            self._entry(GSMRegistrationStatus="Registered, roaming")
+        )
+        assert out["registered"] is True
+
+    def test_unregistered_state(self):
+        out = AMIClient._normalize_device_entry(
+            self._entry(GSMRegistrationStatus="Not registered")
+        )
+        assert out["registered"] is False
+
+    def test_signal_clamped_to_range(self):
+        assert AMIClient._normalize_device_entry(
+            self._entry(RSSI="-999, x"))["signal_percent"] == 0
+        assert AMIClient._normalize_device_entry(
+            self._entry(RSSI="-10, x"))["signal_percent"] == 100
+        assert AMIClient._normalize_device_entry(
+            self._entry(RSSI="N/A"))["signal_percent"] is None
