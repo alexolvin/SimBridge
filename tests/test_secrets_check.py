@@ -89,8 +89,18 @@ class TestAllowlist:
         assert sc.scan_lines(['x = "+79261234555"'], "a.py", allow) == []
 
     def test_unlisted_number_still_blocks(self):
+        """A value NOT in the tracked allowlist must still block.
+
+        The base fixture below IS allowlisted (so this file can be
+        committed); the unlisted number is derived at runtime so no new
+        block-pattern literal ever appears in the source.
+        """
         allow = sc._load_allowlist()
-        matches = sc.scan_lines(['x = "+79267523624"'], "a.py", allow)
+        base = "+79267523624"
+        assert base in allow
+        unlisted = base[:-1] + str((int(base[-1]) + 1) % 10)
+        assert unlisted not in allow
+        matches = sc.scan_lines([f'x = "{unlisted}"'], "a.py", allow)
         assert [m.pattern_name for m in matches] == ["e164_phone"]
         assert matches[0].severity == "block"
 
@@ -182,8 +192,11 @@ class TestCli:
 
     def test_blocking_hit_exit_1(self, tmp_path: Path, capsys):
         # Value must NOT be in the tracked allowlist (main() loads it).
+        # Derive it at runtime from the allowlisted base below.
+        base = "ffffffffffffffffffffffffffffffff"
+        leak = base[:-1] + "e"
         f = tmp_path / "leak.py"
-        f.write_text('API_HASH = "ffffffffffffffffffffffffffffffff"\n')
+        f.write_text(f'API_HASH = "{leak}"\n')
         assert sc.main([str(f)]) == 1
         assert "COMMIT BLOCKED" in capsys.readouterr().err
 
