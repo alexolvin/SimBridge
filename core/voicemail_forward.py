@@ -13,12 +13,18 @@ Pipeline (preserved from the old tg-voice-forward.sh, plus fixes):
   1. ffprobe the duration
   2. classify: missing file -> "recording_missing"; zero audio
      (duration 0) -> "early_hangup" reported as JSON (a 0-second voice
-     note is useless in Telegram); duration < early_hangup_max_seconds
-     -> "early_hangup" (S03.1); else "normal"
+     note is useless in Telegram); speech time (recording duration
+     minus the greeting, S03.1) < early_hangup_max_seconds ->
+     "early_hangup" reported as TEXT ONLY — by definition the audio is
+     a greeting fragment plus under-threshold silence, there is no
+     caller content in it; else "normal"
   3. ffmpeg loudnorm (I=-16:LRA=11:TP=-1.5, 48000 Hz mono, libopus 32k
      — production parity with tg-voice-forward.sh; knowledge item 6:
      Telegram voice notes are too quiet without normalization),
-     fallback libvorbis/ogg, fallback the original file
+     fallback libvorbis/ogg, fallback the original file. The greeting
+     is trimmed from the front (S03.1: MixMonitor starts before
+     Playback, so the prompt is captured at the head of the WAV) —
+     stated choice: trim, not accept
   4. multipart POST /events/voicemail to the userbot with the
      X-SimBridge-Secret header
   5. cleanup is the CALLER's decision (AGI and sweeper both delete
@@ -58,12 +64,31 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# Raw Asterisk sound formats: ffprobe cannot infer these from content,
+# an explicit -f hint is required. Asterisk raw sounds are 8 kHz mono
+# (the native rate of the dialplan sounds dir). One probe function
+# shared by the AGI, the sweeper and the config generator (Rule 1).
+_RAW_FORMAT_HINTS = {
+    ".ulaw": ("-f", "mulaw", "-ar", "8000", "-channel_layout", "mono"),
+    ".gsm": ("-f", "gsm", "-ar", "8000", "-channel_layout", "mono"),
+    ".sln": ("-f", "sln", "-ar", "8000", "-channel_layout", "mono"),
+    ".slin": ("-f", "sln", "-ar", "8000", "-channel_layout", "mono"),
+    ".alaw": ("-f", "alaw", "-ar", "8000", "-channel_layout", "mono"),
+}
+
+
 def ffprobe_duration(path: str) -> float:
-    """Recording duration in seconds (0.0 on any failure)."""
+    """Recording duration in seconds (0.0 on any failure).
+
+    Asterisk raw sound files (.ulaw/.gsm/.sln/.alaw) are probed with a
+    format hint derived from the extension; container formats (.wav,
+    .ogg, ...) are probed as-is.
+    """
+    hint = _RAW_FORMAT_HINTS.get(os.path.splitext(path)[1].lower(), ())
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
+             "-of", "csv=p=0", *hint, path],
             capture_output=True, text=True, timeout=PROBE_TIMEOUT,
         )
         return float(r.stdout.strip() or "0")
@@ -71,40 +96,58 @@ def ffprobe_duration(path: str) -> float:
         return 0.0
 
 
-def classify(duration: float, early_hangup_max_seconds: int) -> str:
-    """S03.1: a recording shorter than the threshold means the caller
-    hung up right after the greeting."""
-    if int(duration) < early_hangup_max_seconds:
+def classify(duration: float, prompt_duration: float,
+             early_hangup_max_seconds: int) -> str:
+    """S03.1: the recording includes the greeting (MixMonitor starts
+    before Playback), so only the audio AFTER the prompt counts as the
+    caller's message: speech = duration - prompt_duration.
+
+    ``prompt_duration == 0`` reduces to the legacy check
+    (``int(duration) < max``), so callers that do not know the prompt
+    length keep the old behavior.
+    """
+    speech = duration - prompt_duration
+    if int(speech) < early_hangup_max_seconds:
         return "early_hangup"
     return "normal"
 
 
-def _ffmpeg(input_path: str, codec: str, output_path: str) -> bool:
-    """ffmpeg loudnorm to *output_path* with *codec* (arg vector, no shell)."""
+def _ffmpeg(input_path: str, codec: str, output_path: str,
+            seek_seconds: float = 0.0) -> bool:
+    """ffmpeg loudnorm to *output_path* with *codec* (arg vector, no shell).
+
+    ``seek_seconds`` input-seeks before reading — used to trim the
+    greeting from the front of the recording (S03.1).
+    """
+    cmd = ["ffmpeg", "-y"]
+    if seek_seconds > 0:
+        cmd += ["-ss", f"{seek_seconds:.3f}"]
+    cmd += ["-i", input_path,
+            "-af", LOUDNORM,
+            "-ar", AUDIO_RATE, "-ac", AUDIO_CHANNELS,
+            "-c:a", codec, "-b:a", AUDIO_BITRATE, output_path]
     try:
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path,
-             "-af", LOUDNORM,
-             "-ar", AUDIO_RATE, "-ac", AUDIO_CHANNELS,
-             "-c:a", codec, "-b:a", AUDIO_BITRATE, output_path],
-            capture_output=True, timeout=ENCODE_TIMEOUT,
-        )
+        r = subprocess.run(cmd, capture_output=True, timeout=ENCODE_TIMEOUT)
         return r.returncode == 0 and os.path.isfile(output_path)
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def normalize_volume(input_path: str, temp_files: list[str]) -> str:
+def normalize_volume(input_path: str, temp_files: list[str],
+                     prompt_duration: float = 0.0) -> str:
     """loudnorm → opus; fallback ogg; fallback the original file.
 
     Appends the temp file paths to *temp_files* (caller cleans them up).
+    With ``prompt_duration > 0`` the first that many seconds (the
+    greeting, captured because MixMonitor runs before Playback) are
+    trimmed off (S03.1).
     """
     base = input_path[:-4] if input_path.endswith(".wav") else input_path
     opus, ogg = base + ".opus", base + ".ogg"
     temp_files.extend((opus, ogg))
-    if _ffmpeg(input_path, "libopus", opus):
+    if _ffmpeg(input_path, "libopus", opus, seek_seconds=prompt_duration):
         return opus
-    if _ffmpeg(input_path, "libvorbis", ogg):
+    if _ffmpeg(input_path, "libvorbis", ogg, seek_seconds=prompt_duration):
         return ogg
     log(f"ERROR: ffmpeg normalization failed for {input_path}, sending raw")
     return input_path
@@ -182,8 +225,13 @@ def forward_recording(
     url: str,
     secret: str,
     early_hangup_max_seconds: int = DEFAULT_EARLY_HANGUP_MAX_SECONDS,
+    prompt_duration: float = 0.0,
 ) -> tuple[bool, str, str]:
     """Forward one voicemail recording to the userbot.
+
+    ``prompt_duration`` is the greeting length in seconds — the
+    recording includes it (S03.1: MixMonitor starts before Playback).
+    It is subtracted for classification and trimmed off the sent audio.
 
     Returns (ok, detail, voicemail_type). Does NOT delete the recording
     or the temp files — the caller decides (both current callers delete
@@ -205,12 +253,28 @@ def forward_recording(
             duration=0.0, vm_type="early_hangup",
         )
 
-    vm_type = classify(duration, early_hangup_max_seconds)
-    log(f"Voicemail from {caller}: type={vm_type} duration={duration}s")
+    vm_type = classify(duration, prompt_duration, early_hangup_max_seconds)
+    log(f"Voicemail from {caller}: type={vm_type} duration={duration}s "
+        f"(prompt={prompt_duration:.3f}s)")
+
+    # S03.1 (stated choice): an early hangup is, by definition, a
+    # greeting fragment plus under-threshold silence — there is no
+    # caller content in the audio. Send a text-only "call came in"
+    # notification instead of a 1-2 second Telegram note.
+    if vm_type == "early_hangup":
+        return _report_missing_or_empty(
+            recording_path, caller, correlation, url, secret,
+            duration=duration, vm_type="early_hangup",
+        )
 
     temp_files: list[str] = []
     try:
-        final_file = normalize_volume(recording_path, temp_files)
+        # S03.1: trim the greeting captured at the front of the WAV
+        # (stated choice: trim, not accept) so the voice note starts
+        # with the caller's words.
+        final_file = normalize_volume(
+            recording_path, temp_files, prompt_duration=prompt_duration,
+        )
         ok, detail = post_multipart(
             url, secret, "/events/voicemail",
             fields={

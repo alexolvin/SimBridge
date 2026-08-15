@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hmac
 import os
+import tempfile
 from logging import getLogger
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -162,11 +164,24 @@ def create_http_server(
         - duration: recording duration in seconds
 
         S03.1: Distinguishes early hangup from normal voicemail.
-        S03.3: Uses ContactResolver for caller display name.
+        S03.3: Uses ContactResolver for caller display name; the uploaded
+        audio is written to a temp file for the voice note and deleted
+        after the send attempt — on BOTH the success and the failure
+        path, so no recording lives on this node longer than the send.
+
+        Delivery (S03.3): the in_call audience (a voicemail is a voice
+        event, same audience as the ring notification). "normal" sends
+        the label text plus the audio as a Telegram voice note;
+        "early_hangup" and "recording_missing" are text-only.
         """
         received_secret = req.headers.get("x-simbridge-secret", "")
         if not hmac.compare_digest(received_secret, secret):
             raise HTTPException(status_code=401, detail="Invalid secret")
+
+        # IP allowlist (same as /events/sms and /events/delivery)
+        client_host = req.client.host if req.client else None
+        if allowed_peers and client_host not in allowed_peers:
+            raise HTTPException(status_code=403, detail="IP not allowed")
 
         # Parse multipart form-data
         form = await req.form()
@@ -204,27 +219,100 @@ def create_http_server(
             norm, vm_type, duration, correlation_id,
         )
 
-        # Audit log
-        event_type = EventType.VOICEMAIL_EARLY_HANGUP if vm_type == "early_hangup" else EventType.VOICEMAIL_RECEIVED
+        # Deliver to the in_call audience. Per-user isolation: one
+        # failing recipient must not break the rest (same pattern as
+        # /events/sms).
+        audience = sorted(acl.users_with_right("in_call"))
+        delivered: list[int] = []
+        failed: list[int] = []
+
+        temp_path: Optional[str] = None
+        try:
+            # Voice note only for a real recording: "normal" + an
+            # upload with content. early_hangup / recording_missing
+            # are text-only (S03.1: sub-threshold audio is a greeting
+            # fragment plus silence — no caller content).
+            has_audio = False
+            if vm_type == "normal" and client is not None and audio_file is not None:
+                content = await audio_file.read()
+                if content:
+                    fd, temp_path = tempfile.mkstemp(
+                        suffix=Path(audio_file.filename or "").suffix or ".opus",
+                    )
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(content)
+                    has_audio = True
+                    logger.info(
+                        "Voicemail audio from %s: %s (%d bytes)",
+                        norm, audio_file.filename, len(content),
+                    )
+                else:
+                    logger.warning("voicemail upload from %s is empty", norm)
+            if client is None:
+                logger.warning(
+                    "voicemail from %s accepted but no Telethon client "
+                    "is wired — not delivered", norm,
+                )
+            for uid in audience:
+                try:
+                    # Label text first, then the voice note: the text
+                    # carries the caller number + resolved name and
+                    # must land even if the media send fails.
+                    await client.send_message(uid, vm_label)
+                    if has_audio:
+                        await client.send_file(uid, temp_path, voice_note=True)
+                    delivered.append(uid)
+                except Exception as e:
+                    failed.append(uid)
+                    logger.warning(
+                        "failed to deliver voicemail to user %s: %s", uid, e,
+                    )
+        finally:
+            # S03.3: the uploaded recording does not outlive the send
+            # attempt — deleted on the success AND the failure path.
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+        if delivered and not failed:
+            outcome = "ok"
+        elif delivered:
+            outcome = "partial"
+        elif audience:
+            outcome = "failed"
+        else:
+            outcome = "no_audience"
+
+        # S03.1: the three notification shapes are distinguishable in
+        # the audit (early_hangup gets its own event type).
+        event_type = (
+            EventType.VOICEMAIL_EARLY_HANGUP
+            if vm_type == "early_hangup"
+            else EventType.VOICEMAIL_RECEIVED
+        )
         audit.log(
             event_type,
-            outcome="ok",
+            outcome=outcome,
             correlation_id=correlation_id,
             details={
                 "from": norm,
                 "name": name,
                 "voicemail_type": vm_type,
                 "duration": duration,
+                "audience": audience,
+                "delivered_to": delivered,
+                "has_audio": has_audio,
             },
         )
 
-        # TODO: Send to Telegram via Telethon client (wired via app state)
-        # The audio file is available as audio_file (UploadFile)
-        # Notification text: vm_label
-        if audio_file:
-            logger.info("Voicemail audio received: %s (%d bytes)", audio_file.filename, len(audio_file.file.read(0) if hasattr(audio_file.file, 'read') else 0))
-
-        return {"ok": True, "voicemail_type": vm_type, "label": vm_label}
+        return {
+            "ok": True,
+            "voicemail_type": vm_type,
+            "label": vm_label,
+            "delivered_to": delivered,
+        }
 
     @app.post("/events/delivery")
     async def handle_delivery_event(req: Request):

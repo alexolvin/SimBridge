@@ -53,6 +53,7 @@ asterisk:
   max_record_seconds: 90            # max voicemail length
   early_hangup_max_seconds: 3       # shorter recording = caller hung up during the greeting
   sweep_max_age_seconds: 300        # sweep timer: a *.wav older than this is an orphan
+  sweep_max_retain_seconds: 604800  # S03.3: delete un-forwarded *.wav older than this (7 days)
   prompt: /var/lib/asterisk/sounds/custom/vm-prompt.ulaw
   # AMI access — for the agent HTTP API (replaces SSH shell commands)
   ami_host: 127.0.0.1

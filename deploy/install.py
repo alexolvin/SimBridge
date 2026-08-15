@@ -809,6 +809,7 @@ asterisk:
   max_record_seconds: 90
   early_hangup_max_seconds: 3
   sweep_max_age_seconds: 300
+  sweep_max_retain_seconds: 604800
   prompt: {AST_PROMPT}
   ami_host: 127.0.0.1
   ami_port: 5038
@@ -997,7 +998,22 @@ def _install_asterisk_dialplan() -> None:
     else:
         ok("Dialplan unchanged.", AST_EXTENSIONS)
 
-    # 2. Globals — generated from the config _write_config() just wrote
+    # 2. Voicemail prompt — must exist BEFORE step 3: the generator
+    #    probes it to emit PROMPT_DURATION (S03.1 greeting trim).
+    #    Only overwritten when content differs.
+    snd_src = Path(s.src_dir) / "sounds" / "vm-prompt.ulaw"
+    snd_dst = Path(AST_PROMPT)
+    if snd_src.exists():
+        snd_dst.parent.mkdir(parents=True, exist_ok=True)
+        if not snd_dst.exists() or snd_dst.read_bytes() != snd_src.read_bytes():
+            shutil.copy(str(snd_src), str(snd_dst))
+            ok("Prompt:", str(snd_dst))
+        snd_dst.chmod(0o644)
+        _chown_asterisk(snd_dst)
+    else:
+        warn("Prompt missing in repo:", str(snd_src))
+
+    # 3. Globals — generated from the config _write_config() just wrote
     gen = (f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/"
            f"generate_asterisk_config.py {CONF_FILE} -o {AST_GLOBALS}")
     old_globals = (Path(AST_GLOBALS).read_text()
@@ -1012,19 +1028,6 @@ def _install_asterisk_dialplan() -> None:
     else:
         fail("Globals generation failed — needs the agent venv (PyYAML).")
         fail("Command:", gen)
-
-    # 3. Voicemail prompt — only overwritten when content differs
-    snd_src = Path(s.src_dir) / "sounds" / "vm-prompt.ulaw"
-    snd_dst = Path(AST_PROMPT)
-    if snd_src.exists():
-        snd_dst.parent.mkdir(parents=True, exist_ok=True)
-        if not snd_dst.exists() or snd_dst.read_bytes() != snd_src.read_bytes():
-            shutil.copy(str(snd_src), str(snd_dst))
-            ok("Prompt:", str(snd_dst))
-        snd_dst.chmod(0o644)
-        _chown_asterisk(snd_dst)
-    else:
-        warn("Prompt missing in repo:", str(snd_src))
 
     # 4. AGI hooks — exec bit + symlink into Asterisk's AGI bin dir
     agi_dir = _agi_bin_dir()

@@ -318,7 +318,9 @@ class TestTgVoiceAgi:
 
     @pytest.mark.skipif(not HAVE_FFMPEG,
                         reason="ffmpeg/ffprobe not available")
-    def test_forwards_real_wav_with_ffmpeg(self, http_server, tmp_path):
+    def test_early_hangup_is_text_only_json(self, http_server, tmp_path):
+        """S03.1: 1 s under the threshold is a greeting fragment +
+        silence — a text-only JSON event, never an audio upload."""
         wav = tmp_path / "vm-test.wav"
         _make_wav(wav, seconds=1.0)
         final, _ = run_agi(
@@ -328,15 +330,38 @@ class TestTgVoiceAgi:
             env_block={"UNIQUEID": "test-unique-2"},
             extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
         )
-        # 1 s < 3 s -> early_hangup, encoding + multipart forward
         assert final.startswith("200 forwarded type=early_hangup"), final
+        assert not wav.exists()  # consumed on success
+        (req,) = http_server.captured
+        assert req["headers"]["Content-Type"] == "application/json"
+        payload = json.loads(req["body"])
+        assert payload["voicemail_type"] == "early_hangup"
+        assert payload["phone_number"] == "+79000000000"
+        assert payload["correlation_id"] == "test-unique-2"
+
+    @pytest.mark.skipif(not HAVE_FFMPEG,
+                        reason="ffmpeg/ffprobe not available")
+    def test_normal_wav_trims_greeting_and_sends_audio(self, http_server, tmp_path):
+        """S03.1: 12 s total, an 8.444 s greeting -> 3.556 s of speech
+        >= 3 s -> a normal voice note with the greeting trimmed off."""
+        wav = tmp_path / "vm-test.wav"
+        _make_wav(wav, seconds=12.0)
+        final, _ = run_agi(
+            "tg-voice-agi.py", [],
+            variables={"VMFILE": str(wav), "CALLER": "+79000000000",
+                       "FWD_URL": http_server.url, "EH_MAX": "3",
+                       "VM_PROMPT_DURATION": "8.444"},
+            env_block={"UNIQUEID": "test-unique-4"},
+            extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
+        )
+        assert final.startswith("200 forwarded type=normal"), final
         assert not wav.exists()  # consumed on success
         (req,) = http_server.captured
         assert "multipart/form-data" in req["headers"]["Content-Type"]
         body = req["body"]
-        assert b"early_hangup" in body
+        assert b"normal" in body
         assert b"+79000000000" in body
-        assert b"test-unique-2" in body
+        assert b"test-unique-4" in body
         assert b"OggS" in body  # opus (Ogg container) in the file part
 
 

@@ -5,6 +5,15 @@ S03.2 — Configurable timings. The dialplan cannot read YAML directly.
 This script reads the YAML config and writes asterisk-globals.conf
 in Asterisk [globals] format. One generator, no second mechanism.
 
+S03.1 — PROMPT_DURATION: the greeting file (asterisk.prompt) is probed
+with the shared ffprobe helper (core.voicemail_forward.ffprobe_duration
+— Rule 1, one probe function for all three consumers: this generator,
+the sweeper, the forward). The dialplan publishes the result as a
+channel variable so the forward can classify speech time and trim the
+greeting from the recording. If the file is missing or ffprobe is
+unavailable the global is 0.000 (legacy behavior, no trim) and a
+warning is printed. Regenerate after swapping the prompt file.
+
 Usage:
     python3 scripts/generate-asterisk-config.py /etc/simbridge/simbridge.yaml
 
@@ -22,6 +31,12 @@ import sys
 from pathlib import Path
 
 import yaml
+
+# core/ sits next to scripts/ in the deployed tree and the repo. When
+# run as `python .../scripts/generate_asterisk_config.py` only scripts/
+# is on sys.path, so add the app root explicitly (stdlib-only import).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.voicemail_forward import ffprobe_duration  # noqa: E402
 
 OUTPUT_HEADER = """\
 ; SimBridge — auto-generated Asterisk globals
@@ -47,6 +62,14 @@ def generate(config: dict, output_path: str) -> None:
     # and doesn't want the .ulaw suffix
     prompt_path = prompt.rsplit(".", 1)[0] if "." in prompt.split("/")[-1] else prompt
 
+    # S03.1: probe the greeting length (the full path, extension-based
+    # format hint). 0.0 when the file is missing or ffprobe is absent
+    # — the dialplan then classifies/trims as before (legacy behavior).
+    prompt_duration = ffprobe_duration(prompt) if prompt else 0.0
+    if prompt and prompt_duration <= 0.0:
+        print(f"WARNING: cannot probe prompt {prompt} — "
+              f"PROMPT_DURATION=0.000 (no greeting trim)")
+
     # Bridge settings (S04.2)
     voice = config.get("voice", {})
     bridge_endpoint = voice.get("bridge_endpoint", "tg-bridge")
@@ -61,6 +84,9 @@ def generate(config: dict, output_path: str) -> None:
     content += f"MAX_RECORD_SECONDS={max_record}\n"
     content += f"EARLY_HANGUP_MAX_SECONDS={early_hangup}\n"
     content += f"VM_PROMPT={prompt_path}\n"
+    content += (f"; S03.1: greeting length in seconds (probed) — the AGI "
+                f"trims this many seconds from the front of the recording\n")
+    content += f"PROMPT_DURATION={prompt_duration:.3f}\n"
     content += f"VM_REC_DIR={config.get('paths', {}).get('recordings_dir', '/var/lib/simbridge/recordings')}\n"
     content += f"; Bridge (S04.2): Telegram voice bridge settings\n"
     content += f"BRIDGE_ENDPOINT={bridge_endpoint}\n"
@@ -94,6 +120,7 @@ def generate(config: dict, output_path: str) -> None:
     print(f"  MAX_RECORD_SECONDS = {max_record}")
     print(f"  EARLY_HANGUP_MAX_SECONDS = {early_hangup}")
     print(f"  VM_PROMPT = {prompt_path}")
+    print(f"  PROMPT_DURATION = {prompt_duration:.3f}")
     print(f"  BRIDGE_ENDPOINT = {bridge_endpoint}")
     print(f"  OUTBOUND_RING_TIMEOUT = {outbound_timeout}")
     print(f"  USERBOT_URL = http://{userbot_listen}")

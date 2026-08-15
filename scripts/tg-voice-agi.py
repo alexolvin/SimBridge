@@ -21,13 +21,18 @@ The forward logic lives in core/voicemail_forward.py (Rule 1 — one
 implementation, shared with the sweep-recordings.py timer).
 
 Behavior (see core/voicemail_forward.forward_recording):
-  1. no recording file      -> JSON event voicemail_type=recording_missing
-  2. zero audio (0 s)       -> JSON event voicemail_type=early_hangup
-  3. duration < EH_MAX      -> voicemail_type=early_hangup (S03.1)
-  4. else                   -> voicemail_type=normal
+  1. no recording file       -> JSON event voicemail_type=recording_missing
+  2. zero audio (0 s)        -> JSON event voicemail_type=early_hangup
+  3. speech < EH_MAX         -> JSON (text only) voicemail_type=early_hangup
+  4. else                    -> voicemail_type=normal (multipart, greeting
+  trimmed off per VM_PROMPT_DURATION — S03.1)
   5. on success: the recording is deleted (consumed — the h-exten STAT
      check and the sweep timer must not resend it); on failure: kept
      so the sweep timer (or a retry) picks it up.
+
+"speech" = recording duration minus the greeting (S03.1: MixMonitor
+starts before Playback, so the greeting is captured at the front of the
+WAV).
 
 Usage in dialplan::
 
@@ -38,8 +43,9 @@ Usage in dialplan::
      same => n,AGI(tg-voice-agi.py)
      same => n(end),Hangup()
 
-The s-exten sets FWD_URL, MODEM_ID, EH_MAX and CALLER (channel
-variables persist into the h-exten on the same channel).
+The s-exten sets FWD_URL, MODEM_ID, EH_MAX, VM_PROMPT_DURATION and
+CALLER (channel variables persist into the h-exten on the same
+channel).
 
 Stdlib only — runs under Asterisk's system python3 (the shared module
 core.voicemail_forward is stdlib-only as well). A failure must never
@@ -125,6 +131,12 @@ def main() -> None:
         eh_max = int(agi_get_variable("EH_MAX") or DEFAULT_EARLY_HANGUP_MAX_SECONDS)
     except ValueError:
         eh_max = DEFAULT_EARLY_HANGUP_MAX_SECONDS
+    # S03.1: greeting length (the generated PROMPT_DURATION global).
+    # Missing/invalid -> 0.0 = legacy classification, no trim.
+    try:
+        prompt_duration = float(agi_get_variable("VM_PROMPT_DURATION") or 0)
+    except ValueError:
+        prompt_duration = 0.0
     correlation = env.get("UNIQUEID", "")
     secret = os.environ.get(SECRET_ENV, "")
 
@@ -148,6 +160,7 @@ def main() -> None:
             url=url,
             secret=secret,
             early_hangup_max_seconds=eh_max,
+            prompt_duration=prompt_duration,
         )
     except Exception:  # noqa: BLE001 — never wedge the dialplan
         _log("ERROR: voicemail forward crashed:\n" + traceback.format_exc())

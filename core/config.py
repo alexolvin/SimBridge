@@ -161,6 +161,9 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("asterisk.early_hangup_max_seconds", int, required=False),
     # Sweep timer: a *.wav older than this is an orphan, safe to forward.
     _SchemaEntry("asterisk.sweep_max_age_seconds", int, required=False),
+    # S03.3 bounded retention: a *.wav older than this is deleted
+    # without forwarding — a failed send must not live on disk forever.
+    _SchemaEntry("asterisk.sweep_max_retain_seconds", int, required=False),
     _SchemaEntry("asterisk.prompt", str),
     _SchemaEntry("asterisk.ami_host", str, required=False),
     _SchemaEntry("asterisk.ami_port", int, required=False),

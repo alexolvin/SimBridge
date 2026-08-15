@@ -127,65 +127,99 @@ Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node)
 
 ### Current (Pre-Stage-04)
 
-Incoming calls go directly to voicemail — there is no Telegram ring yet:
+Incoming calls go directly to voicemail — there is no Telegram ring yet.
+The voicemail path is a **named, same-context branch** `voicemail` inside
+`[incoming-mobile]`, entered with `Goto(voicemail,1)`:
 
 ```
 chan_dongle (incoming-mobile/s)
     │
-    ├── Dial(Local/voicemail-fallback@voicemail-ctx, ${RING_WAIT_SECONDS})
+    ├── AGI(tg-blacklist-agi.py)          → BL_BLOCKED → Busy(5) (fail-open)
+    ├── Set(FWD_URL / MODEM_ID / EH_MAX / VM_PROMPT_DURATION)
+    ├── AGI(tg-sms-agi.py, ring)          → userbot /events/sms ("📞 Входящий звонок")
+    ├── Wait(${RING_WAIT_SECONDS})        ← ringback on the line
     │
-    └── voicemail-ctx/voicemail-fallback
+    └── Goto(voicemail, 1)                ← S03.4 named fallback branch
             │
-            ├── Gosub(voicemail-record, s, 1)
-            │   ├── Answer()
-            │   ├── MixMonitor()        ← starts BEFORE prompt (S03.1)
-            │   ├── Playback(vm-prompt)
-            │   ├── WaitExten()
-            │   └── Hangup()
-            │
-            └── hangup-handler
-                ├── MixMonitor callback (recording complete)
-                └── tg-voice-forward.sh → /events/voicemail (HTTP)
+            ├── Answer()
+            ├── Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)
+            ├── MixMonitor(${VMFILE})     ← starts BEFORE the prompt (S03.1)
+            ├── Playback(${VM_PROMPT})
+            ├── Wait(${MAX_RECORD_SECONDS})
+            ├── StopMixMonitor()
+            └── Hangup()
+                    │
+                    └── h-exten (same context)
+                        ├── StopMixMonitor()   (synchronous WAV finalization)
+                        └── AGI(tg-voice-agi.py) → core.voicemail_forward
+                            → userbot /events/voicemail
 ```
+
+Why a same-context named exten and not a separate context: the h-exten
+resolves in the channel's *current* context, so a voicemail path in a
+different context would need its own h-exten — a second forwarding
+mechanism (Rule 1). `Goto(voicemail,1)` keeps everything in
+`[incoming-mobile]`; the Stage 04 state machine will call the same target.
 
 ### Post-Stage-04 (Planned)
 
-Stage 04 introduces a state machine that rings the user in Telegram first:
+Stage 04 inserts a Telegram ring between the line ringback and the voicemail
+fallback — the voicemail branch itself is unchanged:
 
 ```
 chan_dongle (incoming-mobile/s)
     │
-    ├── Dial(SIP/tg-bridge@tg-ringing, ${OUTBOUND_RING_TIMEOUT})
-    │   │
-    │   └── If unanswered → voicemail-ctx/voicemail-fallback (same sub)
+    ├── AGI(tg-blacklist-agi.py)
+    ├── AGI(tg-sms-agi.py, ring)          → Telegram ring (in_call audience)
+    ├── Wait(${RING_WAIT_SECONDS})        ← the Telegram ring window
     │
-    └── If answered → live voice bridge (Stage 04)
+    ├── User accepted in Telegram → live voice bridge (Stage 04)
+    ├── User rejected / no answer → Goto(voicemail, 1)   ← same branch
+    └── No Telegram user at all    → Goto(voicemail, 1)
 ```
 
-The voicemail recording sub (`voicemail-record`) is a reusable, stateless branch
-that can be invoked from any context. It requires:
+The state machine (`core/call_control.py`) decides; `voicemail,1` is the
+single, unchanged fallback target.
 
-- `CALL_FROM` — caller phone number (set by caller context)
-- Channel variables from generated globals (`RING_WAIT_SECONDS`, `MAX_RECORD_SECONDS`, `VM_PROMPT`)
+### Voicemail Types (S03.1)
 
-### Early Hangup Detection (S03.1)
+The AGI path (`tg-voice-agi.py` → `core/voicemail_forward.py`) classifies by
+**speech time** — the recording includes the greeting (MixMonitor starts
+before Playback), so speech = duration − PROMPT_DURATION (probed by the
+config generator, published as the `PROMPT_DURATION` global):
 
-The `tg-voice-forward.sh` script determines the voicemail type by recording
-duration:
-
-| Duration | Type | Telegram Notification |
+| Condition | Type | Telegram Notification |
 |---|---|---|
-| < 3s | `early_hangup` | "📞 Звонок — (Name)" (no audio) |
-| ≥ 3s, valid audio | `normal` | "🎙 Голосовое — (Name)" (with audio) |
-| No file found | `recording_missing` | "⚠️ Нет записи — (Name)" |
+| no recording file | `recording_missing` | text-only: "⚠️ Нет записи — (name)" |
+| zero audio (0 s) | `early_hangup` | text-only: "📞 Звонок — (name)" |
+| speech < `EARLY_HANGUP_MAX_SECONDS` (default 3 s) | `early_hangup` | **text-only** "📞 Звонок — (name)" — the audio is a greeting fragment plus <3 s of silence, no caller content (stated choice) |
+| speech ≥ `EARLY_HANGUP_MAX_SECONDS` | `normal` | "🎙 Голосовое — (name)" + voice note, greeting **trimmed off** (stated choice: trim, not accept) |
 
-### Voicemail Recording — Prompt Handling
+Delivery goes to the `in_call` audience (a voicemail is a voice event, the
+same audience as the ring notification); the label text carries the caller
+number + resolved contact name and is sent before the voice note.
 
-MixMonitor starts before the prompt playback (S03.1 fix). The resulting
-recording contains the prompt at the beginning. This is intentional: it makes
-it audible when the call was answered and gives context to the message. The
-prompt duration is used by the forwarding script to distinguish early hangups
-from actual messages.
+### Prompt-in-Recording (S03.1)
+
+MixMonitor starts before Playback, so the greeting is at the front of the
+WAV. Chosen handling: **trim** — the forward input-seeks
+`PROMPT_DURATION` seconds in the same single ffmpeg pass that applies
+loudnorm, so the voice note starts with the caller's words. Rationale: the
+user hears only the message; ffmpeg is already a hard dependency (loudnorm);
+deterministic given a probed prompt length. If the prompt file is missing or
+ffprobe is unavailable, `PROMPT_DURATION` is 0.000 and the behavior degrades
+to the legacy one (no trim, full-duration classification) — the generator
+logs a warning.
+
+### Cleanup (S03.3)
+
+- **GSM node**: a successfully forwarded recording is deleted by the AGI /
+  sweeper; a failed forward keeps it for retry, up to
+  `asterisk.sweep_max_retain_seconds` (default 7 days), after which the
+  sweeper deletes it — a failed send does not live on disk forever.
+- **Telegram node**: the uploaded audio is written to a temp file for the
+  voice note and deleted in a `finally` — on the success **and** the failure
+  path.
 
 ---
 

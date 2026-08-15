@@ -252,6 +252,38 @@ class TestConfigGenerator:
         finally:
             os.unlink(output_path)
 
+    def test_prompt_duration_probed_from_prompt_file(self, tmp_path):
+        """S03.1: the generator probes the greeting and publishes
+        PROMPT_DURATION; a missing prompt degrades to 0.000 (no trim)."""
+        import shutil
+        from scripts.generate_asterisk_config import generate
+
+        if not shutil.which("ffprobe"):
+            pytest.skip("ffprobe not available")
+
+        # the shipped greeting: 67556 bytes of 8 kHz mu-law = 8.4445 s
+        prompt = Path(__file__).parent.parent / "sounds" / "vm-prompt.ulaw"
+        assert prompt.is_file()
+
+        config = {
+            "asterisk": {
+                "ring_wait_seconds": 30,
+                "max_record_seconds": 120,
+                "prompt": str(prompt),
+            },
+            "paths": {},
+        }
+        out = tmp_path / "globals.conf"
+        generate(config, str(out))
+        assert "PROMPT_DURATION=8.444" in out.read_text()
+
+        # missing prompt -> 0.000 (legacy behavior: full-duration
+        # classification, no trim) — the generator warns, not fails
+        config["asterisk"]["prompt"] = str(tmp_path / "missing.ulaw")
+        out2 = tmp_path / "globals2.conf"
+        generate(config, str(out2))
+        assert "PROMPT_DURATION=0.000" in out2.read_text()
+
 
 # =========================================================================
 # TS03-6 — Voicemail with contact name
@@ -342,14 +374,16 @@ class TestVoicemailFallback:
         self.section = m.group(1)
 
     def test_ring_timeout_goes_to_voicemail(self):
-        """s-exten order: ring wait → answer → prompt → record → stop."""
+        """s-exten: ring wait → Goto into the named voicemail branch;
+        voicemail branch: answer → record → prompt → stop."""
         order = [
             "AGI(tg-sms-agi.py,ring)",
             "Wait(${RING_WAIT_SECONDS})",
+            "Goto(voicemail,1)",
             "Answer()",
-            "Playback(${VM_PROMPT})",
             "Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)",
             "MixMonitor(${VMFILE})",
+            "Playback(${VM_PROMPT})",
             "Wait(${MAX_RECORD_SECONDS})",
             "StopMixMonitor()",
         ]
@@ -359,6 +393,21 @@ class TestVoicemailFallback:
             assert i != -1, f"{step} not found in incoming-mobile"
             assert i > pos, f"{step} appears out of order in incoming-mobile"
             pos = i
+
+    def test_voicemail_is_a_named_same_context_exten(self):
+        """S03.4: the Stage 04 state machine calls this target, so it
+        must be a named exten IN the channel's current context (the
+        h-exten resolves there)."""
+        assert "exten => voicemail,1," in self.section
+        # one and only one entry point (dialplan lines, not comments)
+        lines = [l for l in self.section.splitlines()
+                 if not l.strip().startswith(";")]
+        assert sum("Goto(voicemail,1)" in l for l in lines) == 1
+
+    def test_prompt_duration_is_published_as_channel_var(self):
+        """S03.1: the AGI reads VM_PROMPT_DURATION, set from the
+        generated PROMPT_DURATION global in the s-exten."""
+        assert "Set(VM_PROMPT_DURATION=${PROMPT_DURATION})" in self.section
 
     def test_blacklisted_caller_gets_busy(self):
         """Blacklisted numbers get Busy(5), not the voicemail path."""

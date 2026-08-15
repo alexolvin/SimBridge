@@ -18,16 +18,22 @@ from userbot.http_server import create_http_server
 
 
 class FakeClient:
-    """Duck-typed Telethon client: records send_message calls."""
+    """Duck-typed Telethon client: records send_message/send_file calls."""
 
     def __init__(self, fail_for=frozenset()):
-        self.sent = []  # list of (uid, text)
+        self.sent = []    # list of (uid, text)
+        self.files = []   # list of (uid, path, voice_note)
         self._fail_for = set(fail_for)
 
     async def send_message(self, uid, text):
         if uid in self._fail_for:
             raise RuntimeError(f"fake failure for {uid}")
         self.sent.append((uid, text))
+
+    async def send_file(self, uid, path, voice_note=False):
+        if uid in self._fail_for:
+            raise RuntimeError(f"fake failure for {uid}")
+        self.files.append((uid, path, voice_note))
 
 
 class FakeAudit:
@@ -232,3 +238,108 @@ class TestEventsDelivery:
         )
         assert r.status_code == 200
         assert r.json()["notified"] is False
+
+
+# ---------------------------------------------------------------------------
+# /events/voicemail — S03.1/S03.3 delivery + cleanup
+# ---------------------------------------------------------------------------
+
+class TestEventsVoicemail:
+    def _post(self, client, vm_type="normal", with_file=True,
+              phone="+79261234555"):
+        kwargs = {
+            "data": {
+                "phone_number": phone,
+                "voicemail_type": vm_type,
+                "correlation_id": "corr-vm-1",
+                "duration": "12",
+            },
+            "headers": {"X-SimBridge-Secret": SECRET},
+        }
+        if with_file:
+            kwargs["files"] = {"file": ("vm.opus", b"OggS-fake", "audio/ogg")}
+        return client.post("/events/voicemail", **kwargs)
+
+    def test_wrong_secret_401(self, tmp_path):
+        client, _ = _make_env(tmp_path)
+        r = client.post(
+            "/events/voicemail",
+            data={"phone_number": "+79261234555", "voicemail_type": "normal"},
+            headers={"X-SimBridge-Secret": "bad"},
+        )
+        assert r.status_code == 401
+
+    def test_normal_sends_label_and_voice_note(self, tmp_path):
+        """S03.3: the in_call audience gets the label text plus the
+        voice note; the uploaded audio does not survive the send."""
+        tg = FakeClient()
+        client, audit = _make_env(
+            tmp_path, client=tg,
+            acl_lines="111 in_sms\n222 in_call\n333 out_sms\n",
+        )
+        r = self._post(client, vm_type="normal")
+        assert r.status_code == 200
+        assert r.json()["delivered_to"] == [222]
+        # only the in_call user — not in_sms / out_sms
+        assert tg.sent == [(222, "🎙 Голосовое — +79261234555")]
+        assert len(tg.files) == 1
+        uid, path, voice_note = tg.files[0]
+        assert uid == 222
+        assert voice_note is True
+        import os
+        assert not os.path.isfile(path)  # S03.3: deleted after the send
+        etype, kw = audit.calls[0]
+        assert etype == EventType.VOICEMAIL_RECEIVED
+        assert kw["outcome"] == "ok"
+        assert kw["details"]["has_audio"] is True
+        assert kw["details"]["delivered_to"] == [222]
+        assert kw["correlation_id"] == "corr-vm-1"
+
+    def test_early_hangup_is_text_only(self, tmp_path):
+        """S03.1: even if audio arrived, early_hangup sends text only."""
+        tg = FakeClient()
+        client, audit = _make_env(tmp_path, client=tg)
+        r = self._post(client, vm_type="early_hangup")
+        assert r.status_code == 200
+        assert tg.sent == [(222, "📞 Звонок — +79261234555")]
+        assert tg.files == []  # no voice note for a greeting fragment
+        etype, kw = audit.calls[0]
+        assert etype == EventType.VOICEMAIL_EARLY_HANGUP
+        assert kw["details"]["has_audio"] is False
+
+    def test_recording_missing_is_text_only(self, tmp_path):
+        tg = FakeClient()
+        client, audit = _make_env(tmp_path, client=tg)
+        r = self._post(client, vm_type="recording_missing", with_file=False)
+        assert r.status_code == 200
+        assert tg.sent == [(222, "⚠️ Нет записи — +79261234555")]
+        assert tg.files == []
+
+    def test_normal_without_file_is_text_only(self, tmp_path):
+        tg = FakeClient()
+        client, audit = _make_env(tmp_path, client=tg)
+        r = self._post(client, vm_type="normal", with_file=False)
+        assert r.status_code == 200
+        assert tg.sent == [(222, "🎙 Голосовое — +79261234555")]
+        assert tg.files == []
+        assert audit.calls[0][1]["details"]["has_audio"] is False
+
+    def test_no_client_wired_not_delivered(self, tmp_path):
+        client, audit = _make_env(tmp_path, client=None)
+        r = self._post(client, vm_type="normal")
+        assert r.status_code == 200  # accepted + audited
+        assert r.json()["delivered_to"] == []
+        assert audit.calls[0][1]["outcome"] == "failed"
+
+    def test_per_user_isolation_partial_failure(self, tmp_path):
+        """One failing recipient must not break the rest (S03.3)."""
+        tg = FakeClient(fail_for={222})
+        client, audit = _make_env(
+            tmp_path, client=tg,
+            acl_lines="222 in_call\n333 in_call\n",
+        )
+        r = self._post(client, vm_type="normal")
+        assert r.status_code == 200
+        assert r.json()["delivered_to"] == [333]
+        assert [uid for uid, _, _ in tg.files] == [333]
+        assert audit.calls[0][1]["outcome"] == "partial"

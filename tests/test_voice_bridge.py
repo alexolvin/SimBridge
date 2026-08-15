@@ -54,5 +54,8 @@ class TestBridgeSelection:
         assert "dtmf_mode=rfc2833" in self.doc
 
     def test_voicemail_fallback_documented(self):
-        """Voicemail as fallback branch documented."""
-        assert "voicemail-fallback" in self.doc
+        """S03.4: voicemail is a named, same-context fallback branch that
+        the Stage 04 state machine calls (not a separate voicemail-ctx)."""
+        assert "named, same-context branch" in self.doc
+        assert "Goto(voicemail, 1)" in self.doc
+        assert "unchanged fallback target" in self.doc
