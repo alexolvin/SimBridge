@@ -249,6 +249,21 @@ class TestBlacklistManager:
         bl.reload()
         assert bl.contains("+79269999999") is True
 
+    def test_hot_reload_on_contains(self, tmp_path: Path):
+        """S01.4: contains() detects manual edits without an explicit reload()."""
+        bl_path = tmp_path / "blacklist.txt"
+        bl_path.write_text("# empty\n")
+        bl = BlacklistManager(str(bl_path))
+        assert bl.contains("+79269999999") is False
+
+        # Manual edit — no bl.reload() call; contains() must notice.
+        import os, time
+        time.sleep(0.01)
+        bl_path.write_text("+79269999999\n")
+        os.utime(str(bl_path))
+
+        assert bl.contains("+79269999999") is True
+
     def test_nonexistent_file(self, tmp_path: Path):
         """Creating with a nonexistent file should work (empty blacklist)."""
         bl_path = tmp_path / "nonexistent.txt"

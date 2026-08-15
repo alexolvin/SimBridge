@@ -19,6 +19,7 @@ import asyncio
 import os
 import re
 import sys
+import uuid
 from logging import getLogger
 from typing import Optional
 
@@ -140,7 +141,11 @@ class Userbot:
                 await evt.reply(SMSErrorType.BLACKLISTED.value)
                 return
 
-            # Call agent API (HTTP) with correlation (S02.3)
+            # Call agent API (HTTP) with correlation (S02.3).
+            # The x-correlation-id header activates the agent's replay
+            # protection (S01.3); the same id is sent in the JSON body for
+            # audit tracing.
+            cid = uuid.uuid4().hex
             import httpx
 
             try:
@@ -152,10 +157,12 @@ class Userbot:
                             "text": text,
                             "telegram_user_id": sender_id,
                             "telegram_message_id": evt.message.id,
+                            "correlation_id": cid,
                         },
                         headers={
                             "Authorization": f"Bearer {self._agent_token}",
                             "Content-Type": "application/json",
+                            "x-correlation-id": cid,
                         },
                         timeout=30.0,
                     )
@@ -241,7 +248,9 @@ class Userbot:
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
                 return
 
-            # Call agent API to persist the block
+            # Call agent API to persist the block. The x-correlation-id
+            # header activates the agent's replay protection (S01.3).
+            cid = uuid.uuid4().hex
             import httpx
             try:
                 async with httpx.AsyncClient() as http:
@@ -251,6 +260,7 @@ class Userbot:
                         headers={
                             "Authorization": f"Bearer {self._agent_token}",
                             "Content-Type": "application/json",
+                            "x-correlation-id": cid,
                         },
                         timeout=10.0,
                     )
@@ -287,6 +297,9 @@ class Userbot:
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
                 return
 
+            # The x-correlation-id header activates the agent's replay
+            # protection (S01.3).
+            cid = uuid.uuid4().hex
             import httpx
             try:
                 async with httpx.AsyncClient() as http:
@@ -296,6 +309,7 @@ class Userbot:
                         headers={
                             "Authorization": f"Bearer {self._agent_token}",
                             "Content-Type": "application/json",
+                            "x-correlation-id": cid,
                         },
                         timeout=10.0,
                     )

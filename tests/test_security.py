@@ -157,6 +157,7 @@ asterisk:
   ring_wait_seconds: 24
   max_record_seconds: 90
   prompt: /tmp/p
+  ami_password_env: SIMBRIDGE_AMI_PASSWORD
 voice:
   bridge_endpoint: tg-bridge
   bridge_host: 127.0.0.1
@@ -176,6 +177,7 @@ paths:
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
         os.environ["SIMBRIDGE_AGENT_TOKEN"] = "test-token"
         os.environ["SIMBRIDGE_HTTP_SECRET"] = "test-secret"
+        os.environ["SIMBRIDGE_AMI_PASSWORD"] = "test-ami-pw"
         try:
             with pytest.raises(ConfigError, match="0\\.0\\.0\\.0"):
                 load_config(str(cfg_path))
@@ -184,6 +186,7 @@ paths:
             os.environ.pop("SIMBRIDGE_TG_API_HASH", None)
             os.environ.pop("SIMBRIDGE_AGENT_TOKEN", None)
             os.environ.pop("SIMBRIDGE_HTTP_SECRET", None)
+            os.environ.pop("SIMBRIDGE_AMI_PASSWORD", None)
 
     def test_rejects_0_0_0_0_userbot_listen(self, tmp_path: Path):
         """userbot_http.listen with 0.0.0.0 should raise ConfigError."""
@@ -267,6 +270,7 @@ asterisk:
   ring_wait_seconds: 24
   max_record_seconds: 90
   prompt: /tmp/p
+  ami_password_env: SIMBRIDGE_AMI_PASSWORD
 voice:
   bridge_endpoint: tg-bridge
   bridge_host: 127.0.0.1
@@ -286,6 +290,7 @@ paths:
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
         os.environ["SIMBRIDGE_AGENT_TOKEN"] = "test-token"
         os.environ["SIMBRIDGE_HTTP_SECRET"] = "test-secret"
+        os.environ["SIMBRIDGE_AMI_PASSWORD"] = "test-ami-pw"
         try:
             cfg = load_config(str(cfg_path))
             assert cfg["agent.listen"] == "127.0.0.1:8090"
@@ -294,6 +299,7 @@ paths:
             os.environ.pop("SIMBRIDGE_TG_API_HASH", None)
             os.environ.pop("SIMBRIDGE_AGENT_TOKEN", None)
             os.environ.pop("SIMBRIDGE_HTTP_SECRET", None)
+            os.environ.pop("SIMBRIDGE_AMI_PASSWORD", None)
 
     def test_allows_tailscale_ip(self, tmp_path: Path):
         """Tailscale IP (100.x.x.x) should be accepted."""
@@ -322,6 +328,7 @@ asterisk:
   ring_wait_seconds: 24
   max_record_seconds: 90
   prompt: /tmp/p
+  ami_password_env: SIMBRIDGE_AMI_PASSWORD
 voice:
   bridge_endpoint: tg-bridge
   bridge_host: 100.64.1.10
@@ -341,6 +348,7 @@ paths:
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
         os.environ["SIMBRIDGE_AGENT_TOKEN"] = "test-token"
         os.environ["SIMBRIDGE_HTTP_SECRET"] = "test-secret"
+        os.environ["SIMBRIDGE_AMI_PASSWORD"] = "test-ami-pw"
         try:
             cfg = load_config(str(cfg_path))
             assert cfg["agent.listen"] == "100.64.1.5:8090"
@@ -349,6 +357,7 @@ paths:
             os.environ.pop("SIMBRIDGE_TG_API_HASH", None)
             os.environ.pop("SIMBRIDGE_AGENT_TOKEN", None)
             os.environ.pop("SIMBRIDGE_HTTP_SECRET", None)
+            os.environ.pop("SIMBRIDGE_AMI_PASSWORD", None)
 
 
 # =========================================================================
@@ -416,3 +425,28 @@ class TestNoWildcardBinds:
             assert "0.0.0.0" in content and "never" in content.lower(), (
                 "Example config should warn against 0.0.0.0"
             )
+
+
+# =========================================================================
+# S01.3 — Replay protection wired on userbot->agent traffic (source check)
+# =========================================================================
+
+class TestUserbotCorrelationHeader:
+    """The userbot must send x-correlation-id on agent requests; otherwise
+    the agent's replay window (S01.3) is never triggered on this traffic."""
+
+    def _userbot_source(self) -> str:
+        # Read by path: telethon is a node-side dependency and is not
+        # installed in the unit-test environment, so the module cannot
+        # be imported here.
+        return Path("userbot/userbot.py").read_text()
+
+    def test_userbot_sends_correlation_header(self):
+        source = self._userbot_source()
+        assert "x-correlation-id" in source
+
+    def test_sms_body_carries_same_correlation_id(self):
+        """The same id in the JSON body lets the audit trail match the header."""
+        source = self._userbot_source()
+        assert '"correlation_id": cid' in source
+        assert "uuid.uuid4().hex" in source

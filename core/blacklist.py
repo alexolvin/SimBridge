@@ -25,13 +25,43 @@ logger = logging.getLogger("simbridge.blacklist")
 
 
 class BlacklistManager:
-    """Thread-safe blacklist with atomic file writes."""
+    """Thread-safe blacklist with atomic file writes.
+
+    Hot-reload: ``contains``/``block``/``unblock`` detect file changes
+    automatically (mtime-based), so hand edits to the blacklist file take
+    effect without a restart.
+    """
 
     def __init__(self, path: str) -> None:
         self._path = path
         self._lock = threading.Lock()
         self._numbers: Set[str] = set()
+        self._mtime: float = 0.0
         self._load()
+        self._mtime = self._stat_mtime()
+
+    def _stat_mtime(self) -> float:
+        """Return the file's mtime, or 0.0 if it does not exist."""
+        try:
+            return os.stat(self._path).st_mtime
+        except OSError:
+            return 0.0
+
+    def _maybe_reload(self) -> None:
+        """Reload from disk if the file changed since the last check.
+
+        No-op when the mtime is unchanged. Must be called WITHOUT holding
+        ``self._lock`` (it acquires the lock itself).
+        """
+        mtime = self._stat_mtime()
+        if mtime == self._mtime:
+            return
+        with self._lock:
+            if mtime == self._mtime:
+                return  # another thread already reloaded
+            self._numbers.clear()
+            self._load()
+            self._mtime = self._stat_mtime()
 
     def _load(self) -> None:
         """Load all numbers from the blacklist file."""
@@ -50,6 +80,7 @@ class BlacklistManager:
     def contains(self, number: str) -> bool:
         """Check if *number* is blacklisted."""
         norm = normalize_e164(number)
+        self._maybe_reload()
         with self._lock:
             return norm in self._numbers if norm else False
 
@@ -64,6 +95,7 @@ class BlacklistManager:
             logger.warning("Cannot block malformed number: %s", number)
             return False
 
+        self._maybe_reload()
         with self._lock:
             if norm in self._numbers:
                 return False
@@ -81,6 +113,7 @@ class BlacklistManager:
         if not norm:
             return False
 
+        self._maybe_reload()
         with self._lock:
             if norm not in self._numbers:
                 return False
@@ -108,6 +141,9 @@ class BlacklistManager:
                 for num in sorted(self._numbers):
                     fh.write(f"{num}\n")
             os.replace(tmp_path, self._path)
+            # Refresh the tracked mtime so _maybe_reload does not
+            # re-read the file we just wrote.
+            self._mtime = self._stat_mtime()
         except OSError:
             # Cleanup temp file on error
             try:
@@ -121,8 +157,10 @@ class BlacklistManager:
         with self._lock:
             self._numbers.clear()
             self._load()
+            self._mtime = self._stat_mtime()
 
     @property
     def count(self) -> int:
+        self._maybe_reload()
         with self._lock:
             return len(self._numbers)

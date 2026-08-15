@@ -3,7 +3,9 @@
 Reads ``acl.conf`` — format: ``<telegram_user_id> <right1> <right2> ...``
 One entry per line. Unknown IDs are denied by default.
 
-Supports hot-reload: call ``reload()`` to re-read the file without restarting.
+Supports hot-reload: ``check()`` and ``get_user_rights()`` detect file
+changes automatically (mtime-based), so editing acl.conf takes effect
+without a restart.
 """
 
 from __future__ import annotations
@@ -61,11 +63,13 @@ class ACLManager:
         """Check whether *uid* has *right*. Default: deny."""
         if right not in _RIGHTS:
             return False
+        self.reload()  # hot-reload: no-op unless the file changed (mtime)
         with self._lock:
             return right in self._rules.get(uid, set())
 
     def get_user_rights(self, uid: int) -> set[str]:
         """Return all rights for *uid* (empty set if unknown)."""
+        self.reload()  # hot-reload: no-op unless the file changed (mtime)
         with self._lock:
             return self._rules.get(uid, set()).copy()
 

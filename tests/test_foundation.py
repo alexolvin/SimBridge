@@ -102,6 +102,61 @@ class TestPreCommitHook:
 # TS01-4 — Config validation: three failure cases
 # =========================================================================
 
+# Structurally complete config template with all secret env-var names
+# present. The role-conditional secret tests vary only node.role and which
+# env vars are actually set.
+_ROLE_ENV_CONFIG = """\
+node:
+  role: {role}
+  id: test
+telegram:
+  master_username: test
+  session_path: /tmp/t
+  acl_file: /tmp/a
+  api_id_env: SIMBRIDGE_TG_API_ID
+  api_hash_env: SIMBRIDGE_TG_API_HASH
+agent:
+  listen: "127.0.0.1:8090"
+  token_env: SIMBRIDGE_AGENT_TOKEN
+  allowed_peers: []
+userbot_http:
+  listen: "127.0.0.1:8088"
+  secret_env: SIMBRIDGE_HTTP_SECRET
+  allowed_peers: []
+asterisk:
+  ari_url: http://127.0.0.1:8088/ari
+  dongle: gsm
+  ring_wait_seconds: 24
+  max_record_seconds: 90
+  prompt: /tmp/p
+  ami_password_env: SIMBRIDGE_AMI_PASSWORD
+voice:
+  bridge_endpoint: tg-bridge
+  bridge_host: 127.0.0.1
+  bridge_port: 5062
+  srtp: false
+  outbound_answer_timeout: 30
+limits:
+  sms_per_hour: 30
+  calls_per_minute: 3
+  max_call_seconds: 3600
+paths:
+  blacklist: /tmp/b
+  contacts_cache: /tmp/c
+  audit_log: /tmp/a
+"""
+
+# Every secret env var a config may reference. New tests clear all of these
+# first because earlier tests in the suite leak them into os.environ.
+_ALL_SECRET_ENVS = (
+    "SIMBRIDGE_TG_API_ID",
+    "SIMBRIDGE_TG_API_HASH",
+    "SIMBRIDGE_AGENT_TOKEN",
+    "SIMBRIDGE_HTTP_SECRET",
+    "SIMBRIDGE_AMI_PASSWORD",
+)
+
+
 class TestConfigValidation:
     """TS01-4: unknown key, missing key, missing secret — three failures."""
 
@@ -172,6 +227,7 @@ asterisk:
   ring_wait_seconds: 24
   max_record_seconds: 90
   prompt: /tmp/p
+  ami_password_env: SIMBRIDGE_AMI_PASSWORD
 voice:
   bridge_endpoint: tg-bridge
   bridge_host: 127.0.0.1
@@ -193,9 +249,55 @@ paths:
         os.environ["SIMBRIDGE_TG_API_ID"] = "12345"
         os.environ["SIMBRIDGE_TG_API_HASH"] = "0123456789abcdef0123456789abcdef"
         os.environ["SIMBRIDGE_HTTP_SECRET"] = "test"
+        os.environ["SIMBRIDGE_AMI_PASSWORD"] = "test-ami"
 
         with pytest.raises(ConfigError, match="NONEXISTENT_ENV_VAR"):
             load_config(str(cfg_path))
+
+    def test_gsm_role_requires_ami_password_env(self, tmp_path: Path):
+        """Role gsm: a missing AMI password env var must be rejected."""
+        for env in _ALL_SECRET_ENVS:
+            os.environ.pop(env, None)
+        os.environ["SIMBRIDGE_AGENT_TOKEN"] = "tok"
+        try:
+            cfg_path = tmp_path / "gsm.yaml"
+            cfg_path.write_text(_ROLE_ENV_CONFIG.format(role="gsm"))
+            with pytest.raises(ConfigError, match="SIMBRIDGE_AMI_PASSWORD"):
+                load_config(str(cfg_path))
+        finally:
+            for env in _ALL_SECRET_ENVS:
+                os.environ.pop(env, None)
+
+    def test_gsm_role_does_not_require_tg_envs(self, tmp_path: Path):
+        """Role gsm: Telegram credentials are not required for a GSM node."""
+        for env in _ALL_SECRET_ENVS:
+            os.environ.pop(env, None)
+        os.environ["SIMBRIDGE_AGENT_TOKEN"] = "tok"
+        os.environ["SIMBRIDGE_AMI_PASSWORD"] = "test-ami"
+        try:
+            cfg_path = tmp_path / "gsm.yaml"
+            cfg_path.write_text(_ROLE_ENV_CONFIG.format(role="gsm"))
+            cfg = load_config(str(cfg_path))
+            assert cfg["node.role"] == "gsm"
+        finally:
+            for env in _ALL_SECRET_ENVS:
+                os.environ.pop(env, None)
+
+    def test_telegram_role_requires_tg_envs(self, tmp_path: Path):
+        """Role telegram: missing Telegram credential env vars rejected."""
+        for env in _ALL_SECRET_ENVS:
+            os.environ.pop(env, None)
+        os.environ["SIMBRIDGE_AGENT_TOKEN"] = "tok"
+        os.environ["SIMBRIDGE_HTTP_SECRET"] = "test"
+        os.environ["SIMBRIDGE_AMI_PASSWORD"] = "test-ami"
+        try:
+            cfg_path = tmp_path / "tg.yaml"
+            cfg_path.write_text(_ROLE_ENV_CONFIG.format(role="telegram"))
+            with pytest.raises(ConfigError, match="SIMBRIDGE_TG_API_ID"):
+                load_config(str(cfg_path))
+        finally:
+            for env in _ALL_SECRET_ENVS:
+                os.environ.pop(env, None)
 
 
 # =========================================================================
@@ -225,6 +327,22 @@ class TestACL:
         # Touch to ensure mtime updates on fast filesystems
         os.utime(str(acl_file))
         acl.reload()
+
+        assert acl.check(9999999, "in_sms") is True
+
+    def test_hot_reload_on_check(self, tmp_path: Path):
+        """S01.4: check() detects file changes without an explicit reload()."""
+        acl_file = tmp_path / "acl.conf"
+        acl_file.write_text("1234567 out_sms\n")
+        acl = ACLManager(str(acl_file))
+        assert acl.check(9999999, "in_sms") is False
+
+        # Hand-edit the file — no acl.reload() call; check() must notice.
+        import os, time
+        time.sleep(0.01)
+        acl_file.write_text("1234567 out_sms\n9999999 in_sms\n")
+        # Touch to ensure mtime updates on fast filesystems
+        os.utime(str(acl_file))
 
         assert acl.check(9999999, "in_sms") is True
 

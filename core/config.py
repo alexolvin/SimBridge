@@ -109,6 +109,20 @@ class _SchemaEntry:
     required: bool = True
     env: bool = False     # if True, this key holds an env var NAME, not the value
     enum: Optional[list] = None
+    roles: tuple = ()     # if non-empty: entry is required only for these node.roles
+
+
+def _is_required(entry: _SchemaEntry, role: Optional[str]) -> bool:
+    """Whether *entry* is required for the given node role.
+
+    Entries with a non-empty ``roles`` tuple are required only when the
+    node's role matches (a GSM node does not need Telegram credentials,
+    a Telegram node does not need the AMI password). Otherwise the plain
+    ``required`` flag applies.
+    """
+    if entry.roles:
+        return role in entry.roles
+    return entry.required
 
 
 _CONFIG_SCHEMA: list[_SchemaEntry] = [
@@ -119,15 +133,20 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("telegram.master_username", str),
     _SchemaEntry("telegram.session_path", str),
     _SchemaEntry("telegram.acl_file", str),
-    _SchemaEntry("telegram.api_id_env", str, env=True, required=False),
-    _SchemaEntry("telegram.api_hash_env", str, env=True, required=False),
+    # Required for roles that run the userbot (Telegram credentials).
+    _SchemaEntry("telegram.api_id_env", str, env=True, required=False,
+                 roles=("telegram", "all-in-one")),
+    _SchemaEntry("telegram.api_hash_env", str, env=True, required=False,
+                 roles=("telegram", "all-in-one")),
     # -- agent --
     _SchemaEntry("agent.listen", str),
     _SchemaEntry("agent.token_env", str, env=True),
     _SchemaEntry("agent.allowed_peers", list, required=False),
     # -- userbot_http --
     _SchemaEntry("userbot_http.listen", str),
-    _SchemaEntry("userbot_http.secret_env", str, env=True, required=False),
+    # Required for roles that run the userbot HTTP server (event receiver).
+    _SchemaEntry("userbot_http.secret_env", str, env=True, required=False,
+                 roles=("telegram", "all-in-one")),
     _SchemaEntry("userbot_http.allowed_peers", list, required=False),
     # -- asterisk --
     _SchemaEntry("asterisk.ari_url", str),
@@ -143,7 +162,9 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("asterisk.ami_host", str, required=False),
     _SchemaEntry("asterisk.ami_port", int, required=False),
     _SchemaEntry("asterisk.ami_username", str, required=False),
-    _SchemaEntry("asterisk.ami_password_env", str, env=True, required=False),
+    # Required for roles that run the agent (AMI access to Asterisk).
+    _SchemaEntry("asterisk.ami_password_env", str, env=True, required=False,
+                 roles=("gsm", "all-in-one")),
     # -- sim --
     _SchemaEntry("sim.phone", str, required=False),
     _SchemaEntry("sim.modem_model", str, required=False),
@@ -172,6 +193,7 @@ class ConfigError(Exception):
 def _validate(cfg: DotDict, schema: list[_SchemaEntry]) -> list[str]:
     """Validate *cfg* against *schema*. Return list of error strings (empty = OK)."""
     errors: list[str] = []
+    role: Optional[str] = cfg.get("node.role")
 
     # Build a set of all known dotted keys and their top-level prefixes
     known_keys: set[str] = {e.key for e in schema}
@@ -189,7 +211,7 @@ def _validate(cfg: DotDict, schema: list[_SchemaEntry]) -> list[str]:
                 break
 
         if not found:
-            if entry.required:
+            if _is_required(entry, role):
                 errors.append(f"Missing required key: {entry.key}")
             continue
 
@@ -271,6 +293,8 @@ def load_config(path: Optional[str] = None) -> DotDict:
     raw = _expand(raw)
     cfg = _to_dot_dict(raw)
 
+    role: Optional[str] = cfg.get("node.role")
+
     # Structural validation
     errors = _validate(cfg, _CONFIG_SCHEMA)
     if errors:
@@ -294,7 +318,7 @@ def load_config(path: Optional[str] = None) -> DotDict:
 
         env_name = obj
         if isinstance(env_name, str) and env_name not in os.environ:
-            if entry.required:
+            if _is_required(entry, role):
                 errors.append(
                     f"Secret env var {env_name!r} (referenced by {entry.key}) is not set"
                 )

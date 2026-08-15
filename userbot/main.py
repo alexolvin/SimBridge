@@ -16,7 +16,7 @@ import sys
 import asyncio
 from logging import getLogger, basicConfig
 
-from core.config import load_config
+from core.config import load_config, redact_config
 from userbot.userbot import Userbot
 
 logger = getLogger("simbridge.userbot.main")
@@ -30,6 +30,13 @@ async def async_main() -> None:
 
     cfg_path = os.environ.get("SIMBRIDGE_CONFIG", "/etc/simbridge/simbridge.yaml")
     cfg = load_config(cfg_path)
+
+    # Log the effective config with secrets redacted (S01.2) — same
+    # discipline as agent.py.
+    logger.info(
+        "Userbot starting with config: %s",
+        redact_config(cfg),
+    )
 
     # Only start userbot if role is 'telegram' or 'all-in-one'
     role = cfg["node.role"]
