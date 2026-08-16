@@ -359,6 +359,59 @@ class TestOrchestrateFailures:
         assert not any("--answers" in c for (_, c) in fake_remote.calls)
 
 
+class TestSecretsFile:
+    def test_load_ok(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"agent_token": "a", "bridge_secret": "b",
+                                 "http_secret": "c"}))
+        d = ir.load_shared_secrets(str(p))
+        assert d == {"agent_token": "a", "bridge_secret": "b",
+                     "http_secret": "c"}
+
+    def test_missing_key_exits(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"agent_token": "a"}))
+        with pytest.raises(SystemExit) as e:
+            ir.load_shared_secrets(str(p))
+        assert e.value.code == 1
+
+    def test_empty_value_exits(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps({"agent_token": "", "bridge_secret": "b",
+                                 "http_secret": "c"}))
+        with pytest.raises(SystemExit) as e:
+            ir.load_shared_secrets(str(p))
+        assert e.value.code == 1
+
+    def test_not_a_dict_exits(self, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text("[1, 2]")
+        with pytest.raises(SystemExit) as e:
+            ir.load_shared_secrets(str(p))
+        assert e.value.code == 1
+
+    def test_unreadable_exits(self, tmp_path):
+        with pytest.raises(SystemExit) as e:
+            ir.load_shared_secrets(str(tmp_path / "nope.json"))
+        assert e.value.code == 1
+
+    def test_orchestrator_reuses_file(self, fake_remote, monkeypatch,
+                                      tmp_path, capsys):
+        p = tmp_path / "s.json"
+        pair = {"agent_token": "reuse" + "a" * 27,
+                "bridge_secret": "reuse" + "b" * 27,
+                "http_secret": "reuse" + "c" * 27}
+        p.write_text(json.dumps(pair))
+        monkeypatch.setattr(ir, "q", make_q(SINGLE_Q))
+        args = argparse.Namespace(dry_run=True, secrets_file=str(p))
+        rc = ir.orchestrate(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"agent_token = {pair['agent_token']}" in out
+        assert f"bridge_secret = {pair['bridge_secret']}" in out
+        assert f"http_secret = {pair['http_secret']}" in out
+
+
 class TestExistingInstall:
     def test_wipe_action(self, fake_remote, monkeypatch):
         fake_remote.existing = 1

@@ -22,8 +22,11 @@ Shared secrets (agent_token / bridge_secret / http_secret) are
 pre-generated ONCE on the PC and written into every node's answers
 file — both nodes get identical values, which removes the
 "which node generates the token" chicken-and-egg of a two-node
-deploy. The AMI password stays node-local (absent from the answers
-file, the installer auto-detects/generates it per node).
+deploy. For staged deploys (node A now, node B later) pass
+`--secrets-file FILE` (0600 JSON with the three keys) to REUSE the
+pair from the first run. The AMI password stays node-local (absent
+from the answers file, the installer auto-detects/generates it per
+node).
 
 Telegram login is NEVER done here (it is TTY-bound): after deploy,
 log in interactively with `install.py --tg-login` — the final report
@@ -513,6 +516,32 @@ def gather_params() -> Tuple[List[Node], Shared]:
 # Orchestration
 # ══════════════════════════════════════════════════════════════════════════════
 
+def load_shared_secrets(path: str) -> Dict[str, str]:
+    """Read a 0600 JSON file with the shared secrets, to REUSE an existing
+    token pair across runs (staged two-node deploys: node A first, node B
+    later — both must carry identical values).
+
+    Format: {"agent_token": "...", "bridge_secret": "...",
+             "http_secret": "..."}  (all three required, non-empty).
+    """
+    try:
+        d = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read secrets file {path}: {e}")
+        sys.exit(1)
+    if not isinstance(d, dict):
+        print(f"ERROR: {path}: expected a JSON object with"
+              f" agent_token/bridge_secret/http_secret")
+        sys.exit(1)
+    keys = ("agent_token", "bridge_secret", "http_secret")
+    missing = [k for k in keys
+               if not isinstance(d.get(k), str) or not d[k]]
+    if missing:
+        print(f"ERROR: {path}: missing or empty keys: {', '.join(missing)}")
+        sys.exit(1)
+    return {k: d[k] for k in keys}
+
+
 def orchestrate(args: argparse.Namespace) -> int:
     transport = detect_transport()
     if transport == "ssh":
@@ -521,9 +550,16 @@ def orchestrate(args: argparse.Namespace) -> int:
     nodes, sh = gather_params()
 
     # Shared secrets: one pair of values for the whole deployment.
-    sh.agent_token = secrets.token_hex(16)
-    sh.bridge_secret = secrets.token_hex(16)
-    sh.http_secret = secrets.token_hex(16)
+    # --secrets-file reuses an existing pair (staged deploys: node A now,
+    # node B later — both runs must produce identical values).
+    if getattr(args, "secrets_file", None):
+        ss = load_shared_secrets(args.secrets_file)
+    else:
+        ss = {k: secrets.token_hex(16)
+              for k in ("agent_token", "bridge_secret", "http_secret")}
+    sh.agent_token = ss["agent_token"]
+    sh.bridge_secret = ss["bridge_secret"]
+    sh.http_secret = ss["http_secret"]
 
     install_py = Path(__file__).resolve().parent / "install.py"
     if not install_py.exists():
@@ -618,6 +654,11 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="ask the questions, print the answers files and"
                          " commands, touch no node")
+    ap.add_argument("--secrets-file", default=None, metavar="FILE",
+                    help="reuse an existing shared-secrets pair (0600 JSON"
+                         " with agent_token/bridge_secret/http_secret)"
+                         " instead of generating new ones — for staged"
+                         " two-node deploys")
     args = ap.parse_args()
     sys.exit(orchestrate(args))
 
