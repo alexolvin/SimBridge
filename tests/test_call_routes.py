@@ -134,6 +134,23 @@ class TestCallIncoming:
         )
         assert r.status_code == 401
 
+    def test_modem_id_from_configured_dongle(self, env):
+        """S05.1 provenance: the node's configured dongle, not a default.
+        cfg is wrapped in a DotDict as load_config() produces in production."""
+        from core.config import DotDict
+
+        client, registry, audit, ami, app, _ = env
+        cfg = DotDict(app.state.cfg)
+        cfg["asterisk"]["dongle"] = "ttyUSB0"
+        app.state.cfg = cfg
+        r = client.post(
+            "/v1/call/incoming", headers=_auth(),
+            json={"phone_number": "+79261234555",
+                  "gsm_channel_id": "Dongle/ttyUSB0-0"},
+        )
+        assert r.status_code == 200
+        assert registry.get(r.json()["call_id"]).modem_id == "ttyUSB0"
+
 
 # =========================================================================
 # /v1/call/outgoing
@@ -216,6 +233,27 @@ class TestCallOutgoing:
         )
         assert r2.status_code == 503
         assert len(registry.list_all()) == 1  # no second session
+
+    def test_offline_modem_503_message(self, env):
+        """TS05-4: no reachable modem -> 503 with an 'offline' message,
+        not the busy one (the operator action differs)."""
+        from core.modem import ModemPool, SingleModemProvider
+
+        client, registry, audit, ami, app, _ = env
+        provider = SingleModemProvider(modem_id="gsm", device="gsm")  # OFFLINE
+        pool = ModemPool(provider=provider)
+        new_registry = CallRegistry(
+            sms_store=MagicMock(), audit=audit, modem_pool=pool
+        )
+        app.state.call_registry = new_registry
+        r = client.post(
+            "/v1/call/outgoing", headers=_auth(),
+            json={"phone_number": "+14155552671",
+                  "telegram_user_id": ACL_USER},
+        )
+        assert r.status_code == 503
+        assert "offline" in r.json()["detail"]
+        assert len(new_registry.list_all()) == 0  # no session created
 
 
 # =========================================================================

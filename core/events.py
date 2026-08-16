@@ -44,6 +44,9 @@ class EventType(str, Enum):
     CALL_HANGUP = "CALL_HANGUP"
     CALL_TELEGRAM_TIMEOUT = "CALL_TELEGRAM_TIMEOUT"
     CALL_DURATION_EXPIRED = "CALL_DURATION_EXPIRED"
+    # -- Modem (S05.2) --
+    # Which routing policy chose which modem, and why.
+    MODEM_SELECTED = "MODEM_SELECTED"
 
 
 @dataclass
@@ -79,14 +82,3 @@ class SMSEvent:
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-
-
-@dataclass
-class ModemState:
-    """Modem registration and signal state."""
-
-    device: str
-    registered: bool
-    signal_percent: Optional[int] = None
-    imei_suffix: Optional[str] = None
-    operator: Optional[str] = None

@@ -160,7 +160,17 @@ class InvalidTransition(Exception):
 
 
 class ModemBusyError(Exception):
-    """Raised when the modem is already in use."""
+    """Raised when no modem can service the request.
+
+    ``reason`` distinguishes ``"busy"`` (every modem is reserved for a
+    call) from ``"offline"`` (no modem is reachable at all) — the
+    operator-facing message differs (all-busy must be a clear message,
+    not a hang: TS05-4).
+    """
+
+    def __init__(self, detail: str = "Modem busy", reason: str = "busy") -> None:
+        super().__init__(detail)
+        self.reason = reason
 
 
 class ACLDeniedError(Exception):
@@ -355,15 +365,20 @@ class CallRegistry:
         """
         # S05.1: Try pool-based selection first
         selected_modem_id = modem_id
+        policy_name = "direct"
         if self._modem_pool:
             chosen = self._modem_pool.select_for_call(destination=callee_number)
             if chosen is None:
-                raise ModemBusyError("All modems busy — no modem available for this call")
+                reason = "offline" if self._modem_pool.all_offline() else "busy"
+                raise ModemBusyError(
+                    "No modem available for this call", reason=reason
+                )
             selected_modem_id = chosen.modem_id
+            policy_name = self._modem_pool.strategy_name
         else:
             # Backward compat: direct modem reservation
             if self._modems_reserved > 0:
-                raise ModemBusyError("Modem is already in use")
+                raise ModemBusyError("Modem is already in use", reason="busy")
 
         call = CallMachine(
             call_id=uuid.uuid4().hex,
@@ -385,6 +400,17 @@ class CallRegistry:
         call.transition(CallState.MODEM_RESERVED)
         with self._lock:
             self._calls[call.call_id] = call
+        # S05.2: record the selection — which policy chose which modem.
+        self._audit.log(
+            EventType.MODEM_SELECTED,
+            correlation_id=call.call_id,
+            modem_id=selected_modem_id,
+            details={
+                "policy": policy_name,
+                "direction": "outgoing",
+                "destination": callee_number,
+            },
+        )
         logger.info(
             "Outgoing call %s to %s (user %s) on %s",
             call.call_id[:8],

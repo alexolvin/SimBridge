@@ -186,6 +186,10 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     # S04.3: loopback control API of the voice bridge (userbot node).
     # Optional — pre-S04 configs validate as-is (userbot defaults to 5063).
     _SchemaEntry("voice.bridge_control_port", int, required=False),
+    # -- watchdog --
+    # S05.1: how often the agent polls the device for modem state.
+    # Optional — pre-S05 configs validate as-is (agent defaults to 30).
+    _SchemaEntry("watchdog.modem_check_seconds", int, required=False),
     # -- limits --
     _SchemaEntry("limits.sms_per_hour", int),
     _SchemaEntry("limits.calls_per_minute", int),

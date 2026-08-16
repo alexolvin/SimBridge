@@ -542,6 +542,8 @@ async def call_incoming(
     call = registry.create_incoming(
         caller_number=req.phone_number,
         caller_name=req.contact_name,
+        # S05.1: provenance — the node's configured dongle, not a default.
+        modem_id=get_cfg(request).get("asterisk.dongle", "gsm"),
         gsm_channel_id=req.gsm_channel_id,
     )
     registry.start_telegram_ring(call.call_id)
@@ -617,8 +619,14 @@ async def call_outgoing(
             caller_number=f"user:{req.telegram_user_id or 0}",
             telegram_user_id=req.telegram_user_id,
         )
-    except ModemBusyError:
-        raise HTTPException(status_code=503, detail="Modem busy — another call in progress")
+    except ModemBusyError as exc:
+        # TS05-4: all-busy/offline must be a clear message, not a hang.
+        detail = (
+            "Modem offline — check the device"
+            if exc.reason == "offline"
+            else "Modem busy — another call in progress"
+        )
+        raise HTTPException(status_code=503, detail=detail)
     # S04.3: the userbot starts the Telegram ring via the bridge control
     # API immediately after this response. Mark the ring as started now —
     # the Telegram ring is out-of-band (no dialplan Dial enforces it), so

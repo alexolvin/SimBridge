@@ -126,6 +126,15 @@ class ModemProvider(ABC):
     def set_call_active(self, modem_id: str, active: bool) -> bool:
         """Mark call activity. Returns True if modem was found."""
 
+    @abstractmethod
+    def mark_offline(self, modem_id: str) -> bool:
+        """Mark the modem as gone (unplugged / no device entry reported).
+
+        Clears all device-reported fields (registration, signal, operator,
+        error) so a stale signal value cannot keep the state at
+        INITIALIZING. Returns True if the modem was known.
+        """
+
 
 class SingleModemProvider(ModemProvider):
     """Single-modem implementation.
@@ -133,9 +142,19 @@ class SingleModemProvider(ModemProvider):
     This is the default for single-SIM deployments. The modem_id is
     configurable (defaults to "gsm"). State is derived from real device
     reports via update_state().
+
+    ``sim_number`` is the SIM's phone number (node-level config,
+    ``sim.phone``). It is carried at the modem level — every record
+    carries the ``modem_id`` that maps 1:1 to this SIM on the node, so
+    per-record duplication would be a duplicate mechanism (Rule 1).
     """
 
-    def __init__(self, modem_id: str = "gsm", device: str = "gsm") -> None:
+    def __init__(
+        self,
+        modem_id: str = "gsm",
+        device: str = "gsm",
+        sim_number: Optional[str] = None,
+    ) -> None:
         self._modem_id = modem_id
         self._device = device
         self._lock = threading.Lock()
@@ -143,6 +162,7 @@ class SingleModemProvider(ModemProvider):
             modem_id=modem_id,
             device=device,
             state=ModemState.OFFLINE,
+            sim_number=sim_number,
         )
         self._sms_active = False
         self._call_active = False
@@ -201,6 +221,18 @@ class SingleModemProvider(ModemProvider):
             self._derive_state()
         return True
 
+    def mark_offline(self, modem_id: str) -> bool:
+        if modem_id != self._modem_id:
+            return False
+        with self._lock:
+            self._info.registered = False
+            self._info.signal_percent = None
+            self._info.operator = None
+            self._info.error = None
+            self._info.last_seen = time.monotonic()
+            self._derive_state()
+        return True
+
     def _derive_state(self) -> None:
         """Derive operational state from device state + activity flags.
 
@@ -245,7 +277,13 @@ class SingleModemProvider(ModemProvider):
 
 
 class RoutingStrategy(ABC):
-    """Pluggable routing strategy for modem selection."""
+    """Pluggable routing strategy for modem selection.
+
+    Subclasses carry a ``name`` used in the audit log when a selection
+    is recorded (S05.2: "which policy chose which modem").
+    """
+
+    name: str = "strategy"
 
     @abstractmethod
     def select(
@@ -262,6 +300,8 @@ class RoutingStrategy(ABC):
 class FirstAvailableStrategy(RoutingStrategy):
     """Select the first available modem (by modem_id order)."""
 
+    name = "first_available"
+
     def select(
         self,
         available: List[ModemInfo],
@@ -275,6 +315,8 @@ class FirstAvailableStrategy(RoutingStrategy):
 
 class RoundRobinStrategy(RoutingStrategy):
     """Distribute requests across available modems in round-robin order."""
+
+    name = "round_robin"
 
     def __init__(self) -> None:
         self._counter = 0
@@ -292,6 +334,48 @@ class RoundRobinStrategy(RoutingStrategy):
             idx = self._counter % len(sorted_modems)
             self._counter += 1
         return sorted_modems[idx]
+
+
+class StickyStrategy(RoutingStrategy):
+    """Sticky: keep the same modem for a given contact.
+
+    NOT IMPLEMENTED — declared as an interface because the GPT document
+    §8 lists it as a routing policy. No current deployment uses it;
+    select() raises so a misconfiguration fails loudly instead of
+    silently routing with the wrong semantics.
+    """
+
+    name = "sticky"
+
+    def select(
+        self,
+        available: List[ModemInfo],
+        destination: Optional[str] = None,
+    ) -> Optional[ModemInfo]:
+        raise NotImplementedError(
+            "StickyStrategy is not implemented (not used in any deployment)"
+        )
+
+
+class ExplicitStrategy(RoutingStrategy):
+    """Explicit: operator names the modem (e.g. ``SIM2 +7926...``).
+
+    NOT IMPLEMENTED — declared as an interface because the GPT document
+    §8 lists it as a routing policy. No current deployment uses it;
+    select() raises so a misconfiguration fails loudly instead of
+    silently routing with the wrong semantics.
+    """
+
+    name = "explicit"
+
+    def select(
+        self,
+        available: List[ModemInfo],
+        destination: Optional[str] = None,
+    ) -> Optional[ModemInfo]:
+        raise NotImplementedError(
+            "ExplicitStrategy is not implemented (not used in any deployment)"
+        )
 
 
 # =========================================================================
@@ -320,9 +404,27 @@ class ModemPool:
     def provider(self) -> ModemProvider:
         return self._provider
 
+    @property
+    def strategy_name(self) -> str:
+        """Name of the routing policy in use (for selection audit)."""
+        return getattr(
+            self._strategy, "name", type(self._strategy).__name__
+        )
+
     def list_modems(self) -> List[ModemInfo]:
         """Get current state of all modems in the pool."""
         return self._provider.list_modems()
+
+    def all_offline(self) -> bool:
+        """True if the pool is empty or every modem is OFFLINE (device level).
+
+        Distinguishes "no modem reachable" from "all modems busy" — the
+        operator-facing 503 message differs.
+        """
+        infos = self._provider.list_modems()
+        if not infos:
+            return True
+        return all(info.state is ModemState.OFFLINE for info in infos)
 
     def select_for_sms(
         self,

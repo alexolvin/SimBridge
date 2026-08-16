@@ -62,6 +62,13 @@ asterisk:
   ami_password_env: SIMBRIDGE_AMI_PASSWORD   # from env, never in YAML
 
 # ---------------------------------------------------------------------------
+# SIM (optional — the modem's number, carried at modem level in the pool)
+# ---------------------------------------------------------------------------
+sim:
+  phone: ""                 # SIM's phone number (E.164) — surfaced in modem info
+  modem_model: ""           # e.g., "ZTE MF831" — informational
+
+# ---------------------------------------------------------------------------
 # Voice bridge (stage 04 — live bidirectional voice)
 # ---------------------------------------------------------------------------
 voice:
@@ -72,6 +79,12 @@ voice:
   outbound_answer_timeout: 30       # seconds
   outbound_gsm_ring_seconds: 30     # max seconds the GSM number may ring before no-answer
   bridge_control_port: 5063         # loopback control API of the voice bridge (S04.3)
+
+# ---------------------------------------------------------------------------
+# Watchdog (stage 05 — device-state polling)
+# ---------------------------------------------------------------------------
+watchdog:
+  modem_check_seconds: 30           # how often the agent polls the device for modem state
 
 # ---------------------------------------------------------------------------
 # Rate limits

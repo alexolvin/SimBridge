@@ -851,6 +851,8 @@ voice:
   bridge_port: 5062
   srtp: false
   outbound_answer_timeout: 30
+watchdog:
+  modem_check_seconds: 30
 limits:
   sms_per_hour: 30
   calls_per_minute: 3

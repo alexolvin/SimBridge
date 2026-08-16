@@ -6,6 +6,7 @@ Replaces the SSH+shell-interpolation path for outgoing SMS.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from logging import getLogger
@@ -25,7 +26,7 @@ from core.logging_config import setup_logging
 from core.metrics import MetricsCollector
 from core.health import HealthChecker
 from core.alerting import AlertManager
-from core.recovery import BackoffReconnector, ModemWatchdog
+from core.recovery import BackoffReconnector
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
@@ -140,12 +141,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.sms_store = sms_store
 
     # Initialize modem pool (S05.1)
+    dongle_id = cfg.get("asterisk.dongle", "gsm")
     modem_provider = SingleModemProvider(
-        modem_id=cfg.get("asterisk.dongle", "gsm"),
-        device=cfg.get("asterisk.dongle", "gsm"),
+        modem_id=dongle_id,
+        device=dongle_id,
+        sim_number=cfg.get("sim.phone") or None,
     )
     modem_pool = ModemPool(provider=modem_provider)
     app.state.modem_pool = modem_pool
+
+    # S05.1: derive modem state from the real device — without the poller
+    # the provider stays OFFLINE forever and every outgoing call 503s.
+    from agent.modem_poll import run_modem_poller
+
+    poll_interval = float(cfg.get("watchdog.modem_check_seconds", 30))
+    poller_stop = asyncio.Event()
+    poller_task = asyncio.create_task(
+        run_modem_poller(ami, modem_provider, dongle_id, poll_interval, poller_stop)
+    )
+    app.state.modem_poller_task = poller_task
 
     # Initialize call registry (S04.2)
     call_registry = CallRegistry(
@@ -165,6 +179,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # Shutdown
+    poller_stop.set()
+    await poller_task
     await ami.close()
     logger.info("Agent shut down")
 

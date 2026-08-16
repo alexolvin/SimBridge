@@ -909,9 +909,12 @@ asterisk -rx "dialplan reload"
 10. **Восстановление** — BackoffReconnector для AMI, ModemWatchdog для модема
 11. **Voicemail** — MixMonitor до Playback (ловит ранний сброс), ffmpeg loudnorm, early hangup detection
 12. **Генератор Asterisk-глобалей** — из YAML в [globals] формат
-13. **Многомодемная абстракция** — ModemProvider, ModemPool, RoutingStrategy
+13. **Многомодемная абстракция (S05)** — ModemProvider, ModemPool,
+    роутинг (first_available / round_robin), poller состояния устройства
+    (DongleShowDevices через AMI каждые `watchdog.modem_check_seconds`),
+    аудит выбора модема (MODEM_SELECTED), modem_id на всех записях
 14. **Secret detection** — pre-commit хук, проверка при комите
-15. **Тесты** — 469 passed / 6 skipped, все проходят
+15. **Тесты** — 500 passed / 6 skipped, все проходят
 
 ### Что НЕ реализовано
 
@@ -935,3 +938,5 @@ asterisk -rx "dialplan reload"
 1. **Все интеграционные тесты** (6 skipped) требуют физического модема и работающего Asterisk — автоматизировать невозможно
 2. **Голосовые звонки** — требуют интеграции tg-bridge и тестирования на реальном оборудовании
 3. **Распределённая установка** — требует двух серверов с Tailscale
+4. **Отключение/подключение модема (TS05-2)** — poller покрыт unit-тестами
+   на фэйковом AMI; live-прогон (выдернуть/вставить USB) — MANUAL_VERIFY
