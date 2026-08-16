@@ -374,12 +374,17 @@ class TestVoicemailFallback:
         self.section = m.group(1)
 
     def test_ring_timeout_goes_to_voicemail(self):
-        """s-exten: ring wait → Goto into the named voicemail branch;
-        voicemail branch: answer → record → prompt → stop."""
+        """s-exten (Stage 04): register the call, Dial the bridge for
+        RING_WAIT_SECONDS (Dial blocks for the whole call, so
+        DIALSTATUS is final); NOANSWER (Telegram ring timed out) →
+        voicemail; any other outcome → Hangup.
+        Voicemail branch: answer → record → prompt → stop."""
         order = [
             "AGI(tg-sms-agi.py,ring)",
-            "Wait(${RING_WAIT_SECONDS})",
-            "Goto(voicemail,1)",
+            "AGI(notify-agent-agi.py,incoming,${CALLER})",
+            "Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})",
+            "AGI(notify-agent-agi.py,complete,${DIALSTATUS})",
+            'GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)',
             "Answer()",
             "Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)",
             "MixMonitor(${VMFILE})",
@@ -399,10 +404,12 @@ class TestVoicemailFallback:
         must be a named exten IN the channel's current context (the
         h-exten resolves there)."""
         assert "exten => voicemail,1," in self.section
-        # one and only one entry point (dialplan lines, not comments)
+        # one and only one entry point (dialplan lines, not comments):
+        # either Goto(voicemail,1) or a GotoIf whose target is voicemail
         lines = [l for l in self.section.splitlines()
                  if not l.strip().startswith(";")]
-        assert sum("Goto(voicemail,1)" in l for l in lines) == 1
+        assert sum(("Goto(voicemail,1)" in l) or ("?voicemail)" in l)
+                   for l in lines) == 1
 
     def test_prompt_duration_is_published_as_channel_var(self):
         """S03.1: the AGI reads VM_PROMPT_DURATION, set from the

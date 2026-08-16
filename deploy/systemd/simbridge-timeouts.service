@@ -1,0 +1,19 @@
+[Unit]
+Description=SimBridge call-timeout driver (S04.3 — reaps expired calls)
+After=network-online.target simbridge-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=simbridge
+Group=__SVC_GROUP__
+WorkingDirectory=/opt/simbridge
+EnvironmentFile=/etc/simbridge/env
+Environment=SIMBRIDGE_CONFIG=/etc/simbridge/simbridge.yaml
+ExecStart=/opt/simbridge-venv/bin/python /opt/simbridge/scripts/call-timeout-check.py
+Nice=10
+
+# Read-only poller: one HTTP POST to the local agent, nothing written.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

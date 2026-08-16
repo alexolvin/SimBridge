@@ -90,6 +90,7 @@ HANDOFF_DIR   = Path(".handoff")
 # ── Asterisk (GSM nodes) ────────────────────────────────────────────────────
 AST_DIR        = "/etc/asterisk"
 AST_GLOBALS    = f"{AST_DIR}/asterisk-globals.conf"   # generated
+AST_PJSIP      = f"{AST_DIR}/pjsip.conf"              # generated (S04.2, holds the SIP secret)
 AST_EXTENSIONS = f"{AST_DIR}/extensions.conf"         # from the repo
 AST_PROMPT     = "/var/lib/asterisk/sounds/custom/vm-prompt.ulaw"
 # Drop-in giving the Asterisk process SimBridge's env — the AGI hooks
@@ -229,6 +230,7 @@ class S:
     tg_username: str = ""
     agent_token: str = ""
     http_secret: str = ""
+    bridge_secret: str = ""          # S04.2: SIP credential for the voice bridge
     own_ip: str = ""
     peer_ip: str = ""
     acl_ids: str = ""
@@ -482,17 +484,40 @@ def phase_gather() -> None:
             warn(f"Agent token: {tok}")
             warn("(Save — needed on Telegram node.)")
         s.agent_token = tok
+        # S04.2: SIP credential for the voice bridge endpoint. The GSM
+        # node owns Asterisk and generates pjsip.conf with it; the
+        # Telegram node's bridge authenticates with the same value.
+        bsec = ask("Bridge secret (SIP credential, empty = auto)",
+                   required=False, default=s.bridge_secret)
+        if not bsec:
+            bsec = _rand(32)
+            warn(f"Bridge secret: {bsec}")
+            warn("(Save — needed on Telegram node for the voice bridge.)")
+        s.bridge_secret = bsec
 
-    if tg:
-        if s.node_role == "telegram":
-            s.agent_token = ask("Agent token (must match GSM node)",
-                                default=s.agent_token)
+    if s.node_role == "telegram":
+        s.agent_token = ask("Agent token (must match GSM node)",
+                            default=s.agent_token)
+        s.bridge_secret = ask("Bridge secret (must match GSM node)",
+                              default=s.bridge_secret)
+
+    # HTTP secret — shared by the GSM node's agent (it authenticates to
+    # the userbot's event endpoints) and the Telegram node's HTTP
+    # server, so both nodes must hold the same value. A pure GSM node
+    # generates it here (previously it never did, which left
+    # SIMBRIDGE_HTTP_SECRET missing on the GSM node and broke the
+    # agent -> userbot notifications).
+    if s.node_role == "telegram":
+        sec = ask("HTTP secret (must match GSM node)",
+                  default=s.http_secret)
+    else:
         sec = ask("HTTP secret (empty = auto)",
                   required=False, default=s.http_secret)
         if not sec:
             sec = _rand(32)
             warn(f"HTTP secret: {sec}")
-        s.http_secret = sec
+            warn("(Save — needed on Telegram node.)")
+    s.http_secret = sec
 
     if s.install_type == "distributed":
         info("", "--- Network ---")
@@ -523,12 +548,14 @@ def phase_remove() -> None:
     if s.action != "remove":
         return
     heading("5a / 8 — Remove Existing")
-    for svc in ("simbridge-agent", "simbridge-userbot", "simbridge-sweep"):
+    for svc in ("simbridge-agent", "simbridge-userbot", "simbridge-sweep",
+                "simbridge-timeouts"):
         if run_ok(f"systemctl is-active --quiet {svc}"):
             info(f"Stopping {svc}...")
             run_q(f"systemctl stop {svc}"); run_q(f"systemctl disable {svc}")
     for u in ("simbridge-agent.service", "simbridge-userbot.service",
-              "simbridge-sweep.service", "simbridge-sweep.timer"):
+              "simbridge-sweep.service", "simbridge-sweep.timer",
+              "simbridge-timeouts.service", "simbridge-timeouts.timer"):
         p = Path(f"/etc/systemd/system/{u}")
         if p.exists():
             p.unlink(); info("Removed:", f" {u}")
@@ -890,6 +917,8 @@ def _merge_env() -> None:
         wanted["SIMBRIDGE_TG_API_HASH"] = s.tg_api_hash
     if s.http_secret:
         wanted["SIMBRIDGE_HTTP_SECRET"] = s.http_secret
+    if s.bridge_secret:
+        wanted["SIMBRIDGE_BRIDGE_SECRET"] = s.bridge_secret
     if s.ami_pw:
         wanted["SIMBRIDGE_AMI_PASSWORD"] = s.ami_pw
     # notify-agent-agi.py (S04) reads the agent URL from the environment —
@@ -1013,11 +1042,23 @@ def _install_asterisk_dialplan() -> None:
     else:
         warn("Prompt missing in repo:", str(snd_src))
 
-    # 3. Globals — generated from the config _write_config() just wrote
-    gen = (f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/"
-           f"generate_asterisk_config.py {CONF_FILE} -o {AST_GLOBALS}")
+    # 3. Globals + PJSIP — generated from the config _write_config()
+    #    just wrote. The PJSIP file (S04.2) carries the bridge SIP
+    #    credential, so the generator reads it from the process
+    #    environment (never a file argument); the file itself stays
+    #    root-owned and asterisk-group-readable (0640) — not world
+    #    readable like the other Asterisk files.
     old_globals = (Path(AST_GLOBALS).read_text()
                    if Path(AST_GLOBALS).exists() else None)
+    old_pjsip = (Path(AST_PJSIP).read_text()
+                 if Path(AST_PJSIP).exists() else None)
+    node_ip = (s.own_ip
+               if s.own_ip and s.own_ip != "127.0.0.1" else "")
+    gen = (f"SIMBRIDGE_BRIDGE_SECRET={s.bridge_secret} "
+           f"SIMBRIDGE_NODE_TAILSCALE_IP={node_ip} "
+           f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/"
+           f"generate_asterisk_config.py {CONF_FILE} "
+           f"-o {AST_GLOBALS} -p {AST_PJSIP}")
     if run_ok(gen):
         _chown_asterisk(Path(AST_GLOBALS))
         if Path(AST_GLOBALS).read_text() != old_globals:
@@ -1025,9 +1066,22 @@ def _install_asterisk_dialplan() -> None:
             ok("Globals:", AST_GLOBALS)
         else:
             ok("Globals unchanged.", AST_GLOBALS)
+        try:
+            _g = grp.getgrnam("asterisk")
+            Path(AST_PJSIP).chown(0, _g.gr_gid)
+        except (KeyError, OSError):
+            pass
+        Path(AST_PJSIP).chmod(0o640)
+        if Path(AST_PJSIP).read_text() != old_pjsip:
+            s.ast_config_changed = True
+            ok("PJSIP (voice bridge):", AST_PJSIP)
+        else:
+            ok("PJSIP unchanged.", AST_PJSIP)
     else:
-        fail("Globals generation failed — needs the agent venv (PyYAML).")
-        fail("Command:", gen)
+        fail("Globals/PJSIP generation failed — needs the agent venv "
+             "(PyYAML) and SIMBRIDGE_BRIDGE_SECRET.")
+        fail("Command:", gen.replace(s.bridge_secret, "<redacted>")
+             if s.bridge_secret else gen)
 
     # 4. AGI hooks — exec bit + symlink into Asterisk's AGI bin dir
     agi_dir = _agi_bin_dir()
@@ -1092,6 +1146,14 @@ def _install_systemd() -> None:
         _render(sd / "simbridge-sweep.timer",
                 "/etc/systemd/system/simbridge-sweep.timer")
         ok("simbridge-sweep.timer")
+    if gsm and (sd / "simbridge-timeouts.service").exists():
+        _render(sd / "simbridge-timeouts.service",
+                "/etc/systemd/system/simbridge-timeouts.service")
+        ok("simbridge-timeouts.service")
+    if gsm and (sd / "simbridge-timeouts.timer").exists():
+        _render(sd / "simbridge-timeouts.timer",
+                "/etc/systemd/system/simbridge-timeouts.timer")
+        ok("simbridge-timeouts.timer")
     if tg and (sd / "simbridge-userbot.service").exists():
         _render(sd / "simbridge-userbot.service",
                 "/etc/systemd/system/simbridge-userbot.service")
@@ -1131,11 +1193,13 @@ def _enable() -> None:
     if s.node_role == "all-in-one":
         run_ok("systemctl enable simbridge-agent")
         run_ok("systemctl enable --now simbridge-sweep.timer")
+        run_ok("systemctl enable --now simbridge-timeouts.timer")
         run_ok("systemctl enable simbridge-userbot")
         info("Enabled but NOT started — after Telegram login.")
     elif gsm:
         run_ok("systemctl enable simbridge-agent")
         run_ok("systemctl enable --now simbridge-sweep.timer")
+        run_ok("systemctl enable --now simbridge-timeouts.timer")
         if not run_ok("systemctl start simbridge-agent"):
             warn("Agent start deferred (Asterisk/chan_dongle?).")
     elif tg:
@@ -1387,6 +1451,15 @@ def phase_verify() -> None:
         _check("simbridge-sweep.timer (orphan recordings)", timer_ok,
                detail, fix)
 
+        # 6b. Timeouts timer — call timeout driver (S04.3). The outgoing
+        #     Telegram ring is out-of-band, so without this the 30 s
+        #     answer window is never enforced.
+        r = run_q("systemctl is-active simbridge-timeouts.timer 2>&1")
+        tmo_ok = r.stdout.strip() == "active"
+        _check("simbridge-timeouts.timer (call timeouts)", tmo_ok,
+               "    Timed-out calls will not be reaped." if not tmo_ok else "",
+               "systemctl enable --now simbridge-timeouts.timer")
+
         # 7. Generated globals — the dialplan #includes this file
         globals_ok = Path(AST_GLOBALS).exists()
         if globals_ok:
@@ -1396,6 +1469,14 @@ def phase_verify() -> None:
             fix = (f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/"
                    f"generate_asterisk_config.py {CONF_FILE} -o {AST_GLOBALS}")
         _check("Asterisk globals file", globals_ok, detail, fix)
+
+        # 7b. PJSIP voice-bridge endpoint (S04.2) — without it the
+        #     bridge cannot register and no live call can be bridged.
+        pjsip_ok = Path(AST_PJSIP).exists()
+        _check("PJSIP voice-bridge config (S04)", pjsip_ok,
+               f"    {AST_PJSIP} missing — voice bridge cannot register."
+               if not pjsip_ok else "",
+               "Re-run the installer (PJSIP step) with SIMBRIDGE_BRIDGE_SECRET set")
 
         # 8. AGI hooks reachable from Asterisk
         agi_dir = _agi_bin_dir()
@@ -1707,6 +1788,10 @@ def _load_existing_config() -> None:
     if "SIMBRIDGE_HTTP_SECRET" in env and not s.http_secret:
         s.http_secret = env["SIMBRIDGE_HTTP_SECRET"]
         info("Loaded existing HTTP secret.")
+
+    if "SIMBRIDGE_BRIDGE_SECRET" in env and not s.bridge_secret:
+        s.bridge_secret = env["SIMBRIDGE_BRIDGE_SECRET"]
+        info("Loaded existing bridge secret.")
 
     if "SIMBRIDGE_AMI_PASSWORD" in env and not s.ami_pw:
         s.ami_pw = env["SIMBRIDGE_AMI_PASSWORD"]

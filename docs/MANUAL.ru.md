@@ -424,19 +424,35 @@ python3 scripts/generate_asterisk_config.py /etc/simbridge/simbridge.yaml
 
 ### 6.1 Текущий статус
 
-**Архитектура спроектирована, но не интегрирована.**
+**Control plane реализован (Stage 04); медиа-мост — внешний процесс,
+требует сборки и live-проверки (MANUAL_VERIFY).**
 
 Что есть:
 - State machine для управления звонками (CallState, CallMachine, CallRegistry)
-- API-эндпоинты для входящих/исходящих звонков, accept, reject, hangup
-- Пример PJSIP-конфигурации для bridge-эндпоинта (pjsip.conf.example)
-- Dialplan-контексты для маршрутизации звонков
+- API-эндпоинты: `/v1/call/incoming`, `/v1/call/outgoing`,
+  `/v1/call/outgoing/accepted`, `/v1/call/{id}/complete`,
+  `/v1/call/{id}/accept|reject|hangup`, `/v1/call/check-timeouts`
+- `scripts/notify-agent-agi.py` — AGI-мост dialplan ⇄ agent
+  (incoming / outgoing-accepted / complete, DIALSTATUS-карта)
+- Dialplan: входящие — `Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})`
+  + voicemail на NOANSWER; исходящие — контекст `[tg-bridge]` с
+  nocal-гейтом и `Dial(Dongle/${MODEM_ID}/${EXTEN})`
+- PJSIP-эндпоинт `tg-bridge` **генерируется** из `simbridge.yaml`
+  (`scripts/generate_asterisk_config.py -p`; ручной `pjsip.conf.example`
+  убран — один механизм, Rule 1)
+- Userbot: обработчик «голого номера» (звонок из Telegram), клиент
+  bridge control API (loopback), эндпоинт `/events/call` для
+  локализованных сообщений об исходе исходящего звонка
+- Тайм-драйвер `simbridge-timeouts` (systemd timer, 5 s) — единственный
+  исполнитель out-of-band Telegram-ринга + reaper по max_call_seconds
 - Документация архитектуры в `docs/voice-bridge.md`
 
-**Чего нет:**
-- Программного моста (tg-bridge) между Telegram WebRTC и Asterisk SIP
-- Скрипта `notify-agent-agi.py` (отсутствует — нужен для уведомления agent'а о входящем звонке из dialplan)
-- Интеграции Telegram-клиента с call control (userbot ещё не вызывает call API для звонков)
+**Чего нет (MANUAL_VERIFY):**
+- Собранного бинарного моста: кандидат `blitss/sip-tg-bridge` — POC;
+  его control API нужно адаптировать/форкнуть под loopback-контракт
+  из `docs/voice-bridge.md` (§ Bridge Control API)
+- Live E2E на реальном модеме и Telegram-аккаунте (оба направления,
+  link-drop, двухузловой режим)
 
 ### 6.2 Выбранный кандидат для моста
 
@@ -895,16 +911,18 @@ asterisk -rx "dialplan reload"
 12. **Генератор Asterisk-глобалей** — из YAML в [globals] формат
 13. **Многомодемная абстракция** — ModemProvider, ModemPool, RoutingStrategy
 14. **Secret detection** — pre-commit хук, проверка при комите
-15. **Тесты** — 264 теста, все проходят
+15. **Тесты** — 469 passed / 6 skipped, все проходят
 
 ### Что НЕ реализовано
 
-1. **Live voice (голосовые звонки реального времени)** — API и state machine есть, но программный мост tg-bridge не интегрирован. Кандидат `blitss/sip-tg-bridge` требует тестирования.
-2. **notify-agent-agi.py** — скрипт отсутствует. Referenced в `extensions.conf.example` для уведомления agent'а о входящем звонке. Без него входящие звонки не могут быть маршрутизированы на Telegram.
-3. **Доставка SMS/voicemail в Telegram из http_server.py** — HTTP-сервер форматирует текст, но фактическая отправка через Telethon не интегрирована (TODO в коде: «This would call the Telethon client — wired via app state»)
-4. **/broadcast** — команда принимает текст, но реальная рассылка не реализована (TODO)
-5. **Приём голосовых заметок от пользователя** — обработчик регистрирован, но логика пустая (TODO)
-6. **Выходящие звонки из Telegram** — контекст `tg-bridge` в dialplan'е маршрутизирует на voicemail как заглушку
+1. **Медиа-мост live voice** — control plane (state machine, API,
+   dialplan, AGI, userbot-обработчики, тайм-драйвер) реализован, но
+   бинарный мост между Telegram WebRTC и Asterisk SIP — внешний
+   процесс: кандидат `blitss/sip-tg-bridge` (POC) нужно собрать и
+   адаптировать его control API под loopback-контракт
+   (`docs/voice-bridge.md`, § Bridge Control API). Live E2E — MANUAL_VERIFY.
+2. **Приём голосовых заметок от пользователя** — обработчик
+   регистрирован, но логика пустая (TODO в `userbot/userbot.py`)
 
 ### Допущения и упрощения
 

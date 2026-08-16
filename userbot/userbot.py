@@ -33,6 +33,7 @@ from core.blacklist import BlacklistManager
 from core.phone import normalize_e164
 from core.events import EventType
 from core.errors import SMSErrorType
+from userbot.bridge_control import BridgeControl
 
 logger = getLogger("simbridge.userbot")
 
@@ -40,6 +41,27 @@ logger = getLogger("simbridge.userbot")
 EXPLICIT_NUMBER_RE = re.compile(
     r"^(\+?\d[\d\s\-\(\)]{6,}\d)\s*:\s*(.+)?"
 )
+
+# S04.3: a message that IS a phone number (the entire text) is an
+# outgoing-call request. Mutually exclusive with EXPLICIT_NUMBER_RE:
+# the explicit form contains a colon, which is not in this charset.
+BARE_NUMBER_RE = re.compile(r"^\+?\d[\d\s\-()]{6,}\d$")
+
+
+def extract_call_request(text: Optional[str]) -> Optional[str]:
+    """Return the target number if *text* is a bare phone number, else
+    None. Pure function (S04.3): the whole message must be the number.
+
+    Known false positive: an 8+ digit numeric string (a PIN-like code)
+    matches and is treated as a call request — it simply rings that
+    number. Accepted trade-off, documented in voice-bridge.md.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if BARE_NUMBER_RE.match(stripped):
+        return stripped
+    return None
 
 
 class Userbot:
@@ -78,6 +100,9 @@ class Userbot:
         # Agent HTTP URL (for outgoing SMS)
         self._agent_url = f"http://{self.cfg['agent.listen']}"
         self._agent_token = os.environ.get(self.cfg["agent.token_env"], "")
+
+        # S04.3: voice bridge control API (loopback, same node)
+        self._bridge = BridgeControl(self.cfg)
 
         # Register handlers
         self._register_handlers()
@@ -238,6 +263,109 @@ class Userbot:
                 f"Рассылка: доставлено {len(sent)} из {len(recipients)}"
             )
 
+        @self._client.on(
+            events.NewMessage(
+                func=lambda e: extract_call_request(
+                    e.message.text or ""
+                )
+                is not None
+            )
+        )
+        async def handle_bare_number(evt):
+            """S04.3: a message that IS a phone number (e.g.
+            "+79261234555") is an outgoing-call request."""
+            sender_id = evt.sender_id if evt.sender_id else 0
+            phone = extract_call_request(evt.message.text or "")
+
+            # S04.3: ACL before any call session.
+            if not self._acl.check(sender_id, "out_call"):
+                self._audit.log(
+                    EventType.USER_DENIED,
+                    telegram_user_id=sender_id,
+                    outcome="denied",
+                    details={"right": "out_call", "command": "call"},
+                )
+                await evt.reply(SMSErrorType.DENIED.value)
+                return
+
+            norm = normalize_e164(phone)
+            if not norm:
+                await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
+                return
+
+            # S02.2 parity: a blacklisted target is not dialed.
+            if self._blacklist.contains(norm):
+                await evt.reply(SMSErrorType.BLACKLISTED.value)
+                return
+
+            # Register the call with the agent (ACL re-check + atomic
+            # modem reservation happen there).
+            cid = uuid.uuid4().hex
+            import httpx
+
+            try:
+                async with httpx.AsyncClient() as http:
+                    resp = await http.post(
+                        f"{self._agent_url}/v1/call/outgoing",
+                        json={
+                            "phone_number": norm,
+                            "telegram_user_id": sender_id,
+                        },
+                        headers={
+                            "Authorization": f"Bearer {self._agent_token}",
+                            "Content-Type": "application/json",
+                            "x-correlation-id": cid,
+                        },
+                        timeout=10.0,
+                    )
+            except httpx.HTTPError:
+                await evt.reply("Сервис звонков недоступен")
+                return
+
+            if resp.status_code == 403:
+                await evt.reply(SMSErrorType.BLACKLISTED.value)
+                return
+            if resp.status_code == 429:
+                await evt.reply("Слишком много звонков. Попробуйте позже.")
+                return
+            if resp.status_code == 503:
+                await evt.reply("Модем занят — другой звонок идёт.")
+                return
+            if resp.status_code >= 400:
+                await evt.reply(SMSErrorType.SEND_FAILED.value)
+                return
+
+            try:
+                call_id = resp.json().get("call_id", "")
+            except ValueError:
+                call_id = ""
+
+            # Ring the Telegram user through the bridge (S04.3). On
+            # failure: reject the agent-side call — the reserved modem
+            # must not sit in TELEGRAM_CALLING until the 30 s timeout.
+            if not await self._bridge.start_call(sender_id, norm):
+                try:
+                    async with httpx.AsyncClient() as http:
+                        await http.post(
+                            f"{self._agent_url}/v1/call/{call_id}/reject",
+                            headers={
+                                "Authorization": f"Bearer {self._agent_token}",
+                                "Content-Type": "application/json",
+                                "x-correlation-id": uuid.uuid4().hex,
+                            },
+                            timeout=10.0,
+                        )
+                except httpx.HTTPError as e:
+                    # The call will still expire via /call/check-timeouts
+                    # (TELEGRAM_CALLING window) — logged, not fatal.
+                    logger.warning(
+                        "bridge start failed and agent reject failed: %s", e
+                    )
+                await evt.reply("Ошибка: голосовой мост недоступен")
+                return
+
+            await evt.reply("Звоню вам в Telegram…")
+
         @self._client.on(events.NewMessage(func=lambda e: e.voice is not None))
         async def handle_voice_note(evt):
             """Handle incoming voice notes from Telegram."""
@@ -363,6 +491,8 @@ class Userbot:
                 help_text += "  /broadcast <message> — send to all\n"
                 help_text += "  /block <phone> — block number\n"
                 help_text += "  /unblock <phone> — unblock number\n"
+            if "out_call" in rights:
+                help_text += "  <phone> — voice call (send the number alone)\n"
             if "in_sms" in rights:
                 help_text += "  (incoming SMS forwarded automatically)\n"
 

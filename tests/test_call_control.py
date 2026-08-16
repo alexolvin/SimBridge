@@ -479,8 +479,9 @@ class TestCallRegistry:
         from datetime import datetime, timezone, timedelta
         call = registry.create_incoming(caller_number="+79261234555")
         registry.start_telegram_ring(call.call_id)
-        # Backdate the call to simulate timeout
-        call.created_at = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        # Backdate updated_at to simulate timeout — get_timed_out_calls
+        # measures elapsed time from the last state change, not creation.
+        call.updated_at = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
         timed_out = registry.get_timed_out_calls(ring_wait_seconds=24, max_call_seconds=1800)
         assert len(timed_out) == 1
         assert timed_out[0].call_id == call.call_id
@@ -493,8 +494,9 @@ class TestCallRegistry:
         registry.accept_incoming(call.call_id)
         registry.answer_gsm(call.call_id)
         registry.bridge_call(call.call_id)
-        # Backdate to simulate long call
-        call.created_at = (datetime.now(timezone.utc) - timedelta(seconds=2000)).isoformat()
+        # Backdate updated_at to simulate a long call (elapsed time is
+        # measured from the last state change — BRIDGED here).
+        call.updated_at = (datetime.now(timezone.utc) - timedelta(seconds=2000)).isoformat()
         timed_out = registry.get_timed_out_calls(ring_wait_seconds=24, max_call_seconds=1800)
         assert len(timed_out) == 1
 
@@ -503,6 +505,77 @@ class TestCallRegistry:
         call = registry.create_incoming(caller_number="+79261234555")
         timed_out = registry.get_timed_out_calls(ring_wait_seconds=24, max_call_seconds=1800)
         assert len(timed_out) == 0
+
+    # -- Outgoing Telegram-ring window (S04.3) --
+
+    def test_get_timed_out_calls_outgoing_telegram_window(self, registry):
+        """TELEGRAM_CALLING past tg_ring_seconds is timed out — the TG ring
+        is out-of-band, so the check-timeouts driver is the only enforcer."""
+        from datetime import datetime, timezone, timedelta
+        call = registry.create_outgoing(callee_number="+14155552671")
+        registry.start_telegram_calling(call.call_id)
+        assert call.state == CallState.TELEGRAM_CALLING
+        call.updated_at = (datetime.now(timezone.utc) - timedelta(seconds=45)).isoformat()
+        timed_out = registry.get_timed_out_calls(
+            ring_wait_seconds=24, max_call_seconds=1800, tg_ring_seconds=30)
+        assert len(timed_out) == 1
+        assert timed_out[0].call_id == call.call_id
+
+    def test_get_timed_out_calls_outgoing_modem_reserved_window(self, registry):
+        """MODEM_RESERVED past tg_ring_seconds is also timed out (the TG
+        invitation may have been sent but not yet confirmed)."""
+        from datetime import datetime, timezone, timedelta
+        call = registry.create_outgoing(callee_number="+14155552671")
+        assert call.state == CallState.MODEM_RESERVED
+        call.updated_at = (datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat()
+        timed_out = registry.get_timed_out_calls(
+            ring_wait_seconds=24, max_call_seconds=1800, tg_ring_seconds=30)
+        assert len(timed_out) == 1
+
+    def test_get_timed_out_calls_outgoing_within_window(self, registry):
+        """A fresh outgoing call is not timed out."""
+        call = registry.create_outgoing(callee_number="+14155552671")
+        registry.start_telegram_calling(call.call_id)
+        timed_out = registry.get_timed_out_calls(
+            ring_wait_seconds=24, max_call_seconds=1800, tg_ring_seconds=30)
+        assert len(timed_out) == 0
+
+    # -- fast_forward_bridged (S04.3 — single-event dialplan) --
+
+    def test_fast_forward_bridged_from_ringing(self, registry):
+        """Full chain from RINGING: the dialplan reports one end event, so
+        TELEGRAM_RINGING → TELEGRAM_ACCEPTED → GSM_ANSWERED → BRIDGED fire
+        as a chain."""
+        call = registry.create_incoming(caller_number="+79261234555")
+        assert registry.fast_forward_bridged(call.call_id) is True
+        assert registry.get(call.call_id).state == CallState.BRIDGED
+
+    def test_fast_forward_bridged_from_telegram_ringing(self, registry):
+        """Mid-chain (TG already rang): the chain starts at the current
+        state and still lands on BRIDGED."""
+        call = registry.create_incoming(caller_number="+79261234555")
+        registry.start_telegram_ring(call.call_id)
+        assert registry.fast_forward_bridged(call.call_id) is True
+        assert registry.get(call.call_id).state == CallState.BRIDGED
+
+    def test_fast_forward_bridged_idempotent(self, registry):
+        """A double POST of the dialplan end event is a no-op: an already
+        BRIDGED call fast-forwards to itself."""
+        call = registry.create_incoming(caller_number="+79261234555")
+        registry.fast_forward_bridged(call.call_id)
+        assert registry.fast_forward_bridged(call.call_id) is True
+        assert registry.get(call.call_id).state == CallState.BRIDGED
+
+    def test_fast_forward_bridged_unknown_call(self, registry):
+        assert registry.fast_forward_bridged("nonexistent") is False
+
+    def test_fast_forward_bridged_outgoing_call_rejected(self, registry):
+        """The chain is incoming-only: an outgoing call mid-flow does not
+        match any source state and must not be forced to BRIDGED."""
+        call = registry.create_outgoing(callee_number="+14155552671")
+        registry.start_telegram_calling(call.call_id)
+        assert registry.fast_forward_bridged(call.call_id) is False
+        assert registry.get(call.call_id).state == CallState.TELEGRAM_CALLING
 
     # -- Count/list --
 
@@ -620,6 +693,7 @@ class TestConfigGeneratorBridge:
             assert "BRIDGE_HOST=100.x.x.x" in result
             assert "BRIDGE_PORT=5062" in result
             assert "OUTBOUND_RING_TIMEOUT=30" in result
+            assert "OUTBOUND_GSM_RING_SECONDS=30" in result  # generator default
             assert "MAX_CALL_SECONDS=1800" in result
         finally:
             os.unlink(out)
@@ -644,12 +718,27 @@ class TestConfigGeneratorBridge:
 # =========================================================================
 
 class TestPjsipConfig:
-    """PJSIP config structure for tg-bridge."""
+    """PJSIP config structure for tg-bridge (S04.2).
+
+    The config is produced by scripts/generate_asterisk_config.py —
+    pjsip.conf.example was retired (Rule 1: the generator is the single
+    source of truth, and it embeds the per-installation bridge secret).
+    """
 
     @pytest.fixture(autouse=True)
-    def load_pjsip(self):
-        pjsip = Path(__file__).parent.parent / "asterisk" / "pjsip.conf.example"
-        self.pjsip = pjsip.read_text()
+    def load_pjsip(self, tmp_path):
+        from scripts.generate_asterisk_config import generate_pjsip
+
+        out = tmp_path / "pjsip.conf"
+        generate_pjsip(
+            {"voice": {"bridge_endpoint": "tg-bridge",
+                       "bridge_host": "127.0.0.1",
+                       "bridge_port": 5062}},
+            str(out),
+            bridge_secret="test-bridge-secret",
+            node_ip="",
+        )
+        self.pjsip = out.read_text()
 
     def test_endpoint_exists(self):
         assert "[tg-bridge]" in self.pjsip
@@ -669,6 +758,23 @@ class TestPjsipConfig:
 
     def test_dtmf_rfc2833(self):
         assert "dtmf_mode=rfc2833" in self.pjsip
+
+    def test_binds_loopback_in_single_node_mode(self):
+        """Single node: the bridge is local, so Asterisk binds 127.0.0.1."""
+        assert "bind=127.0.0.1" in self.pjsip
+
+    def test_no_external_media_addr_in_single_node_mode(self):
+        """Nothing to publish for loopback media."""
+        assert "external_media_addr" not in self.pjsip
+
+    def test_auth_credentials(self):
+        """Bidirectional userpass auth with the generated bridge secret."""
+        assert "auth_type=userpass" in self.pjsip
+        assert "username=tg-bridge" in self.pjsip
+        assert "password=test-bridge-secret" in self.pjsip
+
+    def test_aor_points_at_bridge(self):
+        assert "contact=sip:127.0.0.1:5062" in self.pjsip
 
 
 # =========================================================================
@@ -801,12 +907,27 @@ class TestDistributedMode:
 # =========================================================================
 
 class TestPjsipDistributed:
-    """PJSIP config for distributed mode (S04.4)."""
+    """PJSIP config for distributed mode (S04.4).
+
+    Same generator as TestPjsipConfig, with a remote bridge host and a
+    Tailscale node IP — the distributed differences (bind address,
+    external_media_addr) are what this class asserts.
+    """
 
     @pytest.fixture(autouse=True)
-    def load_pjsip(self):
-        pjsip = Path(__file__).parent.parent / "asterisk" / "pjsip.conf.example"
-        self.pjsip = pjsip.read_text()
+    def load_pjsip(self, tmp_path):
+        from scripts.generate_asterisk_config import generate_pjsip
+
+        out = tmp_path / "pjsip.conf"
+        generate_pjsip(
+            {"voice": {"bridge_endpoint": "tg-bridge",
+                       "bridge_host": "100.x.x.x",
+                       "bridge_port": 5062}},
+            str(out),
+            bridge_secret="test-bridge-secret",
+            node_ip="100.64.0.1",
+        )
+        self.pjsip = out.read_text()
 
     def test_local_net_tailscale(self):
         """local_net is set to Tailscale CGNAT range."""
@@ -816,13 +937,20 @@ class TestPjsipDistributed:
         """nat_option is configured for tailnet."""
         assert "nat_option=rtp" in self.pjsip
 
-    def test_external_media_addr_documented(self):
-        """external_media_addr is documented for distributed mode."""
-        assert "external_media_addr" in self.pjsip
+    def test_external_media_addr_published(self):
+        """external_media_addr publishes the Tailscale IP for remote RTP."""
+        assert "external_media_addr=100.64.0.1" in self.pjsip
 
     def test_no_srtp(self):
         """No SRTP transport configured — Tailscale already encrypts."""
-        assert "srtp" not in self.pjsip.lower() or "srtp" not in self.pjsip
+        assert "srtp" not in self.pjsip.lower()
+
+    def test_binds_all_interfaces_in_distributed_mode(self):
+        """The remote node's bridge must reach Asterisk over the tailnet."""
+        assert "bind=0.0.0.0" in self.pjsip
+
+    def test_aor_points_at_remote_bridge(self):
+        assert "contact=sip:100.x.x.x:5062" in self.pjsip
 
 
 # =========================================================================

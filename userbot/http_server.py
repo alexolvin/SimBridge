@@ -385,6 +385,82 @@ def create_http_server(
         )
         return {"ok": True, "notified": notified}
 
+    @app.post("/events/call")
+    async def handle_call_event(req: Request):
+        """Outgoing-call outcome from the agent (S04.3).
+
+        The agent reports the GSM leg's outcome for a Telegram-initiated
+        call and the userbot sends a separate localized message to the
+        user who placed it. The message goes ONLY to that user
+        (record.telegram_user_id) — a call outcome is personal.
+
+        Expected JSON body::
+
+            {"to": "+7...", "telegram_user_id": 123,
+             "status": "answered" | "no_answer" | "busy" | "failed",
+             "call_id": "..."}
+        """
+        received_secret = req.headers.get("x-simbridge-secret", "")
+        if not hmac.compare_digest(received_secret, secret):
+            raise HTTPException(status_code=401, detail="Invalid secret")
+
+        client_host = req.client.host if req.client else None
+        if allowed_peers and client_host not in allowed_peers:
+            raise HTTPException(status_code=403, detail="IP not allowed")
+
+        body = await req.json()
+        to = str(body.get("to", ""))
+        uid = int(body.get("telegram_user_id", 0) or 0)
+        status = str(body.get("status", ""))
+        call_id = str(body.get("call_id", ""))
+
+        # S04.3: separate localized messages per GSM outcome.
+        messages = {
+            "answered": f"Соединено с {to}",
+            "no_answer": f"Нет ответа: {to}",
+            "busy": f"Занято: {to}",
+            "failed": f"Ошибка сети: {to}",
+        }
+        text = messages.get(status)
+        if text is None:
+            logger.warning(
+                "call event with unknown status %r (call_id=%s)", status, call_id
+            )
+            audit.log(
+                EventType.CALL_HANGUP,
+                telegram_user_id=uid,
+                outcome="unknown_status",
+                correlation_id=call_id,
+                details={"to": to, "status": status},
+            )
+            return {"ok": True, "notified": False}
+
+        notified = False
+        if uid == 0:
+            # Caller unknown — audit only, no one to notify.
+            logger.info("call %s for %s: no caller to notify", status, to)
+        elif client is None:
+            logger.warning(
+                "call %s for user %s not notified — no client", status, uid
+            )
+        else:
+            try:
+                await client.send_message(uid, text)
+                notified = True
+            except Exception as e:
+                logger.warning(
+                    "failed to notify user %s of call %s: %s", uid, status, e
+                )
+
+        audit.log(
+            EventType.CALL_HANGUP,
+            telegram_user_id=uid,
+            outcome=status,
+            correlation_id=call_id,
+            details={"to": to, "notified": notified},
+        )
+        return {"ok": True, "notified": notified}
+
     @app.get("/health")
     async def health():
         return {"status": "ok"}

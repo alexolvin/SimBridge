@@ -180,6 +180,12 @@ _CONFIG_SCHEMA: list[_SchemaEntry] = [
     _SchemaEntry("voice.bridge_port", int),
     _SchemaEntry("voice.srtp", bool),
     _SchemaEntry("voice.outbound_answer_timeout", int),
+    # S04.3: max seconds the GSM number may ring on an outgoing call.
+    # Optional — pre-S04 configs validate as-is (generator defaults to 30).
+    _SchemaEntry("voice.outbound_gsm_ring_seconds", int, required=False),
+    # S04.3: loopback control API of the voice bridge (userbot node).
+    # Optional — pre-S04 configs validate as-is (userbot defaults to 5063).
+    _SchemaEntry("voice.bridge_control_port", int, required=False),
     # -- limits --
     _SchemaEntry("limits.sms_per_hour", int),
     _SchemaEntry("limits.calls_per_minute", int),

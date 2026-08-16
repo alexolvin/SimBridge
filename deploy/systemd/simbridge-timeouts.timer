@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the SimBridge call-timeout driver periodically
+
+[Timer]
+# The outgoing Telegram ring is out-of-band, so the 30 s answer window
+# needs a driver much tighter than the default 1 min timer accuracy —
+# AccuracySec must be lowered explicitly for the short period to hold.
+OnBootSec=30s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

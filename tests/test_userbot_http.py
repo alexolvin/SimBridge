@@ -9,6 +9,7 @@ Drives ``create_http_server()`` with a fake Telethon client and asserts:
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from core.acl import ACLManager
@@ -343,3 +344,151 @@ class TestEventsVoicemail:
         assert r.json()["delivered_to"] == [333]
         assert [uid for uid, _, _ in tg.files] == [333]
         assert audit.calls[0][1]["outcome"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# /events/call — S04.3 outgoing-call outcome notifications
+# ---------------------------------------------------------------------------
+
+class TestEventsCall:
+    def _post(self, client, **body):
+        return client.post(
+            "/events/call", json=body,
+            headers={"X-SimBridge-Secret": SECRET},
+        )
+
+    def test_wrong_secret_401(self, tmp_path):
+        client, _ = _make_env(tmp_path)
+        r = client.post(
+            "/events/call",
+            json={"to": "+14155552671", "telegram_user_id": 7,
+                  "status": "answered", "call_id": "c1"},
+            headers={"X-SimBridge-Secret": "bad"},
+        )
+        assert r.status_code == 401
+
+    @pytest.mark.parametrize("status,snippet", [
+        ("answered", "Соединено с "),
+        ("no_answer", "Нет ответа: "),
+        ("busy", "Занято: "),
+        ("failed", "Ошибка сети: "),
+    ])
+    def test_outcome_notifies_only_caller(self, tmp_path, status, snippet):
+        """S04.3: separate localized message per GSM outcome, going ONLY
+        to the user who placed the call."""
+        tg = FakeClient()
+        client, audit = _make_env(
+            tmp_path, client=tg,
+            acl_lines="7 in_sms\n8 in_sms\n",
+        )
+        r = self._post(
+            client, to="+14155552671", telegram_user_id=7,
+            status=status, call_id="c1",
+        )
+        assert r.status_code == 200
+        assert r.json()["notified"] is True
+        assert tg.sent == [(7, f"{snippet}+14155552671")]
+        etype, kw = audit.calls[0]
+        assert etype == EventType.CALL_HANGUP
+        assert kw["outcome"] == status
+        assert kw["telegram_user_id"] == 7
+        assert kw["correlation_id"] == "c1"
+        assert kw["details"] == {"to": "+14155552671", "notified": True}
+
+    def test_unknown_status_notified_false(self, tmp_path):
+        tg = FakeClient()
+        client, audit = _make_env(tmp_path, client=tg, acl_lines="7 in_sms\n")
+        r = self._post(
+            client, to="+14155552671", telegram_user_id=7,
+            status="weird", call_id="c1",
+        )
+        assert r.status_code == 200
+        assert r.json()["notified"] is False
+        assert tg.sent == []
+        assert audit.calls[0][1]["outcome"] == "unknown_status"
+
+    def test_uid_zero_notifies_noone(self, tmp_path):
+        """Caller unknown (uid 0) — audit only (S04.3)."""
+        tg = FakeClient()
+        client, audit = _make_env(tmp_path, client=tg, acl_lines="")
+        r = self._post(
+            client, to="+14155552671", telegram_user_id=0,
+            status="answered", call_id="c1",
+        )
+        assert r.json()["notified"] is False
+        assert tg.sent == []
+        assert audit.calls[0][1]["outcome"] == "answered"
+
+    def test_no_client_wired_not_notified(self, tmp_path):
+        client, audit = _make_env(tmp_path, client=None)
+        r = self._post(
+            client, to="+14155552671", telegram_user_id=7,
+            status="answered", call_id="c1",
+        )
+        assert r.status_code == 200
+        assert r.json()["notified"] is False
+        assert audit.calls[0][1]["details"]["notified"] is False
+
+    def test_send_failure_swallowed(self, tmp_path):
+        """A notification failure must not 500 the endpoint (best-effort
+        by contract — the agent already logged the outcome)."""
+        tg = FakeClient(fail_for={7})
+        client, audit = _make_env(tmp_path, client=tg, acl_lines="7 in_sms\n")
+        r = self._post(
+            client, to="+14155552671", telegram_user_id=7,
+            status="no_answer", call_id="c1",
+        )
+        assert r.status_code == 200
+        assert r.json()["notified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Bare-number call request (S04.3) — the userbot-side entry point
+# ---------------------------------------------------------------------------
+
+# userbot.userbot imports telethon at module level; the functions under
+# test (BARE_NUMBER_RE / extract_call_request) are pure and do not need
+# it. A stub module satisfies the import without installing telethon.
+import sys  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+if "telethon" not in sys.modules:
+    sys.modules["telethon"] = MagicMock(name="telethon")
+
+from userbot.userbot import extract_call_request  # noqa: E402
+
+
+class TestExtractCallRequest:
+    @pytest.mark.parametrize("text", [
+        "+79261234555",
+        "79261234555",
+        "+14155552671",
+        "  +79261234555  ",           # surrounding whitespace is stripped
+        "+7 (926) 123-45-55",         # spaces / parens / dashes
+        "+7-926-123-45-55",
+    ])
+    def test_bare_number_is_a_call_request(self, text):
+        assert extract_call_request(text) == text.strip()
+
+    def test_pin_like_code_is_a_false_positive(self):
+        """Documented trade-off (voice-bridge.md): an 8-digit numeric
+        string matches and rings that number. Pinned here so the
+        behavior change, if ever decided, is a conscious edit."""
+        assert extract_call_request("12345678") == "12345678"
+
+    @pytest.mark.parametrize("text", [
+        None,
+        "",
+        "   ",
+        "привет",
+        "+79261234555: hi",            # explicit-SMS form, not a call
+        "+79261234555: hi there",
+        "1234567",                     # 7 digits — below the 8-digit floor
+        "+1234567",
+        "123456789 extra",             # text after the number
+        "+79261234555@telegram",       # non-charset chars break the match
+        "12.345.678",
+        "тел: +79261234555",
+    ])
+    def test_not_a_bare_number(self, text):
+        assert extract_call_request(text) is None

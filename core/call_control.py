@@ -119,14 +119,23 @@ _OUTGOING_TRANSITIONS: Dict[CallState, List[CallState]] = {
         CallState.REJECTED,
         CallState.TELEGRAM_TIMEOUT,
     ],
-    CallState.USER_ACCEPTED: [CallState.GSM_DIALING],
+    # S04.3: HANGUP from the pre-bridge states — the caller (or the user,
+    # before the GSM leg answers) can hang up at any point, and the module
+    # docstring promises symmetric hangup on both paths.
+    CallState.USER_ACCEPTED: [CallState.GSM_DIALING, CallState.HANGUP],
     CallState.GSM_DIALING: [
         CallState.GSM_RINGING,
         CallState.GSM_BUSY,
         CallState.GSM_NO_ANSWER,
         CallState.GSM_ERROR,
+        CallState.HANGUP,
     ],
-    CallState.GSM_RINGING: [CallState.CONNECTED, CallState.GSM_NO_ANSWER, CallState.GSM_ERROR],
+    CallState.GSM_RINGING: [
+        CallState.CONNECTED,
+        CallState.GSM_NO_ANSWER,
+        CallState.GSM_ERROR,
+        CallState.HANGUP,
+    ],
     CallState.CONNECTED: [CallState.BRIDGED, CallState.HANGUP],
     CallState.BRIDGED: [CallState.HANGUP],
     CallState.HANGUP: [CallState.CLEANUP],
@@ -487,6 +496,34 @@ class CallRegistry:
         """
         return self.transition(call_id, CallState.BRIDGED)
 
+    def fast_forward_bridged(self, call_id: str) -> bool:
+        """Fast-forward an incoming call to BRIDGED.
+
+        The dialplan reports call end in a single event (Dial returns with
+        a DIALSTATUS), so when the answer is confirmed the intermediate
+        states (TELEGRAM_RINGING → TELEGRAM_ACCEPTED → GSM_ANSWERED →
+        BRIDGED) are applied as a chain. Each step only fires from the
+        expected source state, so the call may already be partway through
+        (e.g. TELEGRAM_RINGING). Returns True if the call ended up BRIDGED.
+        """
+        with self._lock:
+            call = self._calls.get(call_id)
+            if not call:
+                return False
+            steps = [
+                (CallState.RINGING, CallState.TELEGRAM_RINGING),
+                (CallState.TELEGRAM_RINGING, CallState.TELEGRAM_ACCEPTED),
+                (CallState.TELEGRAM_ACCEPTED, CallState.GSM_ANSWERED),
+                (CallState.GSM_ANSWERED, CallState.BRIDGED),
+            ]
+            for src, dst in steps:
+                if call.state == src:
+                    try:
+                        call.transition(dst)
+                    except InvalidTransition:
+                        return False
+            return call.state == CallState.BRIDGED
+
     def hangup(self, call_id: str, reason: Optional[str] = None) -> bool:
         """Transition to HANGUP. Optionally record the reason."""
         ok = self.transition(call_id, CallState.HANGUP)
@@ -584,13 +621,25 @@ class CallRegistry:
     # -- Timeout/duration checking --
 
     def get_timed_out_calls(
-        self, ring_wait_seconds: int, max_call_seconds: int
+        self,
+        ring_wait_seconds: int,
+        max_call_seconds: int,
+        tg_ring_seconds: int = 30,
     ) -> List[CallMachine]:
         """Return calls that have exceeded their timeout.
 
         Checks:
-        - Ringing calls that exceeded ring_wait_seconds
+        - Incoming ringing calls (RINGING/TELEGRAM_RINGING) that exceeded
+          ring_wait_seconds
+        - Outgoing calls awaiting Telegram accept (MODEM_RESERVED/
+          TELEGRAM_CALLING) that exceeded tg_ring_seconds — the Telegram
+          ring is out-of-band (no dialplan Dial enforces it), so the
+          check-timeouts driver is the only enforcement
         - Bridged calls that exceeded max_call_seconds
+
+        Elapsed time is measured from ``updated_at`` (entry into the
+        current state), so max_call_seconds counts call duration from
+        bridging, not from call creation.
         """
         now = datetime.now(timezone.utc)
         timed_out = []
@@ -600,13 +649,21 @@ class CallRegistry:
                 if call.is_terminal:
                     continue
                 try:
-                    created = datetime.fromisoformat(call.created_at)
-                    elapsed = (now - created).total_seconds()
+                    since = datetime.fromisoformat(
+                        call.updated_at or call.created_at
+                    )
+                    elapsed = (now - since).total_seconds()
                 except (ValueError, TypeError):
                     continue
 
                 if call.state in (CallState.RINGING, CallState.TELEGRAM_RINGING):
                     if elapsed > ring_wait_seconds:
+                        timed_out.append(call)
+                elif call.state in (
+                    CallState.MODEM_RESERVED,
+                    CallState.TELEGRAM_CALLING,
+                ):
+                    if elapsed > tg_ring_seconds:
                         timed_out.append(call)
                 elif call.state == CallState.BRIDGED:
                     if elapsed > max_call_seconds:

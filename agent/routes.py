@@ -98,11 +98,33 @@ class BlockResponse(BaseModel):
 class CallRequest(BaseModel):
     phone_number: str = Field(..., description="Phone number (E.164)")
     contact_name: Optional[str] = Field(None, description="Display name")
+    gsm_channel_id: Optional[str] = Field(
+        None, description="Asterisk channel name of the GSM leg (from AGI env)"
+    )
 
 
 class OutgoingCallRequest(BaseModel):
     phone_number: str = Field(..., description="Destination (E.164)")
     telegram_user_id: Optional[int] = Field(None, description="Sender for ACL")
+
+
+class CallCompleteRequest(BaseModel):
+    status: str = Field(
+        ...,
+        description=(
+            "Final leg outcome: answered | no_answer | busy | cancelled | "
+            "ended | failed (mapped from DIALSTATUS by the AGI)"
+        ),
+    )
+    dialstatus: Optional[str] = Field(
+        None, description="Raw DIALSTATUS from the dialplan (diagnostics)"
+    )
+
+
+class OutgoingAcceptedRequest(BaseModel):
+    bridge_channel_id: str = Field(
+        "", description="Asterisk channel name of the bridge INVITE leg"
+    )
 
 
 class CallResponse(BaseModel):
@@ -438,6 +460,47 @@ async def _notify_userbot_delivery(
         logger.warning("userbot delivery notification failed: %s", e)
 
 
+async def _notify_userbot_call(cfg, *, call, status: str) -> None:
+    """Announce an outgoing call outcome to the userbot (best effort).
+
+    The userbot sends a separate localized message to the calling user
+    (S04.3: answered / no_answer / busy / failed). Any failure is logged
+    and swallowed — a call outcome must never fail because the
+    notification did.
+    """
+    import httpx
+
+    try:
+        url = cfg["agent.userbot_url"].rstrip("/") + "/events/call"
+        secret = os.environ.get(
+            cfg.get("userbot_http.secret_env", "SIMBRIDGE_HTTP_SECRET"), ""
+        )
+    except KeyError:
+        logger.warning("call notification skipped: config incomplete")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(
+                url,
+                json={
+                    "to": call.callee_number,
+                    "telegram_user_id": call.telegram_user_id,
+                    "status": status,
+                    "call_id": call.call_id,
+                },
+                headers={"X-SimBridge-Secret": secret},
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "userbot call notification rejected: %s %s",
+                resp.status_code,
+                resp.text[:120],
+            )
+    except Exception as e:
+        logger.warning("userbot call notification failed: %s", e)
+
+
 @router.get("/modems", response_model=list[ModemInfo])
 async def get_modems(
     ami: AMIClient = Depends(get_ami),
@@ -471,16 +534,22 @@ async def call_incoming(
 
     S04.3: The GSM channel is NOT answered — the caller hears real ringback
     while we ring Telegram. The user must accept before we answer the GSM leg.
+
+    Stage 04: the dialplan rings the bridge on the very next line, so the
+    TELEGRAM_RINGING transition happens here (one logical step — there is
+    no decision between the two and no separate telegram-ring event).
     """
     call = registry.create_incoming(
         caller_number=req.phone_number,
         caller_name=req.contact_name,
+        gsm_channel_id=req.gsm_channel_id,
     )
+    registry.start_telegram_ring(call.call_id)
     audit.log(
         EventType.CALL_INCOMING,
         outcome="ok",
         correlation_id=call.call_id,
-        details={"from": req.phone_number},
+        details={"from": req.phone_number, "gsm_channel": req.gsm_channel_id},
     )
     return CallResponse(
         call_id=call.call_id,
@@ -550,6 +619,11 @@ async def call_outgoing(
         )
     except ModemBusyError:
         raise HTTPException(status_code=503, detail="Modem busy — another call in progress")
+    # S04.3: the userbot starts the Telegram ring via the bridge control
+    # API immediately after this response. Mark the ring as started now —
+    # the Telegram ring is out-of-band (no dialplan Dial enforces it), so
+    # /call/check-timeouts is the only thing that can expire it.
+    registry.start_telegram_calling(call.call_id)
     audit.log(
         EventType.CALL_OUTGOING,
         telegram_user_id=req.telegram_user_id,
@@ -564,6 +638,281 @@ async def call_outgoing(
         callee_number=call.callee_number,
         direction=call.direction,
     )
+
+
+@router.post("/call/outgoing/accepted", response_model=CallStateResponse)
+async def call_outgoing_accepted(
+    req: OutgoingAcceptedRequest,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """The Telegram user accepted an outgoing call; the bridge INVITEd us.
+
+    S04.3: Outgoing. The bridge (UAC side) delivers the accept as a SIP
+    INVITE with the target number as the Request-URI user; the [tg-bridge]
+    dialplan calls this before dialing the Dongle. A 404 (call already
+    expired by the TG ring timeout) leaves the AGI's CALL_ID unset, which
+    gates the GSM dial (nocal) — no stray call to the target.
+    """
+    with registry._lock:
+        pending = [
+            c for c in registry._calls.values()
+            if c.direction == "outgoing"
+            and c.state in (CallState.MODEM_RESERVED, CallState.TELEGRAM_CALLING)
+        ]
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending outgoing call")
+    if len(pending) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ambiguous: {len(pending)} pending outgoing calls",
+        )
+    call = pending[0]
+    if call.state == CallState.MODEM_RESERVED:
+        registry.start_telegram_calling(call.call_id)
+    if req.bridge_channel_id:
+        registry.set_bridge_leg(call.call_id, req.bridge_channel_id)
+    if not registry.user_accepted(call.call_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot accept — call is in {call.state.value} state",
+        )
+    if not registry.dial_gsm(call.call_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot dial GSM — call is in {call.state.value} state",
+        )
+    audit.log(
+        EventType.CALL_ACCEPTED,
+        telegram_user_id=call.telegram_user_id,
+        correlation_id=call.call_id,
+        outcome="ok",
+        details={
+            "to": call.callee_number,
+            "direction": "outgoing",
+            "bridge_channel": req.bridge_channel_id,
+        },
+    )
+    return CallStateResponse(
+        call_id=call.call_id,
+        state=call.state.value,
+        direction=call.direction,
+    )
+
+
+@router.post("/call/{call_id}/complete")
+async def call_complete(
+    call_id: str,
+    req: CallCompleteRequest,
+    request: Request,
+    registry: CallRegistry = Depends(get_call_registry),
+    ami: AMIClient = Depends(get_ami),
+    audit: AuditLogger = Depends(get_audit),
+):
+    """Report the final outcome of a call leg from the dialplan (S04.3).
+
+    Dial() blocks for the whole call and returns a final DIALSTATUS, so
+    the dialplan reports outcomes in one or two events (s-exten with the
+    mapped status, h-exten with explicit ENDED). The second POST hits a
+    terminal state and gets 404 — the AGI treats that as a no-op.
+    """
+    call = registry.get(call_id)
+    if not call or call.is_terminal:
+        raise HTTPException(
+            status_code=404, detail="Call not found or already closed"
+        )
+
+    cfg = get_cfg(request)
+
+    # --- BRIDGED (either direction): the call is ending ---
+    if call.state == CallState.BRIDGED:
+        if req.status == "answered":
+            raise HTTPException(status_code=409, detail="Call already bridged")
+        # ended / cancelled / failed: terminate any surviving leg
+        # (no-op if the dialplan's hanguptree already did it) and close.
+        for channel_id in call.get_active_channel_ids():
+            try:
+                await ami.hangup_channel(channel_id, reason="BYE")
+            except Exception as e:
+                audit.log(
+                    EventType.CALL_HANGUP,
+                    correlation_id=call_id,
+                    outcome="partial_hangup",
+                    details={"error": str(e), "channel": channel_id},
+                )
+        registry.hangup(
+            call_id,
+            reason="completed" if req.status == "ended" else req.status,
+        )
+        audit.log(
+            EventType.CALL_HANGUP,
+            telegram_user_id=call.telegram_user_id,
+            correlation_id=call_id,
+            outcome=req.status,
+            details={
+                "direction": call.direction,
+                "dialstatus": req.dialstatus,
+            },
+        )
+        registry.cleanup(call_id)
+        return {"ok": True, "call_id": call_id, "state": "cleanup"}
+
+    # --- INCOMING (GSM -> Telegram) ---
+    if call.direction == "incoming":
+        if req.status == "answered":
+            # The TG user accepted and the call ran to its end (Dial
+            # returned ANSWERED). Fast-forward the intermediate states;
+            # no cleanup — the channel is still alive until the
+            # dialplan hangs up; the h-exten reports ENDED (above).
+            if not registry.fast_forward_bridged(call_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot bridge — call is in {call.state.value} state",
+                )
+            call = registry.get(call_id)
+            audit.log(
+                EventType.CALL_BRIDGED,
+                correlation_id=call_id,
+                outcome="ok",
+                details={
+                    "gsm_channel": call.gsm_channel_id,
+                    "bridge_channel": call.bridge_channel_id,
+                },
+            )
+        elif req.status == "no_answer":
+            # Telegram ring timed out (Dial returned NOANSWER); the
+            # dialplan now takes the voicemail branch.
+            if not registry.fallback_to_voicemail(call_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot fall back to voicemail — call is in "
+                        f"{call.state.value} state"
+                    ),
+                )
+            audit.log(
+                EventType.CALL_TELEGRAM_TIMEOUT,
+                correlation_id=call_id,
+                outcome="voicemail_fallback",
+                details={"from": call.caller_number},
+            )
+            registry.cleanup(call_id)
+        elif req.status == "busy":
+            # TG user explicitly rejected (bridge returned 486/403).
+            if not registry.reject(call_id, reason="telegram_rejected"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot reject — call is in {call.state.value} state",
+                )
+            audit.log(
+                EventType.CALL_REJECTED,
+                correlation_id=call_id,
+                outcome="telegram_rejected",
+                details={"from": call.caller_number},
+            )
+            registry.cleanup(call_id)
+        else:
+            # cancelled (the GSM caller hung up, or the TG user hung up
+            # while ringing) or failed (the bridge leg itself failed,
+            # e.g. bridge down) — close, no voicemail.
+            reason = (
+                "caller_hangup"
+                if req.status == "cancelled"
+                else f"bridge_{req.dialstatus or 'failed'}"
+            )
+            if not registry.hangup(call_id, reason=reason):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot hangup — call is in {call.state.value} state",
+                )
+            audit.log(
+                EventType.CALL_HANGUP,
+                correlation_id=call_id,
+                outcome=req.status,
+                details={
+                    "from": call.caller_number,
+                    "dialstatus": req.dialstatus,
+                },
+            )
+            registry.cleanup(call_id)
+
+    # --- OUTGOING (Telegram -> GSM) ---
+    else:
+        if req.status == "answered":
+            # Dial(Dongle) returned ANSWERED = the target answered and
+            # the call ran. Fast-forward to BRIDGED; no cleanup — the
+            # SIP leg is alive until the TG user hangs up (h-exten
+            # reports ENDED).
+            if not (
+                registry.gsm_ringing(call_id)
+                and registry.gsm_connected(call_id)
+                and registry.bridge_call(call_id)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot bridge — call is in {call.state.value} state",
+                )
+            call = registry.get(call_id)
+            audit.log(
+                EventType.CALL_BRIDGED,
+                telegram_user_id=call.telegram_user_id,
+                correlation_id=call_id,
+                outcome="ok",
+                details={"to": call.callee_number},
+            )
+            await _notify_userbot_call(cfg, call=call, status="answered")
+        elif req.status in ("no_answer", "busy", "failed"):
+            # The GSM dial failed — a separate localized message to the
+            # user (S04.3), then cleanup.
+            if req.status == "no_answer":
+                ok = registry.gsm_no_answer(call_id)
+            elif req.status == "busy":
+                ok = registry.gsm_busy(call_id)
+            else:
+                ok = registry.gsm_error(
+                    call_id, reason=req.dialstatus or "network_error"
+                )
+            if not ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot record {req.status} — call is in "
+                        f"{call.state.value} state"
+                    ),
+                )
+            audit.log(
+                EventType.CALL_HANGUP,
+                telegram_user_id=call.telegram_user_id,
+                correlation_id=call_id,
+                outcome=req.status,
+                details={
+                    "to": call.callee_number,
+                    "dialstatus": req.dialstatus,
+                },
+            )
+            call = registry.get(call_id)
+            await _notify_userbot_call(cfg, call=call, status=req.status)
+            registry.cleanup(call_id)
+        else:
+            # cancelled / ended: the TG user hung up while the GSM leg
+            # was dialing (channel death) — close. No notification: the
+            # user ended the call themselves.
+            if not registry.hangup(call_id, reason="telegram_hangup"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot hangup — call is in {call.state.value} state",
+                )
+            audit.log(
+                EventType.CALL_HANGUP,
+                telegram_user_id=call.telegram_user_id,
+                correlation_id=call_id,
+                outcome=req.status,
+                details={"to": call.callee_number},
+            )
+            registry.cleanup(call_id)
+
+    return {"ok": True, "call_id": call_id}
 
 
 @router.post("/call/{call_id}/accept", response_model=CallStateResponse)
@@ -844,17 +1193,32 @@ async def call_set_gsm_channel(
 async def call_check_timeouts(
     request: Request,
     registry: CallRegistry = Depends(get_call_registry),
+    ami: AMIClient = Depends(get_ami),
     cfg: dict = Depends(get_cfg),
     audit: AuditLogger = Depends(get_audit),
 ):
-    """Check for calls that have exceeded ring_wait or max_call_seconds.
+    """Check for calls that exceeded their timeout window.
 
-    S04.3: Fallback to voicemail on ring timeout.
+    S04.3:
+    - Incoming ring timeout -> voicemail fallback. Backstop: the
+      dialplan Dial timeout normally handles this; this catches calls
+      whose dialplan event was lost.
+    - Outgoing Telegram ring timeout -> TELEGRAM_TIMEOUT + user
+      notified. The Telegram ring is out-of-band (no dialplan Dial
+      enforces it), so THIS driver is the only enforcement. No channel
+      exists yet to hang up (the bridge has not INVITEd); a late accept
+      later hits a 404 at /call/outgoing/accepted (nocal gate).
+    - Bridged calls past max_call_seconds -> hangup both legs via AMI.
+      Hanging either leg cascades (Dial's hanguptree / ast_dial_destroy
+      tears down the other).
     """
     ring_wait = cfg.get("asterisk", {}).get("ring_wait_seconds", 24)
     max_call = cfg.get("limits", {}).get("max_call_seconds", 1800)
+    tg_ring = cfg.get("voice", {}).get("outbound_answer_timeout", 30)
 
-    timed_out = registry.get_timed_out_calls(ring_wait, max_call)
+    timed_out = registry.get_timed_out_calls(
+        ring_wait, max_call, tg_ring_seconds=tg_ring
+    )
     handled: list[dict] = []
 
     for call in timed_out:
@@ -866,11 +1230,47 @@ async def call_check_timeouts(
                 outcome="voicemail_fallback",
                 details={"from": call.caller_number},
             )
+            # The dialplan is self-contained (its CALL_ID is a channel
+            # variable; h-exten's ENDED report hits a 404 no-op), so the
+            # record is no longer needed — same as the /complete path.
+            # Without this every lost-event call leaks one entry forever.
+            registry.cleanup(call.call_id)
             handled.append({"call_id": call.call_id, "action": "voicemail"})
+        elif call.state in (CallState.MODEM_RESERVED, CallState.TELEGRAM_CALLING):
+            registry.telegram_timeout(call.call_id)
+            audit.log(
+                EventType.CALL_TELEGRAM_TIMEOUT,
+                telegram_user_id=call.telegram_user_id,
+                correlation_id=call.call_id,
+                outcome="no_answer",
+                details={"to": call.callee_number},
+            )
+            await _notify_userbot_call(cfg, call=call, status="no_answer")
+            registry.cleanup(call.call_id)
+            handled.append({"call_id": call.call_id, "action": "telegram_timeout"})
         elif call.state == CallState.BRIDGED:
+            # AMI hangup of each active leg, then close the call in the
+            # registry — the state transition does NOT depend on the AMI
+            # result: if Asterisk is dead there is no channel left for
+            # h-exten to report, and a retry loop would hold the modem
+            # reservation forever. If a hangup fails against a LIVE
+            # Asterisk, the leg self-heals (user hangup / rtptimeout=60)
+            # and the dialplan's h-exten ENDED then hits the terminal
+            # state as a 404 no-op.
+            for channel_id in call.get_active_channel_ids():
+                try:
+                    await ami.hangup_channel(channel_id, reason="max_duration")
+                except Exception as e:
+                    audit.log(
+                        EventType.CALL_HANGUP,
+                        correlation_id=call.call_id,
+                        outcome="partial_hangup",
+                        details={"error": str(e), "channel": channel_id},
+                    )
             registry.hangup(call.call_id, reason="max_duration_exceeded")
             audit.log(
                 EventType.CALL_DURATION_EXPIRED,
+                telegram_user_id=call.telegram_user_id,
                 correlation_id=call.call_id,
                 outcome="max_duration",
             )

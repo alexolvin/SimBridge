@@ -1,23 +1,41 @@
 #!/usr/bin/env python3
-"""AGI script: notify simbridge-agent about call events (S04 flow).
+"""AGI script: notify simbridge-agent about call events (Stage 04).
 
-Called from extensions.conf (dialplan) via AGI() when an incoming call
-is registered with the agent or when GSM dialing starts/fails. User
-data (caller number, channel ID) arrives as AGI arguments (argv) — no
-shell is involved (P0-3).
+Called from extensions.conf via AGI() at three points:
 
-Usage in dialplan:
-    AGI(notify-agent-agi.py,incoming,+7XXXXXXXXXX,channel-uniqueid)
-    AGI(notify-agent-agi.py,gsm-dialing,+7XXXXXXXXXX,channel-uniqueid)
+    AGI(notify-agent-agi.py,incoming,${CALLER})
+    AGI(notify-agent-agi.py,outgoing-accepted)
+    AGI(notify-agent-agi.py,complete,${DIALSTATUS})   ; or ,complete,ENDED in dead mode
 
-S04.3: incoming call flow — the GSM channel is NOT answered until the
-Telegram user accepts. This script registers the call with the agent
-API so the userbot can start ringing Telegram.
+Events:
+  incoming           register an incoming call with the agent
+                     (POST /v1/call/incoming); on success sets the
+                     CALL_ID channel variable for the later complete
+                     event.
+  outgoing-accepted  the Telegram user accepted an outgoing call and
+                     the bridge INVITEd this node
+                     (POST /v1/call/outgoing/accepted); on success
+                     sets CALL_ID, which gates the GSM dial. A 404
+                     (call already expired by the TG ring timeout)
+                     leaves CALL_ID unset -> the dialplan skips the
+                     GSM dial.
+  complete           the call leg ended. The argument is either a raw
+                     DIALSTATUS (live s-exten — Dial blocked for the
+                     whole call, so the status is final) or the
+                     literal ENDED (dead-mode h-exten, where
+                     DIALSTATUS is stale). Reports
+                     POST /v1/call/<CALL_ID>/complete; a 404 there
+                     (already terminal — expected double-POST from
+                     s-exten + h-exten) is a no-op.
 
-Security: the agent URL and auth token come from the process
-environment (AGENT_URL, SIMBRIDGE_AGENT_TOKEN — inherited from
-/etc/simbridge/env via the Asterisk systemd drop-in). Secrets never
-traverse the dialplan — channel variables are visible via AMI/CLI.
+The agent URL and auth token come from the process environment
+(AGENT_URL, SIMBRIDGE_AGENT_TOKEN — inherited from /etc/simbridge/env
+via the Asterisk systemd drop-in). Secrets never traverse the dialplan
+— channel variables are visible via AMI/CLI. User data (caller number)
+arrives as AGI arguments (argv) — no shell is involved (P0-3). The
+channel identity (ASTERAISK_CHANNEL from the AGI environment) is passed
+in the JSON payloads so the agent can AMI-hangup the right channel when
+enforcing the call duration limit.
 
 Stdlib only — runs under Asterisk's system python3 (no venv
 dependency). A failed agent call must not wedge the dialplan: the
@@ -37,6 +55,18 @@ AGENT_URL_ENV = "AGENT_URL"
 AGENT_TOKEN_ENV = "SIMBRIDGE_AGENT_TOKEN"
 DEFAULT_URL = "http://127.0.0.1:8090"
 TIMEOUT = 5.0
+
+# Dial() returns with a final DIALSTATUS for the whole call (it blocks
+# until the call ends, not on answer). The dead-mode h-exten passes the
+# literal ENDED instead, because DIALSTATUS is stale there.
+DIALSTATUS_TO_STATUS = {
+    "ANSWERED": "answered",
+    "NOANSWER": "no_answer",
+    "BUSY": "busy",
+    "CANCEL": "cancelled",
+    "": "ended",
+    "ENDED": "ended",
+}
 
 
 def _log(msg: str) -> None:
@@ -68,6 +98,19 @@ def read_agi_env() -> dict[str, str]:
     return env
 
 
+def agi_get_variable(name: str) -> str:
+    """GET VARIABLE <name>; return the value ("" if unset).
+
+    Dead-safe: res/res_agi.c serves GET VARIABLE on hungup channels.
+    """
+    _write(f"GET VARIABLE {name}")
+    line = sys.stdin.readline().strip()
+    if line.startswith("200"):
+        return line[3:].strip()
+    _log(f"WARNING: GET VARIABLE {name} -> {line!r}")
+    return ""
+
+
 def post_json(url: str, token: str, path: str, payload: dict) -> tuple[int, dict, str]:
     """POST JSON to *url*+*path*; return (status, body, error detail)."""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -88,22 +131,25 @@ def post_json(url: str, token: str, path: str, payload: dict) -> tuple[int, dict
 
 
 def main() -> None:
-    read_agi_env()
+    env = read_agi_env()
 
-    if len(sys.argv) < 3:
-        _respond("error=usage: notify-agent-agi.py <event> <phone> [channel_id]")
+    if len(sys.argv) < 2:
+        _respond("error=usage: notify-agent-agi.py <event> [arg]")
         sys.exit(1)
 
-    event = sys.argv[1]  # "incoming", "gsm-dialing", "gsm-busy", "gsm-no-answer"
-    phone = sys.argv[2]
+    event = sys.argv[1]  # "incoming", "outgoing-accepted", "complete"
 
     agent_url = os.environ.get(AGENT_URL_ENV, DEFAULT_URL)
     agent_token = os.environ.get(AGENT_TOKEN_ENV, "")
+    channel = env.get("ASTERAISK_CHANNEL", "")
 
     if event == "incoming":
+        if len(sys.argv) < 3:
+            _respond("error=usage: notify-agent-agi.py incoming <phone>")
+            sys.exit(1)
         status, data, detail = post_json(
             agent_url, agent_token, "/v1/call/incoming",
-            {"phone_number": phone},
+            {"phone_number": sys.argv[2], "gsm_channel_id": channel},
         )
         if status == 200:
             call_id = str(data.get("call_id", ""))
@@ -114,10 +160,49 @@ def main() -> None:
         else:
             _log(f"ERROR: agent /v1/call/incoming failed: {detail} (status={status})")
             _respond(f"error={detail}")
-    elif event in ("gsm-dialing", "gsm-busy", "gsm-no-answer"):
-        # Outcome events: the call is already registered with the agent
-        # (created by the userbot when the user requested the call).
-        _respond(f"ok event={event}")
+
+    elif event == "outgoing-accepted":
+        status, data, detail = post_json(
+            agent_url, agent_token, "/v1/call/outgoing/accepted",
+            {"bridge_channel_id": channel},
+        )
+        if status == 200:
+            call_id = str(data.get("call_id", ""))
+            if call_id:
+                _write(f"SET VARIABLE CALL_ID {call_id}")
+                sys.stdin.readline()
+            _respond("accepted")
+        elif status == 404:
+            # The call already expired (TG ring timeout with a late
+            # accept) — leave CALL_ID unset so the dialplan skips the
+            # GSM dial (nocal gate).
+            _log("outgoing call not found (expired?) — not dialing")
+            _respond("skipped=not_found")
+        else:
+            _log(f"ERROR: agent /v1/call/outgoing/accepted failed: {detail} (status={status})")
+            _respond(f"error={detail}")
+
+    elif event == "complete":
+        raw = sys.argv[2] if len(sys.argv) > 2 else ""
+        status_name = DIALSTATUS_TO_STATUS.get(raw, "failed")
+        call_id = agi_get_variable("CALL_ID")
+        if not call_id:
+            _respond("skipped=no_call_id")
+            return
+        status, data, detail = post_json(
+            agent_url, agent_token,
+            f"/v1/call/{call_id}/complete",
+            {"status": status_name, "dialstatus": raw},
+        )
+        if status in (200, 404):
+            # 404 = already terminal: the call was closed by another
+            # event first (expected double-POST, e.g. s-exten and
+            # h-exten both reporting). Not an error.
+            _respond(f"ok={status_name}")
+        else:
+            _log(f"ERROR: agent /v1/call/{call_id}/complete failed: {detail} (status={status})")
+            _respond(f"error={detail}")
+
     else:
         _respond(f"error=unknown event {event!r}")
 

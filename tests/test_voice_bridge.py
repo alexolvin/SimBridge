@@ -55,7 +55,9 @@ class TestBridgeSelection:
 
     def test_voicemail_fallback_documented(self):
         """S03.4: voicemail is a named, same-context fallback branch that
-        the Stage 04 state machine calls (not a separate voicemail-ctx)."""
+        the Stage 04 state machine calls (not a separate voicemail-ctx).
+        Stage 04 reaches it on Dial NOANSWER — only that DIALSTATUS
+        (bridge-down / reject / caller-cancel hang up, no voicemail)."""
         assert "named, same-context branch" in self.doc
-        assert "Goto(voicemail, 1)" in self.doc
+        assert 'GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)' in self.doc
         assert "unchanged fallback target" in self.doc

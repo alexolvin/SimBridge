@@ -32,7 +32,6 @@ Evaluated in order: tg2sip (primary), sip-tg-bridge (fallback), direct ntgcalls 
 #### 4. Direct ntgcalls Integration — VIABLE (LAST RESORT)
 
 - **Library**: pytgcalls/ntgcalls — mature Python library with Go bindings.
-- **Topics**: audio, calls, cpp, ffmpeg, group-chat, library, python, stream, telegram, tgcalls, video, video-calls, video-chat, voice-chat, voip, webrtc.
 - **Go bindings**: Available via CGO. Example in `./examples/go/`.
 - **Assessment**: Would give maximum control but requires building the SIP layer ourselves. Only pursue if sip-tg-bridge proves insufficient.
 
@@ -42,13 +41,13 @@ Evaluated in order: tg2sip (primary), sip-tg-bridge (fallback), direct ntgcalls 
 
 **Contingency**: If sip-tg-bridge fails in practice (build issues, call reliability), fall back to direct ntgcalls integration using Go bindings + custom pjsip wrapper.
 
+**Honesty note on the control API**: sip-tg-bridge is a POC whose HTTP control surface does not (as of the research date) match the contract below (§ Bridge Control API). The SimBridge-side client (`userbot/bridge_control.py`) is written against the **required** contract; the POC must be adapted or forked to match it. That adaptation is **MANUAL_VERIFY** — it has not been built or exercised yet (see the MANUAL_VERIFY list at the end of this document).
+
 **MANUAL_VERIFY**: Build sip-tg-bridge from source and place a real Telegram voice call. This cannot be verified in this session without the build environment.
 
 ---
 
 ## Transport Decision: Plain RTP over Tailscale, no SRTP
-
-### Rationale
 
 Tailscale (WireGuard) provides point-to-point traffic encryption.
 Every packet between the two nodes is encrypted at the network layer.
@@ -60,15 +59,14 @@ Adding SRTP would mean:
 - Per-packet CPU cost for encrypting already-encrypted traffic
 - Certificate management overhead
 
-This is **duplicated mechanism** — refused under Rule 1.
+This is a **duplicated mechanism** — refused under Rule 1.
 
 Plain RTP over the tailnet is the correct choice.
 
-### When SRTP becomes necessary
-
-If the transport ever changes to something untrusted (public internet
-without WireGuard, shared hosting, etc.), enable `voice.srtp: true`
-in the config. The bridge code supports both modes.
+**When SRTP becomes necessary**: if the transport ever changes to
+something untrusted (public internet without WireGuard, shared hosting,
+etc.), enable `voice.srtp: true` in the config. The generator emits the
+`encryption` settings for that mode; the bridge must support it as well.
 
 ## Where the Bridge Runs
 
@@ -79,67 +77,283 @@ the tailnet to the GSM node.
 This preserves the geographic separation: Telegram connection from
 one location, SIM card physically elsewhere.
 
-## PJSIP Configuration
+---
+
+## Call Control Design: the Bridge-UAC Hybrid
+
+The bridge plays a **different SIP role in each direction**. This is
+the core Stage 04 design decision.
+
+### The ordering constraint
+
+- **Incoming** (GSM caller → TG user): the TG user must be rung, and the
+  GSM leg may be answered **only after the user accepts**. The dialplan
+  can express this natively: `Dial()` to a SIP endpoint blocks, rings
+  the endpoint, and auto-answers when it returns 200.
+- **Outgoing** (TG user → GSM target): the TG user must be rung first,
+  and the real GSM number may be dialed **only after the user accepts**.
+  Only the bridge knows the moment of acceptance (it is the party
+  carrying the Telegram call). A dialplan on the GSM node cannot express
+  "wait for an external event that happens on another machine" — so the
+  GSM node must not initiate this call. The **bridge initiates it**: when
+  the TG user accepts, the bridge sends the SIP INVITE to the GSM node's
+  Asterisk.
+
+Hence: **incoming = bridge is UAS (Asterisk dials it); outgoing = bridge
+is UAC (the bridge dials Asterisk).**
+
+### Alternative evaluated and rejected: bridge as UAS in both directions
+
+The natural "one role" design has Asterisk initiate the SIP leg in both
+directions. Incoming: correct (that is the kept half). Outgoing: wrong —
+Asterisk would have to `Dial(SIP/bridge)` and *then* make the bridge ring
+the TG user, which either (a) dials the real target before the TG user
+has accepted (a stranger's phone rings in the world for a call that may
+never be wanted), or (b) holds the channel in a `WaitForever`-style
+block for the out-of-band Telegram ring — which defeats the `Dial`
+timeout, the `DIALSTATUS` contract and the hangup handler, and gives the
+timeout driver nothing to reason about. The hybrid avoids all of this:
+each direction uses the party that already knows its own timeout.
+
+### Incoming (bridge = UAS)
+
+```
+GSM caller ──► chan_dongle [incoming-mobile/s]
+    │  1. AGI incoming → agent /v1/call/incoming (register, TELEGRAM_RINGING)
+    │  2. Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})
+    │       └─► PJSIP endpoint → bridge → Telegram call to the user
+    │           GSM channel stays UNANSWERED — the GSM caller hears
+    │           real carrier ringback, not a local tone
+    │  3. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
+    │  4. GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)
+    └─► Hangup()
+```
+
+| Dial returns | Meaning | Dialplan outcome |
+|---|---|---|
+| `ANSWERED` | TG user accepted — media bridged, call runs | `Hangup()`; the call ends later via the h-exten (`ENDED`) |
+| `NOANSWER` | Telegram ring window expired | **voicemail** (named branch below) |
+| `BUSY` | bridge answered 486/403 — the user rejected | `Hangup()` (rejected, no voicemail) |
+| `CANCEL` | GSM caller hung up while ringing | `Hangup()` |
+| anything else (`CHANUNAVAIL`, `CONGESTION`, …) | the bridge leg itself failed, e.g. bridge down | `Hangup()` — **no voicemail**: the voicemail branch is a *Telegram-timeout* fallback, not a bridge-failure fallback (a dead bridge has no Telegram leg to blame, and the honest outcome is "call failed") |
+
+The voicemail branch is therefore entered **only on `NOANSWER`**.
+
+### Outgoing (bridge = UAC)
+
+```
+TG user sends a bare phone number (e.g. "+79261234555")
+    │  userbot handle_bare_number:
+    │    extract_call_request() → ACL out_call → normalize → blacklist
+    │    → agent /v1/call/outgoing (rate-limit, ACL re-check, blacklist,
+    │      atomic modem reservation, TELEGRAM_CALLING)
+    │    → bridge control API (loopback) POST /call — the bridge starts
+    │      the Telegram call to the user
+    │
+    │  TG user accepts →
+    ▼
+bridge INVITEs sip:<target>@<GSM node>:5060
+    │  (From-user = the tg-bridge endpoint; Request-URI user = target)
+    ▼
+Asterisk [tg-bridge] context, EXTEN = target
+    │  1. Answer()          ← the SIP leg (and the TG call) is live
+    │  2. AGI outgoing-accepted → agent /v1/call/outgoing/accepted
+    │       └─ 200 → SET VARIABLE CALL_ID <id>
+    │          404 → CALL_ID stays empty (nocal gate below)
+    │  3. GotoIf($["${CALL_ID}" = ""]?nocal)     ← the nocal gate
+    │  4. Dial(Dongle/${MODEM_ID}/${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
+    │       └─ the TG user hears the target's REAL ringback
+    │          (the two-party bridge passes in-band ringback)
+    │  5. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
+    │       └─ per-outcome userbot notification (answered / no_answer /
+    │          busy / failed — separate localized messages)
+    └─► Hangup()
+```
+
+**The nocal gate** (step 3): if the Telegram ring already timed out when
+the user finally accepted, `/call/outgoing/accepted` returns 404 (the
+call was closed by the timeout driver), `CALL_ID` is never set, and the
+dialplan hangs up **without dialing the target**. A late accept must not
+ring a real phone for a call that no longer exists.
+
+**Modem reservation**: `/v1/call/outgoing` takes the reservation
+atomically in the agent (single call per node while the pool is a
+single member); if the bridge cannot start the Telegram call the
+userbot rejects the agent-side call immediately (best-effort), and
+`/v1/call/check-timeouts` is the backstop that reaps any call left in
+`TELEGRAM_CALLING` past `voice.outbound_answer_timeout` (default 30 s).
+
+### Bridge Control API (loopback contract)
+
+The userbot and the bridge run side by side on the Telegram node, so the
+control API is **loopback-only** (`127.0.0.1:<voice.bridge_control_port>`,
+default 5063) and is never exposed on the Tailscale interface. Loopback
+binding is an architectural invariant (the bridge holds the Telegram
+session), not a configurable; the port is configurable
+(`voice.bridge_control_port`).
+
+```
+POST /call    {"user_id": int, "target": "<E.164>",
+               "gsm_host": "<SIP host of the GSM node>",
+               "gsm_port": 5060}
+    → 2xx: the bridge starts a Telegram call to user_id; when the user
+      accepts, the bridge INVITEs sip:<target>@<gsm_host>:<gsm_port>.
+    → non-2xx / unreachable: no Telegram call was started.
+POST /cancel  {"user_id": int}
+    → 2xx: the in-progress Telegram ring/call for user_id is cancelled.
+```
+
+- Auth: Bearer token from the environment variable named by
+  `userbot_http.secret_env` (SIMBRIDGE_HTTP_SECRET) — the same secret
+  domain as the agent → userbot event channel.
+- `gsm_host` is derived from `agent.listen` (the userbot already reaches
+  the GSM node's agent there) — no separate config key (Rule 1).
+
+### No-orphan-legs proof (Asterisk source, verified 2026-08-15)
+
+Requirement: a leg on one side must never survive independently. Both
+directions rely on the Dial app's hangup propagation:
+
+- **Incoming**: if the TG user hangs up, the SIP channel dies. The Dial
+  app tears down the rest via its hanguptree — `apps/app_dial.c`
+  `dial_check_hangup()` (line ~834) and the peer-hangup handling (line
+  ~3322) mark the other party for hangup when a party goes. The GSM
+  channel follows.
+- **Outgoing**: the SIP channel executes the `[tg-bridge]` dialplan, so
+  when the TG user hangs up the channel dies and the Dial app
+  cancels/hangs up the Dongle leg — `apps/app_dial.c` hanguptree and
+  `main/dial.c` `ast_dial_destroy()` (lines ~1069/~1091) destroy the
+  pending/active dial. There is no orphan GSM call left ringing at the
+  target.
+- **Either direction, either party**: AMI `HangupChannel` of ONE leg
+  cascades the same way (the channel's hangup triggers the hanguptree).
+  The agent's `/complete` and `/check-timeouts` handlers therefore hang
+  up legs via AMI and do not need to chase the other side.
+
+The timeout driver (`simbridge-timeouts` systemd timer, 5 s period,
+`scripts/call-timeout-check.py` → `POST /v1/call/check-timeouts`) is the
+enforcement for the **out-of-band** Telegram ring (outgoing `TELEGRAM_CALLING`
+window — no dialplan `Dial` exists to time it out) and a backstop for the
+incoming ring (lost AGI event) and `limits.max_call_seconds` (bridged
+calls past the cap are hung up via AMI per leg).
+
+### Rejected design note: `WaitForever`
+
+An early variant of the outgoing flow held the dialplan channel in a
+`WaitForever`-style block while the Telegram user was being called.
+Rejected: it defeats `Dial` timeouts and the hangup-handler contract,
+and gives the timeout driver no state to observe. The shipped design
+uses `Hangup()` + the nocal gate instead.
+
+---
+
+## PJSIP Endpoint (generated, not hand-edited)
+
+The `tg-bridge` PJSIP endpoint is **generated** by
+`scripts/generate_asterisk_config.py -p` from `simbridge.yaml` (the
+bridge password comes from `SIMBRIDGE_BRIDGE_SECRET` in the process
+environment). There is no `pjsip.conf.example` to edit by hand (Rule 1:
+one mechanism, the generator). Single-node output:
 
 ```ini
-[pjsip+tg-bridge]
-type=aor
-max_contacts=1
-qualify_freq=60
+[global]
+user_agent=SimBridge
 
-[pjsip+tg-bridge]
-type=auth
-username=tg-bridge
-password=bridge-secret
-type=user
+[transport-udp]
+type=transport
+protocol=udp
+bind=127.0.0.1
 
 [tg-bridge]
 type=endpoint
-aors=pjsip+tg-bridge
-auth=pjsip+tg-bridge
-context=incoming-mobile
+transport=transport-udp
+context=tg-bridge
 disallow=all
 allow=ulaw,alaw
 dtmf_mode=rfc2833
+; S04.2: Asterisk MUST relay the media — the bridge is the far party,
+; direct (pass-through) media would expose the bridge's address to the
+; Dongle and break on NAT.
 direct_media=no
-transport=udp
+rtptimeout=60
+rtpholdtimeout=30
+ice_support=no
+local_net=100.64.0.0/10
+nat_option=rtp
+auth=tg-bridge-auth
+outbound_auth=tg-bridge-auth
+aors=tg-bridge-aor
+
+[tg-bridge-auth]
+type=auth
+auth_type=userpass
+username=tg-bridge
+password=<SIMBRIDGE_BRIDGE_SECRET>
+
+[tg-bridge-aor]
+type=aor
+max_contacts=1
+contact=sip:127.0.0.1:5062
+qualify=no
 ```
+
+- Inbound auth is **mandatory**: without it, anyone who can reach the
+  transport could dial arbitrary GSM numbers through the modem
+  (outgoing) or inject fake incoming calls.
+- `context=tg-bridge` routes the bridge's INVITEs to the `[tg-bridge]`
+  dialplan context (outgoing GSM leg, above).
+
+**Distributed diff** (generator, when `voice.bridge_host` is not
+loopback and the node has a Tailscale IP): `bind=0.0.0.0`,
+`external_media_addr=<GSM node Tailscale IP>` added to the endpoint, and
+`contact=sip:<bridge_host>:5062` in the AOR. See § Distributed Mode.
 
 ## Media Flow
 
 ```
-Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node)
-                                        │
-                                   SIP 5062
-                                        │
-                                    Tailscale
-                                        │
-                                   SIP + RTP
-                                        │
-                              Asterisk (GSM node)
-                                        │
-                                   chan_dongle
-                                        │
-                                   GSM Network
+Incoming:
+GSM Network ──► chan_dongle ──► Asterisk (GSM node)
+                                      │  SIP + RTP (plain, over tailnet)
+                                      ▼
+                        sip-tg-bridge (Telegram node, UDP 5062)
+                                      │  WebRTC
+                                      ▼
+                                Telegram user
+
+Outgoing:
+Telegram user ◄──WebRTC── sip-tg-bridge
+                              │  SIP INVITE (on accept) + RTP
+                              ▼
+Asterisk (GSM node) ──► chan_dongle ──► GSM Network (target)
 ```
 
-## Incoming Call Flow — Voicemail as Fallback (S03.4)
+---
 
-### Current (Pre-Stage-04)
+## Voicemail Fallback (S03.4 — preserved)
 
-Incoming calls go directly to voicemail — there is no Telegram ring yet.
-The voicemail path is a **named, same-context branch** `voicemail` inside
-`[incoming-mobile]`, entered with `Goto(voicemail,1)`:
+The voicemail branch is a **named, same-context branch** `voicemail`
+inside `[incoming-mobile]`, entered with `GotoIf($["${DIALSTATUS}" =
+"NOANSWER"]?voicemail)` after the Stage 04 `Dial`. It is the single,
+**unchanged fallback target** of the Stage 04 state machine (Rule 4:
+the Stage 03 voicemail behavior is preserved byte-for-byte; Stage 04
+only adds the `Dial` in front of it).
+
+Why a same-context named exten and not a separate context: the h-exten
+resolves in the channel's *current* context, so a voicemail path in a
+different context would need its own h-exten — a second forwarding
+mechanism (Rule 1). The named branch keeps everything in
+`[incoming-mobile]`.
 
 ```
 chan_dongle (incoming-mobile/s)
     │
-    ├── AGI(tg-blacklist-agi.py)          → BL_BLOCKED → Busy(5) (fail-open)
-    ├── Set(FWD_URL / MODEM_ID / EH_MAX / VM_PROMPT_DURATION)
-    ├── AGI(tg-sms-agi.py, ring)          → userbot /events/sms ("📞 Входящий звонок")
-    ├── Wait(${RING_WAIT_SECONDS})        ← ringback on the line
-    │
-    └── Goto(voicemail, 1)                ← S03.4 named fallback branch
+    ├── AGI(tg-blacklist-agi.py)          → BL_BLOCKED → Busy(5)
+    ├── AGI(tg-sms-agi.py, ring)          → Telegram in_call audience
+    ├── AGI(notify-agent-agi.py,incoming) → agent registers the call
+    ├── Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})
+    │       accept → auto-answer + bridge; reject → BUSY; timeout → NOANSWER
+    ├── AGI(notify-agent-agi.py,complete) → agent records the outcome
+    └── GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)
             │
             ├── Answer()
             ├── Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)
@@ -151,35 +365,11 @@ chan_dongle (incoming-mobile/s)
                     │
                     └── h-exten (same context)
                         ├── StopMixMonitor()   (synchronous WAV finalization)
-                        └── AGI(tg-voice-agi.py) → core.voicemail_forward
-                            → userbot /events/voicemail
+                        ├── AGI(tg-voice-agi.py) → core.voicemail_forward
+                        │   → userbot /events/voicemail
+                        └── AGI(notify-agent-agi.py,complete,ENDED)
+                            (dead mode; 404 = already terminal = no-op)
 ```
-
-Why a same-context named exten and not a separate context: the h-exten
-resolves in the channel's *current* context, so a voicemail path in a
-different context would need its own h-exten — a second forwarding
-mechanism (Rule 1). `Goto(voicemail,1)` keeps everything in
-`[incoming-mobile]`; the Stage 04 state machine will call the same target.
-
-### Post-Stage-04 (Planned)
-
-Stage 04 inserts a Telegram ring between the line ringback and the voicemail
-fallback — the voicemail branch itself is unchanged:
-
-```
-chan_dongle (incoming-mobile/s)
-    │
-    ├── AGI(tg-blacklist-agi.py)
-    ├── AGI(tg-sms-agi.py, ring)          → Telegram ring (in_call audience)
-    ├── Wait(${RING_WAIT_SECONDS})        ← the Telegram ring window
-    │
-    ├── User accepted in Telegram → live voice bridge (Stage 04)
-    ├── User rejected / no answer → Goto(voicemail, 1)   ← same branch
-    └── No Telegram user at all    → Goto(voicemail, 1)
-```
-
-The state machine (`core/call_control.py`) decides; `voicemail,1` is the
-single, unchanged fallback target.
 
 ### Voicemail Types (S03.1)
 
@@ -221,6 +411,10 @@ logs a warning.
   voice note and deleted in a `finally` — on the success **and** the failure
   path.
 
+**No audio to disk in the voice path**: the bridge is a live media
+relay; no side of a bridged call is recorded (unlike voicemail, where
+recording is the product).
+
 ---
 
 ## Distributed Mode (S04.4)
@@ -247,8 +441,10 @@ voice:
   bridge_port: 5062
 ```
 
-That is the only code-relevant difference. All other changes are in
-Asterisk PJSIP configuration (local_net, external_media_addr).
+That is the only code-relevant difference. All other changes are made by
+the PJSIP generator (bind, external_media_addr, AOR contact — § PJSIP
+Endpoint). There is no second mechanism: the same generator, the same
+endpoint, parameterized.
 
 ### Addressing: MagicDNS FQDN or Raw Tailscale IP
 
@@ -256,34 +452,17 @@ Use either the full MagicDNS FQDN (`my-node.tail-<netid>.ts.net`) or the raw
 Tailscale IP (`100.x.x.x`). **Never use short hostnames** — they may not
 resolve reliably across all nodes in the tailnet.
 
-### SRTP Rationale — Why Plain RTP on Tailscale
-
-Tailscale (WireGuard) provides point-to-point encryption at the network layer.
-Every packet between nodes is encrypted end-to-end. The device's private key
-never leaves the device — Tailscale cannot decrypt the traffic either.
-
-Adding SRTP would create a **duplicated mechanism** (Rule 1):
-- A second key infrastructure (DTLS-SRTP requires certificate exchange)
-- Per-packet CPU cost for encrypting already-encrypted traffic
-- Certificate management overhead
-
-Plain RTP over the tailnet is the deliberate, correct choice. It is not an
-oversight — the tailnet already provides the encryption that SRTP would add.
-
-**When SRTP becomes necessary:** If the transport ever changes to something
-untrusted (public internet without WireGuard, shared hosting, etc.), enable
-`voice.srtp: true` in the config.
-
 ### PJSIP local_net and NAT Settings
 
-For the distributed mode, the PJSIP endpoint must be configured so that
-Asterisk does not apply external-address rewriting to Tailscale peers. The
-Tailscale CGNAT range is `100.64.0.0/10`:
+For the distributed mode, the generated PJSIP endpoint must be configured so
+that Asterisk does not apply external-address rewriting to Tailscale peers.
+The Tailscale CGNAT range is `100.64.0.0/10`:
 
 ```ini
 [tg-bridge]
 type=endpoint
 ...
+bind=0.0.0.0
 local_net=100.64.0.0/10
 external_media_addr=100.x.x.x  # GSM node's Tailscale IP
 nat_option=rtp
@@ -329,3 +508,32 @@ Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node, 100.a.
                                         │
                                    GSM Network
 ```
+
+---
+
+## Known trade-offs
+
+- **8-digit numeric false positive**: `extract_call_request()` treats any
+  8+ digit string as a call request, so a PIN-like code ("12345678")
+  matches and rings that number. Accepted trade-off: the alternative
+  (country-code whitelisting) would be a second, config-dependent
+  classification mechanism for the same input; the false positive is
+  harmless (one missed ring) while a missed real number would be a
+  dropped call. Pinned by a unit test so a future change is deliberate.
+
+## MANUAL_VERIFY items (Stage 04)
+
+Live-device evidence (Rule 3) — to be closed in the test & fix pass with
+real modem + real Telegram account:
+
+- **TS04-1**: real build of sip-tg-bridge + adaptation of its control API
+  to the loopback contract above (POC has no matching API).
+- **TS04-2**: real Telegram voice call end-to-end, both directions
+  (incoming accept / reject / timeout→voicemail; outgoing accepted /
+  no-answer / busy / cancelled).
+- **TS04-3**: link-drop run (`tailscale down` mid-call) — clean
+  termination, no orphan channels (`core show channels` empty).
+- **TS04-4**: distributed two-node run (GSM node + Telegram node,
+  `voice.bridge_host` = Tailscale IP) — voice across the tailnet.
+- **TS04-5**: confirm whether foobar26/tg2sip (or a renamed equivalent)
+  exists — the S04.1 research found it missing (404).

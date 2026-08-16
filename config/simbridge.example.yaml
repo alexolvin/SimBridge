@@ -70,6 +70,8 @@ voice:
   bridge_port: 5062
   srtp: false                       # tailnet already encrypts (see docs/voice-bridge.md)
   outbound_answer_timeout: 30       # seconds
+  outbound_gsm_ring_seconds: 30     # max seconds the GSM number may ring before no-answer
+  bridge_control_port: 5063         # loopback control API of the voice bridge (S04.3)
 
 # ---------------------------------------------------------------------------
 # Rate limits
