@@ -29,6 +29,10 @@ class ComponentStatus:
     name: str
     healthy: bool
     detail: str = ""
+    # S06.2: optional structured payload (e.g. the peer node's own health
+    # body). Lets the supervisor read a peer's telegram_connected state
+    # from the same request the health check already made (one mechanism).
+    data: Optional[dict] = None
     last_check: float = field(init=False, default_factory=time.monotonic)
 
 
@@ -57,12 +61,15 @@ class HealthStatus:
         return "degraded"
 
     def to_dict(self) -> dict[str, Any]:
+        components: dict[str, Any] = {}
+        for c in self.components:
+            entry: dict[str, Any] = {"healthy": c.healthy, "detail": c.detail}
+            if c.data is not None:
+                entry["data"] = c.data
+            components[c.name] = entry
         return {
             "status": self.status,
-            "components": {
-                c.name: {"healthy": c.healthy, "detail": c.detail}
-                for c in self.components
-            },
+            "components": components,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
         }
 
@@ -144,7 +151,18 @@ class HealthChecker:
                     headers={"x-simbridge-secret": secret},
                 )
                 if resp.status_code == 200:
-                    return ComponentStatus("peer_node", healthy=True, detail="HTTP 200")
+                    # S06.2: keep the peer's own health body — the
+                    # supervisor reads e.g. telegram_connected from here
+                    # instead of issuing a second request.
+                    try:
+                        data = resp.json()
+                        if not isinstance(data, dict):
+                            data = None
+                    except ValueError:
+                        data = None
+                    return ComponentStatus(
+                        "peer_node", healthy=True, detail="HTTP 200", data=data
+                    )
                 else:
                     return ComponentStatus(
                         "peer_node", healthy=False, detail=f"HTTP {resp.status_code}"

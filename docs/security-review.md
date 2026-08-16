@@ -1,6 +1,6 @@
 # S06.1 — Security Review Against Threat Model
 
-Date: 2026-08-12
+Date: 2026-08-12; revised 2026-08-16 (S06.1 audit pass + S06.2 wiring)
 Scope: Full repository — `main` branch at HEAD.
 
 ---
@@ -20,7 +20,7 @@ Scope: Full repository — `main` branch at HEAD.
 
 **Status: MITIGATED**
 
-- **Session file permissions** (`install.sh:179`): `chmod 0600` on `sim_session.session`. Only the `simbridge` system user can read/write.
+- **Session file permissions** (`deploy/install.py`): `chmod 0600` on `sim_session.session`. Only the `simbridge` system user can read/write.
 - **Never in git** (`.gitignore`): `*.session` and `*.session-journal` are excluded.
 - **Session path** (`config/simbridge.example.yaml`): `/var/lib/simbridge/sim_session` — outside project directory.
 - **Recommendation**: Encrypt backups containing session files. This is documented in install guides.
@@ -48,7 +48,7 @@ Scope: Full repository — `main` branch at HEAD.
   - Hang up active calls
   - Access audit log (read)
 - **Not reachable from GSM node**: Telegram session, userbot HTTP server (one-way: GSM → Telegram events only).
-- **Mitigation for multi-node**: S05.3 (not implemented — no second node planned) would add per-node cryptographic identity.
+- **Mitigation for multi-node**: per-node cryptographic identity is out of scope for the current two-node rollout; the Tailscale network + per-role tokens bound the exposure to what is listed above.
 
 **Accepted risk**: In a single-node or two-node deployment over Tailscale, a compromised GSM node has physical access to the modem anyway. The threat model assumes the physical host is trusted.
 
@@ -74,20 +74,21 @@ Scope: Full repository — `main` branch at HEAD.
 
 ### T7 — Stuck Modem
 
-**Status: NOT MITIGATED — DEFERRED TO S06.2**
+**Status: MITIGATED (S06.2, code-level)**
 
-- **Current state**: The `SingleModemProvider` (`core/modem.py`) derives state from real device reports (`dongle show devices`), but there is no automated watchdog or recovery.
-- **Manual recovery**: Admin can restart the agent service or reset the modem via AMI.
-- **Plan**: S06.2 will implement watchdog with automatic reset attempt, alerting after repeated failures.
+- **State derives from the real device**: the poller (`agent/modem_poll.py`) queries `DongleShowDevices` via AMI every `watchdog.modem_check_seconds` and feeds `SingleModemProvider`; an absent device drives the provider OFFLINE.
+- **Automated watchdog** (`core/recovery.py` `ModemWatchdog`, wired in `agent/agent.py`): while the provider is unavailable it attempts a reset — the AMI reconnect path (`ami.connect()` re-establishes the Asterisk management session) — up to 3 times, then alerts the master (`dongle_offline`, 300 s cooldown per the default alert rule; recovery alerts use a 600 s cooldown).
+- **Edge-triggered alerts** (`agent/supervisor.py`): present→absent (`dongle_offline`), registration lost (`gsm_registration_lost`), recovered (`modem_recovery`), peer unreachable/recovery — the master user is paged on transitions, not every 30 s cycle.
+- **Known limitation**: no verified USB-level reset action exists in the chan_dongle AMI vocabulary (only `DongleShowDevices` / `DongleSendSMS` / `DongleDeviceEntry` are known to this repo — Rule 2), so the reset attempt is the AMI session reconnect, not a hardware reset. Live unplug/replug behavior = Pass C (MANUAL_VERIFY).
 
 ### T8 — Network Partition
 
 **Status: MITIGATED**
 
 - **Clean call teardown** (S04.4): `terminate_bridged_calls()` in `core/call_control.py`. If the tailnet drops mid-call, both legs are terminated and the user is notified.
-- **Link drop detection** (S04.4): PJSIP transport monitoring detects tailnet loss.
+- **Link drop detection** (S04.4): PJSIP `rtptimeout=60` / `rtpholdtimeout=30` drop dead RTP legs; the check-timeouts dialplan extension force-terminates stuck BRIDGED calls (audit `partial_hangup`).
 - **No orphan channels**: Symmetric hangup (`routes.py:call_hangup`) terminates both GSM and bridge legs.
-- **Verified by**: Link drop test (S04.4) — `tailscale down` on one side during active call.
+- **Status**: CODE+UNITS (teardown paths unit-tested). Live `tailscale down` mid-call evidence = Pass C (MANUAL_VERIFY — see HANDOFF-S04).
 
 ---
 
@@ -101,21 +102,31 @@ Scope: Full repository — `main` branch at HEAD.
 
 **Verification**: Test added (`tests/test_foundation.py`) — config with `0.0.0.0` is rejected at startup.
 
+### PJSIP Wildcard Bind (FOUND & FIXED in S06.1 audit)
+
+**Finding**: In distributed mode (`voice.bridge_host != 127.0.0.1`), `scripts/generate_asterisk_config.py::generate_pjsip` emitted `bind=0.0.0.0` whenever `SIMBRIDGE_NODE_TAILSCALE_IP` was unset — a wildcard SIP listener on every interface, protected only by the (mandatory) inbound auth. A wildcard bind is a finding, not a feature: it exposes the SIP port to any interface the host has.
+
+**Fix**: the generator now binds the PJSIP transport to the Tailscale interface IP in distributed mode, and **refuses to generate** `pjsip.conf` (exit 1) when `SIMBRIDGE_NODE_TAILSCALE_IP` is not set. Single-node mode binds `127.0.0.1` only.
+
+**Verification**: `tests/test_s06_wiring.py::TestPjsipBind` — distributed+IP → `bind=<tailscale-ip>` and no `0.0.0.0` in the output; distributed without IP → `SystemExit(1)`; single node → `bind=127.0.0.1`.
+
+### `/health` Endpoints Are Unauthenticated (documented scope decision)
+
+Both nodes' `/health` endpoints accept unauthenticated requests: the response is operational state (component health, counters, session state) — no secrets, no control surface. They bind to the tailnet/loopback only (see bind rules above) and are consumed by the peer's health checker. Documented here so the choice is a decision, not an accident.
+
 ### SSH-Based Control Removed
 
-**Result**: Repo-wide `grep -rnE 'ssh|scp|rsync'` across `agent/`, `userbot/`, `core/`, `scripts/`, `deploy/`, `asterisk/` returns **no matches**. All inter-node control goes through authenticated HTTP API (JSON, not shell-interpolated).
+**Result** (re-checked 2026-08-16): no SSH/SCP/rsync is used for **inter-node control**. The only `ssh` references in the repo are the installer's git-clone fallback (`deploy/install.py`, repo download only) and docstrings describing the replaced legacy path. All inter-node control goes through the authenticated HTTP API (JSON, not shell-interpolated).
 
 ### Secrets Scan
 
-**Result**: Working tree scan with `core/secrets_check.py` returns 151 matches, but **all are false positives**:
-- E.164 phone numbers in test fixtures, comments, and documentation
-- Deliberate secret patterns in `tests/test_foundation.py` (testing the detector)
-- Session file references in `deploy/install.sh` (chmod commands, not commit)
-- `core/secrets_check.py` itself (pattern definitions)
+**Working tree** (re-run 2026-08-16, S06.4): `python3 core/secrets_check.py $(git ls-files)` → **exit 0**. The non-blocking warnings are detector self-test content (deliberate secret patterns in `tests/test_foundation.py` / `tests/test_secrets_check.py`) and session-file path references in `deploy/install.py` (chmod/chown logic, not secrets).
+
+**Git history** (re-run 2026-08-16, S06.4): `python3 scripts/scan_history_secrets.py` → **`HISTORY CLEAN: no blocking secret hits across 297 blobs (435 unique blob paths)`, exit 0** (non-blocking `session_file_ref` warnings only). The earlier "history scan deferred" gap is closed: the full history is scanned, not just the working tree.
 
 **Pre-commit hook** (`scripts/pre-commit.sh`): Active. Blocks commits containing secret patterns.
 
-**Known gap**: The hook checks only the working tree (staged files). It does not scan git history. A force-push or direct git command could bypass it. Mitigation: CI check on push (deferred to S06.4).
+**CI**: the `secrets` job in `.github/workflows/ci.yml` runs both the working-tree scan and the git-history scan on every push.
 
 ### IP Allowlist Fix (FIX APPLIED)
 
@@ -151,7 +162,7 @@ Scope: Full repository — `main` branch at HEAD.
 
 ## Sudoers
 
-The `install.sh` script creates a system user (`simbridge`) with `--no-create-home --shell /usr/sbin/nologin`. The agent runs as this unprivileged user. AMI access to Asterisk is via network socket (port 5038), not sudo.
+The `deploy/install.py` installer creates a system user (`simbridge`) with `--no-create-home --shell /usr/sbin/nologin`. The agent runs as this unprivileged user. AMI access to Asterisk is via network socket (port 5038), not sudo.
 
 **Current sudo requirement**: None identified in the codebase. The old SSH-based path (which required `sudo /usr/local/bin/send-sms-report.sh`) has been fully removed.
 
@@ -166,3 +177,16 @@ The `install.sh` script creates a system user (`simbridge`) with `--no-create-ho
 | IP allowlist enforcement | HIGH | `agent/deps.py` | Reject non-localhost when no peers configured |
 | Call rate limiting | MEDIUM | `agent/routes.py`, `agent/agent.py`, `agent/deps.py` | Per-user rate limit on `/call/outgoing` |
 | Bind-address validation | MEDIUM | `core/config.py` | Reject `0.0.0.0` in listen addresses |
+| PJSIP wildcard bind (S06.1 audit) | MEDIUM | `scripts/generate_asterisk_config.py` | Distributed mode binds the Tailscale IP; generation refused without `SIMBRIDGE_NODE_TAILSCALE_IP` (no `0.0.0.0` SIP listener) |
+
+## S06.2 Observability & Recovery (wired 2026-08-16)
+
+Not a security control per se, but closes the T7 recovery gap and the
+"silently broken system" failure mode:
+
+- Structured JSON logging with correlation IDs on both nodes (`core/logging_config.py`); every agent request and userbot event echoes or mints `x-correlation-id` (middleware in `agent/agent.py` and `userbot/http_server.py`).
+- Metrics (`core/metrics.py`): SMS sent/delivered/failed/incoming + delivery rate; call counts by outcome per direction + answered durations (`avg_answered_seconds`); component state (modem registered, bridge reachable, telegram connected). Exposed at both `/health` endpoints.
+- Real health endpoints: the userbot's `/health` (previously a stub) reports `telegram_connected` + metrics; the agent's reports all components. The agent's supervisor (`agent/supervisor.py`) reads the peer's `/health` and feeds edge-triggered alerts.
+- Alerts to the master: the agent has no Telegram session, so its `AlertManager` posts to the userbot's new `/events/alert` endpoint (secret + IP allowlist, audited `ALERT_SENT`); the userbot alerts the master directly.
+- Auto-recovery: modem watchdog (reset attempt = verified AMI reconnect, alert after 3 failed resets), AMI session auto-reconnect on ConnectionError (`agent/ami_reconnect.py`), Telegram session backoff reconnect (`userbot/userbot.py::run_with_recovery`, re-auth procedure in `docs/re-auth.md`).
+- Wiring covered by `tests/test_s06_wiring.py` (41 tests).

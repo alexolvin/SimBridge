@@ -185,9 +185,18 @@ def generate_pjsip(
     distributed = bridge_host != "127.0.0.1"
     # Single node: the bridge runs on this host and reaches Asterisk on
     # loopback, so a loopback-only bind. Distributed: the bridge is on
-    # the other node and reaches SIP over Tailscale — wildcard bind,
+    # the other node and reaches SIP over Tailscale — bind to the
+    # Tailscale interface IP only (S06.1: no wildcard listeners),
     # protected by the mandatory inbound auth (see module header above).
-    bind_addr = "0.0.0.0" if distributed else "127.0.0.1"
+    if distributed and not node_ip:
+        print(
+            f"ERROR: {NODE_IP_ENV} is not set in distributed mode — "
+            f"refusing to write pjsip.conf with a wildcard SIP bind "
+            f"(S06.1: no 0.0.0.0 listeners).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    bind_addr = node_ip if distributed else "127.0.0.1"
 
     content = PJSIP_HEADER
     content += "[global]\n"
@@ -214,7 +223,7 @@ def generate_pjsip(
     content += "; (comedia) so RTP traverses the tailnet correctly\n"
     content += "local_net=100.64.0.0/10\n"
     content += "nat_option=rtp\n"
-    if distributed and node_ip:
+    if distributed:
         content += f"external_media_addr={node_ip}\n"
     content += f"auth={auth_name}\n"
     content += f"outbound_auth={auth_name}\n"
@@ -235,11 +244,6 @@ def generate_pjsip(
     print(f"Written: {output_path}")
     print(f"  [{endpoint}] context={endpoint} direct_media=no bind={bind_addr}")
     print(f"  [{aor_name}] contact=sip:{bridge_host}:{bridge_port}")
-    if distributed and not node_ip:
-        print(
-            f"WARNING: {NODE_IP_ENV} not set in distributed mode — "
-            f"RTP may leave via the wrong interface"
-        )
 
 
 def main() -> None:

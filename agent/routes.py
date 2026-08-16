@@ -155,6 +155,7 @@ async def send_sms(
     limiter: RateLimiter = Depends(get_sms_limiter),
     blacklist: BlacklistManager = Depends(get_blacklist),
     sms_store: SMSCorrelationStore = Depends(get_sms_store),
+    metrics_collector: "MetricsCollector" = Depends(get_metrics),
 ):
     """Send outgoing SMS via Asterisk + chan_dongle.
 
@@ -229,6 +230,7 @@ async def send_sms(
             error=str(e),
             submit_failed=True,
         )
+        metrics_collector.sms_failed()
         raise HTTPException(
             status_code=502,
             detail=asterisk_sms_error_to_type(str(e)).message,
@@ -239,6 +241,7 @@ async def send_sms(
             error=SMSErrorType.MODEM_UNAVAILABLE.message,
             submit_failed=True,
         )
+        metrics_collector.sms_failed()
         raise HTTPException(status_code=503, detail=SMSErrorType.MODEM_UNAVAILABLE.message)
     except Exception as e:
         err_msg = str(e)
@@ -247,7 +250,12 @@ async def send_sms(
             error=err_msg,
             submit_failed=True,
         )
+        metrics_collector.sms_failed()
         raise HTTPException(status_code=500, detail=err_msg)
+
+    # S06.2: "sent" means submitted to the modem; delivery is counted
+    # when the report arrives (see /sms/report).
+    metrics_collector.sms_sent()
 
     # Audit: submitted to modem
     audit.log(
@@ -351,6 +359,7 @@ async def sms_delivery_report(
     request: Request,
     sms_store: SMSCorrelationStore = Depends(get_sms_store),
     audit: AuditLogger = Depends(get_audit),
+    metrics_collector: "MetricsCollector" = Depends(get_metrics),
 ):
     """Carrier delivery report (DongleSendSMS Report=yes).
 
@@ -384,9 +393,11 @@ async def sms_delivery_report(
     if any(m in lowered for m in failed_markers):
         sms_store.mark_failed(record.sms_id, error=req.text[:200])
         status = "failed"
+        metrics_collector.sms_failed()
     else:
         sms_store.mark_delivered(record.sms_id)
         status = "delivered"
+        metrics_collector.sms_delivered()
 
     audit.log(
         EventType.SMS_DELIVERY_REPORT,

@@ -38,10 +38,24 @@ class CallCounters:
     outgoing_answered: int = 0
     outgoing_failed: int = 0
     outgoing_timeout: int = 0
+    answered_seconds: float = 0.0  # sum of durations of completed answered calls
+    answered_completed: int = 0  # answered calls whose duration is recorded
 
     @property
     def total_answered(self) -> int:
         return self.incoming_answered + self.outgoing_answered
+
+    @property
+    def avg_answered_seconds(self) -> Optional[float]:
+        """Average duration of completed answered calls, seconds. None if none.
+
+        The denominator is ``answered_completed``, not ``total_answered``:
+        active BRIDGED calls have no known duration yet, so including them
+        would skew the average.
+        """
+        if self.answered_completed == 0:
+            return None
+        return round(self.answered_seconds / self.answered_completed, 1)
 
     @property
     def total_missed(self) -> int:
@@ -122,6 +136,17 @@ class MetricsCollector:
         with self._lock:
             self._calls.outgoing_failed += 1
 
+    def record_answered_duration(self, seconds: float) -> None:
+        """Add the duration of a completed answered call (both directions).
+
+        Called at hangup for calls that reached BRIDGED. Non-positive
+        values are ignored (clock skew / zero-length transition).
+        """
+        if seconds > 0:
+            with self._lock:
+                self._calls.answered_seconds += seconds
+                self._calls.answered_completed += 1
+
     # --- Component state ---
 
     def set_modem_registered(self, registered: bool) -> None:
@@ -162,6 +187,8 @@ class MetricsCollector:
                     "outgoing_timeout": self._calls.outgoing_timeout,
                     "total_answered": self._calls.total_answered,
                     "total_missed": self._calls.total_missed,
+                    "answered_seconds": round(self._calls.answered_seconds, 1),
+                    "avg_answered_seconds": self._calls.avg_answered_seconds,
                 },
                 "components": {
                     "modem_registered": self._modem_registered,

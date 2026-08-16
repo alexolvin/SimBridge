@@ -14,19 +14,22 @@ from __future__ import annotations
 import os
 import sys
 import asyncio
-from logging import getLogger, basicConfig
+from logging import getLogger
 
+from core.alerting import AlertManager
 from core.config import load_config, redact_config
+from core.logging_config import setup_logging
+from core.metrics import MetricsCollector
 from userbot.userbot import Userbot
 
 logger = getLogger("simbridge.userbot.main")
 
 
 async def async_main() -> None:
-    basicConfig(
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        level=os.environ.get("SIMBRIDGE_LOG_LEVEL", "INFO"),
-    )
+    # S06.2: structured JSON logging (same discipline as the agent),
+    # one line per event, correlation IDs included.
+    log_level = os.environ.get("SIMBRIDGE_LOG_LEVEL", "INFO")
+    setup_logging(level=log_level, json_format=True)
 
     cfg_path = os.environ.get("SIMBRIDGE_CONFIG", "/etc/simbridge/simbridge.yaml")
     cfg = load_config(cfg_path)
@@ -47,6 +50,18 @@ async def async_main() -> None:
     ub = Userbot(cfg)
     await ub.start()
 
+    # S06.2: userbot-side metrics (incoming SMS, telegram_connected),
+    # exported at /health for the agent's peer check.
+    metrics = MetricsCollector()
+
+    # S06.2: local alerts go straight to Telegram — this node owns the
+    # session, so no HTTP hop (the agent, which has no session, uses
+    # /events/alert on this node instead).
+    async def tg_alert_send(message: str) -> None:
+        await ub.client.send_message(ub.master_id, message)
+
+    alerts = AlertManager(send_fn=tg_alert_send)
+
     # D1/D14: run the Asterisk-event HTTP server in-process, on the
     # same event loop as the Telethon client. One systemd unit covers
     # both; the server exits with the process.
@@ -59,6 +74,8 @@ async def async_main() -> None:
         audit=ub.audit,
         contacts=ub.contacts,
         client=ub.client,
+        master_id=ub.master_id,
+        metrics=metrics,
     )
 
     import uvicorn
@@ -67,7 +84,10 @@ async def async_main() -> None:
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=int(port)))
     server_task = asyncio.create_task(server.serve())
 
-    await ub.run_until_disconnected()
+    # S06.2: survive Telegram session drops — alert, reconnect with
+    # backoff, and only exit (for the systemd re-auth restart) when
+    # the retries are exhausted.
+    await ub.run_with_recovery(alerts=alerts)
 
     server.should_exit = True
     await server_task

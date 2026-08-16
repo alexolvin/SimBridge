@@ -9,6 +9,8 @@ from __future__ import annotations
 import hmac
 import os
 import tempfile
+import uuid
+from datetime import datetime, timezone
 from logging import getLogger
 from pathlib import Path
 from typing import Optional
@@ -20,6 +22,7 @@ from core.audit import AuditLogger
 from core.contacts import ContactResolver
 from core.errors import SMSErrorType
 from core.events import EventType, SMSEvent
+from core.logging_config import set_correlation
 
 logger = getLogger("simbridge.userbot.http")
 
@@ -31,6 +34,8 @@ def create_http_server(
     audit: AuditLogger,
     contacts: Optional[ContactResolver] = None,
     client=None,
+    master_id: Optional[int] = None,
+    metrics=None,
 ) -> FastAPI:
     """Create the HTTP server for receiving Asterisk events.
 
@@ -38,6 +43,10 @@ def create_http_server(
     ``send_message(entity, text)``) used to deliver events to Telegram
     users. When None, events are accepted and audited but not delivered
     (standalone/test mode).
+
+    *master_id* (S06.2): the master user's Telegram ID — the recipient
+    of alerts forwarded from the agent node. *metrics* (S06.2): the
+    userbot-side MetricsCollector (incoming SMS, exported at /health).
     """
 
     app = FastAPI(title="SimBridge Userbot HTTP")
@@ -47,6 +56,19 @@ def create_http_server(
     app.state.audit = audit
     app.state.contacts = contacts
     app.state.client = client
+    app.state.master_id = master_id
+    app.state.metrics = metrics
+
+    # S06.2: correlation IDs on every request (same contract as the
+    # agent app) so the userbot's JSON log lines join the same trace as
+    # the agent's audit records via x-correlation-id.
+    @app.middleware("http")
+    async def set_request_correlation(request: Request, call_next):
+        cid = request.headers.get("x-correlation-id") or uuid.uuid4().hex
+        set_correlation(cid)
+        response = await call_next(request)
+        response.headers["x-correlation-id"] = cid
+        return response
 
     @app.post("/events/sms")
     async def handle_sms_event(req: Request):
@@ -121,6 +143,12 @@ def create_http_server(
                 except Exception as e:
                     failed.append(uid)
                     logger.warning("failed to deliver to user %s: %s", uid, e)
+
+        # S06.2: count real incoming SMS. "RING <number>" is a
+        # call notification (counted as a call, not an SMS) — same
+        # audience split as the delivery above.
+        if metrics is not None and not is_ring:
+            metrics.sms_incoming()
 
         if delivered and not failed:
             outcome = "ok"
@@ -461,9 +489,78 @@ def create_http_server(
         )
         return {"ok": True, "notified": notified}
 
+    @app.post("/events/alert")
+    async def handle_alert_event(req: Request):
+        """Alert from the agent node, forwarded to the master user (S06.2).
+
+        The agent has no Telegram client of its own, so its AlertManager
+        sends over the tailnet to this endpoint; this node owns the
+        Telegram session and does the actual send. The message goes
+        ONLY to the master user (alerts are for the system owner, not a
+        broadcast audience).
+
+        Expected JSON body::
+
+            {"message": "..."}
+        """
+        received_secret = req.headers.get("x-simbridge-secret", "")
+        if not hmac.compare_digest(received_secret, secret):
+            raise HTTPException(status_code=401, detail="Invalid secret")
+
+        client_host = req.client.host if req.client else None
+        if allowed_peers and client_host not in allowed_peers:
+            raise HTTPException(status_code=403, detail="IP not allowed")
+
+        body = await req.json()
+        message = str(body.get("message", "")).strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="message is empty")
+
+        sent = False
+        if master_id is None or client is None:
+            logger.warning(
+                "alert received but no master user / Telegram client — not sent"
+            )
+        else:
+            try:
+                await client.send_message(master_id, message)
+                sent = True
+            except Exception as e:
+                logger.warning(
+                    "failed to send alert to master %s: %s", master_id, e
+                )
+
+        audit.log(
+            EventType.ALERT_SENT,
+            telegram_user_id=master_id,
+            outcome="ok" if sent else "failed",
+            details={"message_preview": message[:200], "sent": sent},
+        )
+        return {"ok": True, "sent": sent}
+
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        """Liveness + Telegram session state + metrics (S06.2).
+
+        Unauthenticated on purpose (as the previous stub was): the
+        response is operational state, not secrets, and the server
+        binds to the tailnet interface only. The agent's peer check
+        (core/health.py ``check_peer_node``) reads ``telegram_connected``
+        from this body — which is also why the response carries the
+        session state the supervisor needs.
+        """
+        connected = None
+        if client is not None:
+            try:
+                connected = bool(client.is_connected)
+            except Exception:
+                connected = False
+        return {
+            "status": "ok" if connected is not False else "degraded",
+            "telegram_connected": connected,
+            "metrics": metrics.get_all() if metrics is not None else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     return app
 

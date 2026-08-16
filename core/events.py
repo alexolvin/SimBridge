@@ -47,6 +47,9 @@ class EventType(str, Enum):
     # -- Modem (S05.2) --
     # Which routing policy chose which modem, and why.
     MODEM_SELECTED = "MODEM_SELECTED"
+    # -- Observability (S06.2) --
+    # Alert delivered (or failed) to the master user.
+    ALERT_SENT = "ALERT_SENT"
 
 
 @dataclass

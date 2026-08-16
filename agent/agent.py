@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from contextlib import asynccontextmanager
 from logging import getLogger
 from typing import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from core.config import load_config, redact_config
 from core.audit import AuditLogger
@@ -22,16 +23,32 @@ from core.sms_correlation import SMSCorrelationStore
 from core.call_control import CallRegistry
 from core.acl import ACLManager
 from core.modem import ModemPool, SingleModemProvider
-from core.logging_config import setup_logging
+from core.logging_config import setup_logging, set_correlation
 from core.metrics import MetricsCollector
 from core.health import HealthChecker
 from core.alerting import AlertManager
-from core.recovery import BackoffReconnector
+from core.recovery import BackoffReconnector, ModemWatchdog
 from agent.routes import router as api_router
 from agent.deps import init_deps
 from agent.ami_client import AMIClient
+from agent.ami_reconnect import AMIReconnect
+from agent.supervisor import run_supervisor
 
 logger = getLogger("simbridge.agent")
+
+# S06.2: how many AMI reconnect attempts before giving up (and alerting).
+AMI_RECONNECT_MAX_RETRIES = 10
+
+
+def modem_alert_rule(message: str) -> str:
+    """Map a watchdog alert message to an alert rule name (S06.2).
+
+    The watchdog emits human-readable messages ("{label} recovered",
+    "{label} stuck — reset failed: ..."); the rule is the stable machine
+    name used for cooldowns. Kept as a pure function so it is testable
+    without instantiating a watchdog.
+    """
+    return "modem_recovery" if "recovered" in message else "dongle_offline"
 
 
 @asynccontextmanager
@@ -60,6 +77,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     health_checker = HealthChecker(ami=None, cfg=cfg)
     app.state.health_checker = health_checker
 
+    # S06.2: Alerting. The agent has no Telegram client of its own, so
+    # alerts travel over the tailnet to the userbot node, which owns the
+    # Telegram session and forwards them to the master user.
+    userbot_url = (cfg.get("agent.userbot_url") or "").rstrip("/")
+    userbot_secret_env = cfg.get("userbot_http.secret_env", "SIMBRIDGE_HTTP_SECRET")
+    userbot_secret = os.environ.get(userbot_secret_env, "")
+
+    async def alert_send(message: str) -> None:
+        import httpx
+
+        if not userbot_url:
+            raise ConnectionError("agent.userbot_url not configured")
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            resp = await http.post(
+                f"{userbot_url}/events/alert",
+                json={"message": message},
+                headers={"x-simbridge-secret": userbot_secret},
+            )
+            if resp.status_code >= 400:
+                raise ConnectionError(
+                    f"userbot /events/alert returned {resp.status_code}"
+                )
+
+    alerts = AlertManager(send_fn=alert_send)
+    alerts.register_rule("ami_down", cooldown_seconds=600)
+    app.state.alerts = alerts
+
     # Initialize audit logger
     audit = AuditLogger(cfg["paths.audit_log"])
     app.state.audit = audit
@@ -79,28 +123,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         password=ami_password,
         dongle=cfg["asterisk.dongle"],
     )
-    app.state.ami = ami
 
-    try:
-        await ami.connect()
-        logger.info("AMI connected to Asterisk at %s:%s", ami_host, ami_port)
-    except ConnectionError as e:
-        logger.error(
-            "AMI connection failed: %s — SMS will fail until Asterisk is reachable", e
-        )
-
-    # S06.2: Wire health checker with actual AMI client
-    health_checker._ami = ami
-    app.state.health_checker = health_checker
-
-    # S06.3: AMI auto-reconnect on failure
+    # S06.3: AMI auto-reconnect on failure. AMIClient has no internal
+    # reconnect — without this, a dropped AMI link is fatal until a
+    # manual restart.
     async def ami_reconnect() -> None:
         await ami.connect()
 
     async def on_ami_give_up() -> None:
         logger.critical(
             "AMI reconnect gave up after %d attempts — agent non-functional",
-            10,
+            AMI_RECONNECT_MAX_RETRIES,
+        )
+        await alerts.alert(
+            "ami_down",
+            f"AMI reconnect failed after {AMI_RECONNECT_MAX_RETRIES} "
+            f"attempts — agent non-functional",
         )
 
     ami_reconnector = BackoffReconnector(
@@ -108,10 +146,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         label="AMI",
         min_delay=2.0,
         max_delay=60.0,
-        max_retries=10,
+        max_retries=AMI_RECONNECT_MAX_RETRIES,
         on_give_up=on_ami_give_up,
     )
     app.state.ami_reconnector = ami_reconnector
+
+    # S06.3: one self-healing AMI client — any ConnectionError from any
+    # caller (request, poller, health check) kicks the reconnector;
+    # start() is a no-op while one is already in flight.
+    app.state.ami = AMIReconnect(ami, ami_reconnector)
+
+    try:
+        await app.state.ami.connect()
+        logger.info("AMI connected to Asterisk at %s:%s", ami_host, ami_port)
+    except ConnectionError as e:
+        logger.error(
+            "AMI connection failed: %s — backoff reconnect started", e
+        )
+
+    # S06.2: Wire health checker with the (wrapped) AMI client
+    health_checker._ami = app.state.ami
+    app.state.health_checker = health_checker
 
     # Initialize rate limiters
     from core.ratelimit import RateLimiter
@@ -152,22 +207,77 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # S05.1: derive modem state from the real device — without the poller
     # the provider stays OFFLINE forever and every outgoing call 503s.
+    # S06.2: the poller also feeds the modem_registered metric.
     from agent.modem_poll import run_modem_poller
 
     poll_interval = float(cfg.get("watchdog.modem_check_seconds", 30))
     poller_stop = asyncio.Event()
     poller_task = asyncio.create_task(
-        run_modem_poller(ami, modem_provider, dongle_id, poll_interval, poller_stop)
+        run_modem_poller(
+            app.state.ami,
+            modem_provider,
+            dongle_id,
+            poll_interval,
+            poller_stop,
+            metrics=metrics,
+        )
     )
     app.state.modem_poller_task = poller_task
 
     # Initialize call registry (S04.2)
+    # S06.2: call outcome + duration metrics are recorded via the
+    # registry's transition hook — one funnel, no per-route counters.
     call_registry = CallRegistry(
         sms_store=sms_store,
         audit=audit,
         modem_pool=modem_pool,
+        metrics=metrics,
     )
     app.state.call_registry = call_registry
+
+    # S06.2: modem watchdog — if the modem stays unavailable for
+    # max_resets consecutive checks, attempt a reset and alert on the
+    # outcome. The poller owns state detection; the watchdog owns
+    # recovery (see agent.py honesty report on the reset mechanism).
+    async def modem_check() -> bool:
+        return modem_provider.is_available(dongle_id)
+
+    async def modem_reset() -> None:
+        # The only reset verified to exist in this repo: AMI reconnect.
+        # A USB power-cycle would need hardware control the nodes do not
+        # have (no udev rule, no AMI reset action — Rule 2).
+        await ami.connect()
+
+    async def modem_alert_fn(message: str) -> None:
+        await alerts.alert(modem_alert_rule(message), message)
+
+    modem_watchdog = ModemWatchdog(
+        check_fn=modem_check,
+        reset_fn=modem_reset,
+        label=dongle_id,
+        check_interval=poll_interval,
+        max_resets=3,
+        alert_fn=modem_alert_fn,
+    )
+    await modem_watchdog.start()
+    app.state.modem_watchdog = modem_watchdog
+
+    # S06.2: supervisor — edge-triggered alerts from the health checker
+    # (dongle present / registration / peer reachability) plus
+    # component-metric refresh from the same check.
+    supervisor_stop = asyncio.Event()
+    supervisor_task = asyncio.create_task(
+        run_supervisor(
+            health_checker,
+            modem_provider,
+            dongle_id,
+            metrics,
+            alerts,
+            poll_interval,
+            supervisor_stop,
+        )
+    )
+    app.state.supervisor_task = supervisor_task
 
     # Initialize ACL manager (S04.3)
     acl = ACLManager(path=cfg["telegram.acl_file"])
@@ -179,6 +289,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # Shutdown
+    supervisor_stop.set()
+    await supervisor_task
+    modem_watchdog.stop()
+    ami_reconnector.stop()
     poller_stop.set()
     await poller_task
     await ami.close()
@@ -192,6 +306,19 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # S06.2: correlation IDs on every request. The inbound
+    # x-correlation-id (already used by the replay guard) is reused when
+    # present, so one ID links the HTTP request, the JSON log lines and
+    # the audit record; otherwise a fresh one is minted and returned to
+    # the caller.
+    @app.middleware("http")
+    async def set_request_correlation(request: Request, call_next):
+        cid = request.headers.get("x-correlation-id") or uuid.uuid4().hex
+        set_correlation(cid)
+        response = await call_next(request)
+        response.headers["x-correlation-id"] = cid
+        return response
 
     # API routes (auth is applied at router level via router.dependencies)
     app.include_router(api_router, prefix="/v1")

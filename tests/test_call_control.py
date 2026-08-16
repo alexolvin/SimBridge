@@ -945,9 +945,14 @@ class TestPjsipDistributed:
         """No SRTP transport configured — Tailscale already encrypts."""
         assert "srtp" not in self.pjsip.lower()
 
-    def test_binds_all_interfaces_in_distributed_mode(self):
-        """The remote node's bridge must reach Asterisk over the tailnet."""
-        assert "bind=0.0.0.0" in self.pjsip
+    def test_binds_tailscale_interface_in_distributed_mode(self):
+        """The remote node's bridge must reach Asterisk over the tailnet.
+
+        S06.1: bind is the Tailscale IP, NOT 0.0.0.0 — a wildcard SIP
+        listener on all interfaces is a finding, not a feature.
+        """
+        assert "bind=100.64.0.1" in self.pjsip
+        assert "0.0.0.0" not in self.pjsip
 
     def test_aor_points_at_remote_bridge(self):
         assert "contact=sip:100.x.x.x:5062" in self.pjsip

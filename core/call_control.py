@@ -38,10 +38,11 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from core.audit import AuditLogger
 from core.events import EventType
+from core.metrics import MetricsCollector
 from core.modem import ModemPool, ModemInfo
 from core.sms_correlation import SMSCorrelationStore
 
@@ -201,9 +202,14 @@ class CallMachine:
     telegram_user_id: Optional[int] = None
     telegram_call_id: Optional[str] = None
 
+    # Duration tracking (S06.2): set when entering BRIDGED, read at HANGUP
+    # to record the answered-call duration in metrics.
+    bridged_at: Optional[str] = None
+
     # Dependency references (set by registry)
     _sms_store: Optional[SMSCorrelationStore] = None
     _audit: Optional[AuditLogger] = None
+    _on_transition: Optional[Callable[["CallMachine"], None]] = None
 
     def __post_init__(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -230,12 +236,23 @@ class CallMachine:
         old_state = self.state
         self.state = new_state
         self.updated_at = datetime.now(timezone.utc).isoformat()
+        if new_state is CallState.BRIDGED:
+            self.bridged_at = self.updated_at
         logger.info(
             "Call %s: %s -> %s",
             self.call_id[:8],
             old_state.value,
             new_state.value,
         )
+        # S06.2: metrics hook — the single funnel every transition passes
+        # through. The hook must never break call control, so it is
+        # exception-guarded (a metrics failure is a log line, not a
+        # dropped call).
+        if self._on_transition is not None:
+            try:
+                self._on_transition(self)
+            except Exception:
+                logger.debug("on-transition hook failed", exc_info=True)
 
     @property
     def is_terminal(self) -> bool:
@@ -302,6 +319,7 @@ class CallRegistry:
         sms_store: SMSCorrelationStore,
         audit: AuditLogger,
         modem_pool: Optional[ModemPool] = None,
+        metrics: Optional[MetricsCollector] = None,
     ) -> None:
         self._calls: Dict[str, CallMachine] = {}
         self._lock = threading.Lock()
@@ -310,10 +328,47 @@ class CallRegistry:
         self._modems_reserved: int = 0
         # S05.1: Modem pool for multi-modem support
         self._modem_pool = modem_pool
+        # S06.2: call metrics — attached to every call as a transition hook
+        self._metrics = metrics
 
     @property
     def modem_pool(self) -> Optional[ModemPool]:
         return self._modem_pool
+
+    def _metrics_hook(self, call: CallMachine) -> None:
+        """S06.2: map call states to metrics counters.
+
+        Invoked from CallMachine.transition for EVERY transition (the hook
+        is attached in create_incoming/create_outgoing), so each terminal
+        state is counted exactly once — a transition can only land in a
+        terminal state once. Exceptions are swallowed at the call site:
+        metrics must never break call control.
+        """
+        if self._metrics is None:
+            return
+        m = self._metrics
+        state = call.state
+        if state is CallState.BRIDGED:
+            m.call_answered(call.direction)
+        elif state is CallState.REJECTED:
+            m.call_rejected(call.direction)
+        elif state is CallState.VOICEMAIL:
+            m.call_voicemail()
+        elif state is CallState.TELEGRAM_TIMEOUT:
+            m.call_timeout("outgoing")
+        elif state in (
+            CallState.GSM_BUSY,
+            CallState.GSM_NO_ANSWER,
+            CallState.GSM_ERROR,
+        ):
+            m.call_failed()
+        elif state is CallState.HANGUP and call.bridged_at:
+            try:
+                since = datetime.fromisoformat(call.bridged_at)
+            except ValueError:
+                return
+            duration = (datetime.now(timezone.utc) - since).total_seconds()
+            m.record_answered_duration(duration)
 
     def create_incoming(
         self,
@@ -337,6 +392,7 @@ class CallRegistry:
         )
         call._sms_store = self._sms_store
         call._audit = self._audit
+        call._on_transition = self._metrics_hook
         call.transition(CallState.RINGING)
         with self._lock:
             self._calls[call.call_id] = call
@@ -391,6 +447,7 @@ class CallRegistry:
         )
         call._sms_store = self._sms_store
         call._audit = self._audit
+        call._on_transition = self._metrics_hook
         call.transition(CallState.REQUESTED)
         # ACL check happens before this (in the route handler).
         # We transition through ACL_CHECKED to record that the check passed.

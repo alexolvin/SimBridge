@@ -33,9 +33,17 @@ from core.blacklist import BlacklistManager
 from core.phone import normalize_e164
 from core.events import EventType
 from core.errors import SMSErrorType
+from core.recovery import BackoffReconnector
 from userbot.bridge_control import BridgeControl
 
 logger = getLogger("simbridge.userbot")
+
+# S06.2: Telegram session reconnect parameters (module constants so
+# tests can monkeypatch them; the AMI reconnect uses the same convention
+# in agent/agent.py).
+TG_RECONNECT_MIN_DELAY = 5.0
+TG_RECONNECT_MAX_DELAY = 300.0
+TG_RECONNECT_MAX_RETRIES = 10
 
 # Pattern for explicit-number SMS: +79261234555: message
 EXPLICIT_NUMBER_RE = re.compile(
@@ -522,10 +530,76 @@ class Userbot:
         """Block until the client disconnects."""
         await self._client.run_until_disconnected()
 
+    async def run_with_recovery(self, alerts=None) -> None:
+        """S06.2: run until the Telegram session is unrecoverable.
+
+        ``run_until_disconnected()`` returns on EVERY session drop —
+        a transient network glitch included. Exitting on the first drop
+        would page the user (and require a manual restart) for blips
+        that reconnect cleanly, so instead:
+
+        1. alert the master via the passed AlertManager (if any),
+        2. reconnect with exponential backoff (up to
+           TG_RECONNECT_MAX_RETRIES attempts),
+        3. continue running on success — the handlers registered in
+           ``_register_handlers`` live on the client object and
+           survive the disconnect/reconnect cycle.
+
+        Returns only when the retries are exhausted: at that point the
+        session is most likely invalidated (revoked auth, 2FA change),
+        and the correct response is process exit → systemd restart →
+        the re-auth flow documented in ``docs/re-auth.md``.
+
+        Note (Rule 2): Telethon's exact ``connect()`` semantics after
+        ``run_until_disconnected()`` cannot be verified in this
+        environment (the library is not installed) — the reconnect
+        cycle is a MANUAL_VERIFY item (TS06-9).
+        """
+        while True:
+            await self.run_until_disconnected()
+            logger.error("Telegram session dropped — attempting reconnect")
+            if alerts is not None:
+                try:
+                    await alerts.alert(
+                        "telegram_session_invalid",
+                        "Telegram session dropped",
+                    )
+                except Exception:  # noqa: BLE001 — alerting must not block recovery
+                    logger.debug("session-drop alert failed", exc_info=True)
+            try:
+                ok = await BackoffReconnector(
+                    operation=self._client.connect,
+                    label="Telegram session",
+                    min_delay=TG_RECONNECT_MIN_DELAY,
+                    max_delay=TG_RECONNECT_MAX_DELAY,
+                    max_retries=TG_RECONNECT_MAX_RETRIES,
+                ).start()
+            except Exception as e:
+                ok = False
+                logger.error("Telegram reconnect raised: %s", e)
+            if not ok:
+                logger.critical(
+                    "Telegram reconnect failed after %d attempts — session "
+                    "may be invalid; exiting for the systemd re-auth restart "
+                    "(see docs/re-auth.md)",
+                    TG_RECONNECT_MAX_RETRIES,
+                )
+                return
+            logger.info("Telegram session re-established")
+
     @property
     def client(self):
         """Telethon client (exposed for the in-process HTTP server, D1)."""
         return self._client
+
+    @property
+    def master_id(self) -> Optional[int]:
+        """Master user's Telegram ID, resolved in ``resolve_master()``.
+
+        Exposed for the HTTP server (S06.2: /events/alert forwards
+        agent alerts to this ID) and for local alert sends.
+        """
+        return self._master_id
 
     @property
     def acl(self) -> ACLManager:

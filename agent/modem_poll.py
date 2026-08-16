@@ -26,6 +26,7 @@ async def poll_modem_state(
     ami,
     provider: "ModemProvider",
     modem_id: str,
+    metrics=None,
 ) -> bool:
     """Run one poll cycle: query the device, feed the provider.
 
@@ -35,7 +36,9 @@ async def poll_modem_state(
     Device absent   -> ``mark_offline()`` (unplugged / driver reset).
     AMI unreachable -> the last known state is kept and logged; the poll
                        retried next cycle. State is only as stale as one
-                       poll interval, never fabricated.
+                       poll interval, never fabricated (and the
+                       ``modem_registered`` metric is NOT updated either —
+                       an AMI outage is not evidence of deregistration).
     """
     try:
         status = await ami.get_modem_status()
@@ -45,6 +48,8 @@ async def poll_modem_state(
     if not status:
         # No DongleDeviceEntry for this device — it is gone.
         provider.mark_offline(modem_id)
+        if metrics is not None:
+            metrics.set_modem_registered(False)
         return False
     provider.update_state(
         modem_id,
@@ -52,6 +57,8 @@ async def poll_modem_state(
         signal_percent=status.get("signal_percent"),
         operator=status.get("operator"),
     )
+    if metrics is not None:
+        metrics.set_modem_registered(status.get("registered", False))
     return provider.is_available(modem_id)
 
 
@@ -61,6 +68,7 @@ async def run_modem_poller(
     modem_id: str,
     interval: float,
     stop: Optional[asyncio.Event] = None,
+    metrics=None,
 ) -> None:
     """Poll the device every *interval* seconds until *stop* is set.
 
@@ -71,7 +79,7 @@ async def run_modem_poller(
         stop = asyncio.Event()
     while not stop.is_set():
         try:
-            await poll_modem_state(ami, provider, modem_id)
+            await poll_modem_state(ami, provider, modem_id, metrics=metrics)
         except Exception:  # noqa: BLE001 — a poll must never kill the loop
             logger.exception("modem state poll cycle crashed — retrying")
         try:

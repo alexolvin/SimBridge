@@ -20,6 +20,7 @@ from agent import deps
 from agent.routes import router
 from core.audit import AuditLogger
 from core.events import EventType
+from core.metrics import MetricsCollector
 from core.sms_correlation import SMSCorrelationStore
 
 
@@ -93,6 +94,8 @@ def env(tmp_path, capture, monkeypatch):
     }
     app.state.sms_store = store
     app.state.audit = FakeAudit()
+    # S06.2: the report route counts delivery outcomes.
+    app.state.metrics = MetricsCollector()
 
     monkeypatch.setenv("SIMBRIDGE_HTTP_SECRET", "sec")
     old_token, old_peers = deps._agent_token, deps._allowed_peers
