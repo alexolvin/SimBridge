@@ -229,14 +229,22 @@ def build_answers(node: Node, sh: Shared) -> Dict[str, str]:
     d["install_tailscale"] = "true" if not node.ts_present else "false"
     d["install_tailscale_opt"] = "false"
     d["node_id"] = node.node_id
+    # Empty values are OMITTED: the installer falls back to the value
+    # from the node's existing config (update mode) or its own default.
     if node.role in ("gsm", "all-in-one"):
-        d["modem_model"] = sh.modem_model
-        d["sim_phone"] = sh.sim_phone
-        d["dongle_name"] = sh.dongle_name
+        if sh.modem_model:
+            d["modem_model"] = sh.modem_model
+        if sh.sim_phone:
+            d["sim_phone"] = sh.sim_phone
+        if sh.dongle_name:
+            d["dongle_name"] = sh.dongle_name
     if node.role in ("telegram", "all-in-one"):
-        d["tg_api_id"] = sh.tg_api_id
-        d["tg_api_hash"] = sh.tg_api_hash
-        d["tg_username"] = sh.tg_username
+        if sh.tg_api_id:
+            d["tg_api_id"] = sh.tg_api_id
+        if sh.tg_api_hash:
+            d["tg_api_hash"] = sh.tg_api_hash
+        if sh.tg_username:
+            d["tg_username"] = sh.tg_username
     # Pre-generated on the PC — identical on every node.
     d["agent_token"] = sh.agent_token
     d["bridge_secret"] = sh.bridge_secret
@@ -244,6 +252,9 @@ def build_answers(node: Node, sh: Shared) -> Dict[str, str]:
     if sh.install_type == "distributed":
         d["own_ip"] = node.own_ip
         d["peer_ip"] = node.peer_ip
+    # acl_ids is ALWAYS sent (never omitted when empty): install.py
+    # marks it required=True and never falls back to the existing
+    # value — the PC-side question enforces it accordingly.
     d["acl_ids"] = sh.acl_ids
     # Login is TTY-bound (later, via --tg-login); the peer is not up
     # during the first pass (the PC cross-checks afterwards).
@@ -496,18 +507,33 @@ def gather_params() -> Tuple[List[Node], Shared]:
         nodes[0].role = "all-in-one"
         nodes[0].node_id = q("Node id", "simbridge-1")
 
+    # Credential/config values are OPTIONAL on the PC side: Enter keeps
+    # the value already present on the node (update mode — the installer
+    # reads its existing /etc/simbridge and reuses it; install.py
+    # _ans_str: missing key -> existing default). On a fresh node the
+    # installer enforces required-ness itself and names the exact
+    # missing key. The PC must never duplicate the node's validation.
+    # Exception: acl_ids — install.py marks it required=True and NEVER
+    # falls back to the existing ACL (an unattended redeploy must
+    # confirm who keeps admin access), so the PC always collects it.
     needs_gsm = any(x.role in ("gsm", "all-in-one") for x in nodes)
     needs_tg = any(x.role in ("telegram", "all-in-one") for x in nodes)
     if needs_gsm:
-        sh.sim_phone = q("SIM phone number (E.164)", required=True)
-        sh.modem_model = q("Modem model (lsusb string)", required=True)
-        sh.dongle_name = q("chan_dongle device name", "gsm")
+        sh.sim_phone = q("SIM phone number (E.164)"
+                         " [Enter = keep on-node value]", "")
+        sh.modem_model = q("Modem model (lsusb string)"
+                           " [Enter = keep on-node value]", "")
+        sh.dongle_name = q("chan_dongle device name"
+                           " [Enter = keep/auto on node]", "")
     if needs_tg:
-        sh.tg_api_id = q("Telegram API_ID (my.telegram.org/apps)", required=True)
-        sh.tg_api_hash = q("Telegram API_HASH", required=True)
-        sh.tg_username = q("Master Telegram username (without @)",
-                           required=True)
-    sh.acl_ids = q("ACL Telegram user IDs (comma-separated)", required=True)
+        sh.tg_api_id = q("Telegram API_ID (my.telegram.org/apps)"
+                         " [Enter = keep on-node value]", "")
+        sh.tg_api_hash = q("Telegram API_HASH"
+                           " [Enter = keep on-node value]", "")
+        sh.tg_username = q("Master Telegram username (without @)"
+                           " [Enter = keep on-node value]", "")
+    sh.acl_ids = q("ACL Telegram user IDs (comma-separated)",
+                   required=True)
     sh.branch = q("Git branch to deploy", "main")
     return nodes, sh
 

@@ -222,6 +222,38 @@ class TestBuildAnswers:
         assert "tg_api_id" not in dg
         assert dt["tg_api_id"] == "1"
 
+    def test_empty_optional_values_omitted(self):
+        # Update mode: credential fields left blank on the PC must be
+        # ABSENT from the answers file — install.py _ans_str then falls
+        # back to the node's existing config (missing key -> default).
+        gsm = ir.Node(name="g", ssh_user="op", role="gsm", node_id="gsm-1",
+                      own_ip="100.64.0.2", peer_ip="100.64.0.3")
+        tg = ir.Node(name="t", ssh_user="op", role="telegram", node_id="tg-1",
+                     own_ip="100.64.0.3", peer_ip="100.64.0.2")
+        sh = ir.Shared(install_type="distributed", dongle_name="",
+                       agent_token="tok", bridge_secret="bs",
+                       http_secret="hs", acl_ids="1")
+        dg, dt = ir.build_answers(gsm, sh), ir.build_answers(tg, sh)
+        # Optional fields empty -> omitted on the node that would use them.
+        for k in ("modem_model", "sim_phone", "dongle_name"):
+            assert k not in dg
+        for k in ("tg_api_id", "tg_api_hash", "tg_username"):
+            assert k not in dt
+        # ...and role-foreign fields stay absent as before.
+        for k in ("tg_api_id", "tg_api_hash", "tg_username"):
+            assert k not in dg
+        for k in ("modem_model", "sim_phone", "dongle_name"):
+            assert k not in dt
+        # acl_ids is ALWAYS sent: install.py marks it required=True and
+        # never falls back to the existing ACL value.
+        assert dg["acl_ids"] == "1" and dt["acl_ids"] == "1"
+        # Shared secrets + network wiring still present on both nodes.
+        for k in ("agent_token", "bridge_secret", "http_secret",
+                  "own_ip", "peer_ip"):
+            assert dg[k] and dt[k]
+        assert dg["own_ip"] == "100.64.0.2" and dt["own_ip"] == "100.64.0.3"
+        assert dg["peer_ip"] == "100.64.0.3" and dt["peer_ip"] == "100.64.0.2"
+
     def test_action_keys(self):
         n = ir.Node(name="a", ssh_user="op", role="gsm", node_id="g1",
                     ts_present=True)
