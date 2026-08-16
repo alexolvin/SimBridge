@@ -280,6 +280,55 @@ class TestParsePreflight:
         assert d["TS_IP"] == "" and d["SUDO_OK"] == "0"
 
 
+class TestLocalTransport:
+    """node.name 'local'/'localhost' -> commands run via `bash -c`
+    on the machine executing the orchestrator (repo lives on a
+    deploy target)."""
+
+    def test_ssh_cmd_local(self):
+        assert ir.ssh_cmd(ir.Node(name="local", ssh_user="op"),
+                          "tailscale") == ["bash", "-c"]
+        assert ir.ssh_cmd(ir.Node(name="localhost", ssh_user="op"),
+                          "ssh") == ["bash", "-c"]
+
+    def test_ssh_cmd_remote_unchanged(self):
+        n = ir.Node(name="x", ssh_user="op")
+        assert ir.ssh_cmd(n, "tailscale") == ["tailscale", "ssh", "op@x"]
+        assert ir.ssh_cmd(n, "ssh") == [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "op@x"]
+
+    def test_run_remote_local_captured(self, monkeypatch):
+        class P:
+            returncode = 0
+            stdout = b"hello\n"
+            stderr = b""
+        seen = {}
+        monkeypatch.setattr(
+            ir.subprocess, "run",
+            lambda argv, **kw: (seen.update(argv=argv) or P()))
+        rc, out = ir.run_remote(ir.Node(name="local", ssh_user="op"),
+                                "tailscale", "echo hello")
+        assert (rc, out) == (0, "hello\n")
+        assert seen["argv"] == ["bash", "-c", "echo hello"]
+
+    def test_run_remote_local_stream(self, monkeypatch, capsys):
+        import io
+
+        class Proc:
+            stdout = io.StringIO("l1\nl2\n")
+
+            def wait(self):
+                return 0
+
+        monkeypatch.setattr(ir.subprocess, "Popen",
+                            lambda argv, **kw: Proc())
+        rc, out = ir.run_remote(ir.Node(name="local", ssh_user="op"),
+                                "tailscale", "cmd", stream=True)
+        assert rc == 0 and out == "l1\nl2\n"
+        assert "[local] l1" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Orchestration (fake transport)
 # ---------------------------------------------------------------------------

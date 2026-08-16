@@ -7,6 +7,9 @@ SimBridge onto one or two tailnet nodes by driving the on-node engine
 
     tailscale ssh user@node     preferred (PC has the `tailscale` CLI)
     ssh user@node               fallback (tailnet hostname must resolve)
+    node name "local"           the machine running the orchestrator
+                                itself (e.g. the repo checkout lives on
+                                one of the deploy targets)
 
 Per node the orchestrator:
   1. preflights: reachability, passwordless sudo, tailscale join state,
@@ -51,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
 import secrets
 import shutil
@@ -132,7 +136,20 @@ def detect_transport() -> str:
     return "tailscale" if shutil.which("tailscale") else "ssh"
 
 
+# Node names that mean "this machine" — the orchestrator runs the
+# commands locally instead of over SSH.
+LOCAL_NAMES = ("local", "localhost")
+
+
 def ssh_cmd(node: Node, transport: str) -> List[str]:
+    """argv prefix that runs a command string on the node.
+
+    Local nodes run as the current user via `bash -c` — the same shape
+    as the remote path (a shell string; commands embed `sudo` where
+    root is needed), so the orchestration layer is transport-blind.
+    """
+    if node.name in LOCAL_NAMES:
+        return ["bash", "-c"]
     target = f"{node.ssh_user}@{node.name}"
     if transport == "tailscale":
         return ["tailscale", "ssh", target]
@@ -142,7 +159,7 @@ def ssh_cmd(node: Node, transport: str) -> List[str]:
 def run_remote(node: Node, transport: str, cmd: str,
                timeout: Optional[int] = None, stream: bool = False,
                stdin: Optional[bytes] = None) -> Tuple[int, str]:
-    """Run a remote shell command.
+    """Run a shell command on the node ('local' node = this machine).
 
     stream=True echoes output line-by-line to the PC console (used for
     the long install run); otherwise output is captured silently.
@@ -492,8 +509,15 @@ def gather_params() -> Tuple[List[Node], Shared]:
     nodes: List[Node] = []
     n = 2 if sh.install_type == "distributed" else 1
     for i in range(1, n + 1):
-        name = q(f"Node {i} tailscale name", required=True)
-        user = q(f"Node {i} ssh user", required=True)
+        name = q(f"Node {i} tailscale name ('local' = this machine)",
+                 required=True)
+        if name in LOCAL_NAMES:
+            # No ssh user to ask for — commands run as the current
+            # user of the machine executing the orchestrator.
+            user = getpass.getuser()
+            print(f"  (local node — will run as {user!r})")
+        else:
+            user = q(f"Node {i} ssh user", required=True)
         nodes.append(Node(name=name, ssh_user=user))
 
     if sh.install_type == "distributed":
@@ -604,7 +628,9 @@ def orchestrate(args: argparse.Namespace) -> int:
 
     # Preflight every node.
     for node in nodes:
-        print(f"\n── Preflight {node.name} ({node.ssh_user}@{node.name})")
+        where = (node.name if node.name in LOCAL_NAMES
+                 else f"{node.ssh_user}@{node.name}")
+        print(f"\n── Preflight {node.name} ({where})")
         ok, detail = preflight(node, transport)
         if not ok:
             node.errors.append(f"preflight: {detail}")
@@ -668,8 +694,11 @@ def orchestrate(args: argparse.Namespace) -> int:
                and x.ok), None)
     if tg:
         print(f"\nNext step — Telegram login (interactive, one time):")
-        print(f"  tailscale ssh {tg.ssh_user}@{tg.name}")
-        print(f"  sudo python3 /opt/simbridge/deploy/install.py --tg-login")
+        if tg.name in LOCAL_NAMES:
+            print("  (this machine — run directly)")
+        else:
+            print(f"  tailscale ssh {tg.ssh_user}@{tg.name}")
+        print("  sudo python3 /opt/simbridge/deploy/install.py --tg-login")
     print()
     return 0 if not final_problems and all(x.ok for x in nodes) else 2
 
