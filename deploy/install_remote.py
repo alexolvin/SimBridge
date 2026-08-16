@@ -190,11 +190,29 @@ def run_remote(node: Node, transport: str, cmd: str,
 def upload_remote(node: Node, transport: str, data: bytes, remote_path: str,
                   mode: str = "0600",
                   timeout: int = TIMEOUT_UPLOAD) -> Tuple[int, str]:
-    """Upload bytes to the node: base64 over ssh stdin → sudo tee."""
+    """Upload bytes to the node: base64 over ssh stdin → sudo tee.
+
+    The payload is base64-encoded on the PC side: the node's
+    `base64 -d` restores the exact bytes, and the encoding keeps
+    binary data intact through `tailscale ssh` (PTY CRLF/8-bit
+    mangling). Size is verified on the node afterwards — the
+    `&&` chain alone cannot catch a decode failure (the pipeline
+    exit status is `tee`'s, so a mangled payload would still print
+    UPLOAD_OK with an empty file).
+    """
     cmd = (f"base64 -d | sudo tee {remote_path} >/dev/null"
            f" && sudo chmod {mode} {remote_path} && echo UPLOAD_OK")
-    rc, out = run_remote(node, transport, cmd, timeout=timeout, stdin=data)
-    return rc, out
+    rc, out = run_remote(node, transport, cmd, timeout=timeout,
+                         stdin=base64.b64encode(data))
+    if "UPLOAD_OK" not in out:
+        return rc, out
+    rc, size_out = run_remote(node, transport,
+                              f"sudo stat -c %s {remote_path}",
+                              timeout=TIMEOUT_PREFLIGHT)
+    if rc != 0 or size_out.strip() != str(len(data)):
+        return 1, (f"SIZE_MISMATCH expected={len(data)}"
+                   f" got={size_out.strip() or f'rc={rc}'}")
+    return 0, out
 
 
 def pc_tailscale_ips() -> Dict[str, str]:

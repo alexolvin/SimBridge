@@ -329,6 +329,51 @@ class TestLocalTransport:
         assert "[local] l1" in capsys.readouterr().out
 
 
+class TestUploadRemote:
+    """upload_remote must base64-encode the payload (node runs
+    `base64 -d`) and verify the resulting file size on the node."""
+
+    def _patch(self, monkeypatch, stat_out="42\n"):
+        calls = []
+
+        def fake_run(node, transport, cmd, **kw):
+            calls.append((cmd, kw.get("stdin")))
+            if "base64 -d" in cmd:
+                return 0, "UPLOAD_OK\n"
+            if "stat -c %s" in cmd:
+                return 0, stat_out
+            return 0, ""
+
+        monkeypatch.setattr(ir, "run_remote", fake_run)
+        return calls
+
+    def test_encodes_base64_and_verifies_size(self, monkeypatch):
+        payload = b"print('hi')\n" * 10
+        calls = self._patch(monkeypatch, stat_out=f"{len(payload)}\n")
+        node = ir.Node(name="n", ssh_user="op")
+        rc, out = ir.upload_remote(node, "tailscale", payload, "/tmp/x.py")
+        assert rc == 0 and "UPLOAD_OK" in out
+        up_cmd, up_stdin = calls[0]
+        assert "base64 -d" in up_cmd
+        assert base64.b64decode(up_stdin) == payload
+        assert "stat -c %s /tmp/x.py" in calls[1][0]
+
+    def test_size_mismatch_fails(self, monkeypatch):
+        payload = b"x" * 100
+        self._patch(monkeypatch, stat_out="12\n")
+        node = ir.Node(name="n", ssh_user="op")
+        rc, out = ir.upload_remote(node, "ssh", payload, "/tmp/x.py")
+        assert rc != 0
+        assert "UPLOAD_OK" not in out and "SIZE_MISMATCH" in out
+
+    def test_stat_failure_fails(self, monkeypatch):
+        payload = b"x" * 100
+        self._patch(monkeypatch, stat_out="")
+        node = ir.Node(name="n", ssh_user="op")
+        rc, out = ir.upload_remote(node, "ssh", payload, "/tmp/x.py")
+        assert rc != 0 and "SIZE_MISMATCH" in out
+
+
 # ---------------------------------------------------------------------------
 # Orchestration (fake transport)
 # ---------------------------------------------------------------------------
