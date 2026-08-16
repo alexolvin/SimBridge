@@ -474,6 +474,31 @@ class TestOrchestrateFailures:
         out = capsys.readouterr().out
         assert "cross-check" in out
 
+    def test_partial_deploy_reports_skip_not_healthy(
+            self, fake_remote, monkeypatch, capsys):
+        # One node fails its install: the report must say the
+        # cross-check was skipped — NOT "both endpoints healthy".
+        fake_remote.ips = {"node-a": "100.64.0.2",
+                           "node-b": "100.64.0.3"}
+        monkeypatch.setattr(ir, "check_url",
+                            lambda url, token=None: (True, "{}"))
+        real_run = fake_remote.run
+
+        def run_partial(node, transport, cmd, timeout=None,
+                        stream=False, stdin=None):
+            if "--answers" in cmd and node.name == "node-b":
+                return 1, "installer crashed\n"
+            return real_run(node, transport, cmd, timeout=timeout,
+                            stream=stream, stdin=stdin)
+
+        monkeypatch.setattr(ir, "run_remote", run_partial)
+        rc = run_orchestrate(monkeypatch, TWO_Q)
+        assert rc == 2
+        out = capsys.readouterr().out
+        assert "node-b" in out and "FAILED" in out
+        assert "cross-check skipped" in out
+        assert "both endpoints healthy" not in out
+
     def test_unreachable_node_blocks_it(self, fake_remote, monkeypatch,
                                         capsys):
         fake_remote.unreachable = True

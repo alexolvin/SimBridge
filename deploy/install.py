@@ -1163,7 +1163,7 @@ def _chown_asterisk(p: Path) -> None:
     """Chown a file to the asterisk user (uid/gid looked up by name)."""
     try:
         st = pwd.getpwnam("asterisk")
-        p.chown(st.pw_uid, st.pw_gid)
+        os.chown(p, st.pw_uid, st.pw_gid)
     except (KeyError, OSError):
         pass
 
@@ -1258,7 +1258,7 @@ def _install_asterisk_dialplan() -> None:
             ok("Globals unchanged.", AST_GLOBALS)
         try:
             _g = grp.getgrnam("asterisk")
-            Path(AST_PJSIP).chown(0, _g.gr_gid)
+            os.chown(AST_PJSIP, 0, _g.gr_gid)
         except (KeyError, OSError):
             pass
         Path(AST_PJSIP).chmod(0o640)

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import stat
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -416,3 +417,35 @@ class TestLoadExistingRole:
                             str(tmp_path / "absent.yaml"))
         install._load_existing_config()
         assert install.s.node_role == ""
+
+
+# ---------------------------------------------------------------------------
+# _chown_asterisk — POSIX chown (Path.chown is Windows-only; a live deploy
+# on AlmaLinux crashed with AttributeError before the os.chown fix)
+# ---------------------------------------------------------------------------
+
+class TestChownAsterisk:
+    def test_chowns_to_asterisk_user(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(install.pwd, "getpwnam",
+                            lambda name: types.SimpleNamespace(
+                                pw_uid=502, pw_gid=502))
+        monkeypatch.setattr(install.os, "chown",
+                            lambda *a: calls.append(a))
+        target = tmp_path / "manager_custom.conf"
+        target.write_text("[simbridge]\n")
+        install._chown_asterisk(target)
+        assert calls == [(target, 502, 502)]
+
+    def test_missing_asterisk_user_is_swallowed(self, tmp_path,
+                                                 monkeypatch):
+        def _no_user(name):
+            raise KeyError(name)
+        monkeypatch.setattr(install.pwd, "getpwnam", _no_user)
+        calls = []
+        monkeypatch.setattr(install.os, "chown",
+                            lambda *a: calls.append(a))
+        target = tmp_path / "pjsip.conf"
+        target.write_text("")
+        install._chown_asterisk(target)   # must not raise
+        assert calls == []

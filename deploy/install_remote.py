@@ -686,12 +686,15 @@ def orchestrate(args: argparse.Namespace) -> int:
         else:
             print(f"  node {node.name}: FAILED")
 
-    # Cross-node health — only when every node deployed.
+    # Cross-node health — only when every node deployed. A partial
+    # deployment must be reported as skipped, never as healthy.
     final_problems: List[str] = []
-    if len(deployed) == len(nodes) and nodes:
+    if nodes and len(deployed) == len(nodes):
         final_problems = cross_check(deployed, sh, transport)
-    elif len(deployed) == 0:
-        final_problems = ["no node deployed"]
+    elif nodes:
+        final_problems = (["no node deployed"] if not deployed
+                          else ["cross-check skipped — not every node "
+                                "deployed successfully"])
 
     # Report.
     print("\n" + "═" * 64)
