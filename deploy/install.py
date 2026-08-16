@@ -11,10 +11,47 @@ The script clones the SimBridge repository, installs system and Python
 dependencies, configures services, and guides you through first-time setup.
 
 Uses ONLY the Python standard library.
+
+Non-interactive (unattended / remote orchestrator):
+
+    sudo python3 install.py --answers answers.env [--result result.json]
+
+answers.env is a key=value file (# comments, values optionally quoted).
+All keys:
+
+    install_type          Single-node (all-in-one) | Two-node (distributed)
+    node_role             GSM node (Asterisk + modem) | Telegram node (userbot)
+    action                Remove existing and start fresh | Update in place
+    install_tailscale     y/n — distributed mode (default y)
+    install_tailscale_opt y/n — single-node mode (default n)
+    node_id               node identifier
+    modem_model           USB modem model (GSM nodes)
+    sim_phone             e164 SIM number, e.g. +7926XXXXXXX
+    dongle_name           chan_dongle device name (default gsm)
+    ami_password          empty = auto-detect/generate
+    tg_api_id             Telegram API_ID (my.telegram.org/apps)
+    tg_api_hash           Telegram API_HASH
+    tg_username           Telegram username without @
+    agent_token           empty = auto-generate (GSM node); must match peer
+    bridge_secret         empty = auto-generate (GSM node); must match peer
+    http_secret           empty = auto-generate (GSM node); must match peer
+    own_ip                this node's Tailscale IP (default: tailscale ip -4)
+    peer_ip               peer node's Tailscale IP (distributed: required)
+    acl_ids               Telegram user ID(s), space-separated (required)
+    tg_login              y/n — login during install (default n unattended)
+    peer_ready            y/n — run the cross-node check (default y)
+
+Exit codes: 0 = ok; 1 = error; 2 = installed but verification failed.
+
+On the Telegram node, log in to Telegram after installation with:
+
+    sudo python3 install.py --tg-login
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import re
 import sys
@@ -134,8 +171,93 @@ def heading(title: str) -> None:
     _w(f"\n{C.B}=== {title} ==={C._0}\n")
 
 # ─── Prompts ────────────────────────────────────────────────────────────────
+#
+# Interactive mode reads from the terminal. Non-interactive mode
+# (--answers FILE) answers the same questions from a key=value file, so
+# every phase runs identically in both modes — these three helpers are
+# the single injection point (Rule 1: no parallel prompt machinery).
 
-def ask(label: str, default: str = "", *, required: bool = False) -> str:
+_NONINTERACTIVE = False
+_ANSWERS: Dict[str, str] = {}
+_RESULT_PATH: str = ""
+
+# All keys an answers file may contain. Unknown keys are warned, not
+# failed, so answers files stay forward-compatible across versions.
+KNOWN_KEYS = ("install_type", "node_role", "action",
+              "install_tailscale", "install_tailscale_opt",
+              "node_id", "modem_model", "sim_phone", "dongle_name",
+              "ami_password",
+              "tg_api_id", "tg_api_hash", "tg_username",
+              "agent_token", "bridge_secret", "http_secret",
+              "own_ip", "peer_ip", "acl_ids",
+              "tg_login", "peer_ready")
+
+def _load_answers(path: str) -> Dict[str, str]:
+    """Parse a key=value answers file (same convention as ENV_FILE).
+
+    '#' lines and blanks are skipped, values may be quoted. Malformed
+    lines are warned and skipped; unknown keys are warned (forward
+    compatibility). A missing file is fatal.
+    """
+    p = Path(path)
+    if not p.exists():
+        fail("Answers file not found:", f" {path}")
+        sys.exit(1)
+    answers: Dict[str, str] = {}
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            warn(f"Skipping malformed line: {line[:60]}")
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k not in KNOWN_KEYS:
+            warn(f"Unknown key in answers file (ignored): {k}")
+            continue
+        answers[k] = v
+    return answers
+
+def _ans_str(key: str, default: str, *, required: bool = False) -> str:
+    """Answer for ask() in non-interactive mode.
+
+    Present and non-empty -> the value. Missing or empty -> the default
+    (same semantics as pressing Enter interactively), unless required —
+    then exit 1, naming the key the orchestrator must fix.
+    """
+    if key in _ANSWERS:
+        val = _ANSWERS[key]
+        if val:
+            return val
+        if required:
+            fail(f"Answer '{key}' is empty in the answers file.", "")
+            sys.exit(1)
+        return default
+    if required:
+        fail(f"Missing required answer '{key}'.",
+             f" Add '{key} = <value>' to the answers file.")
+        sys.exit(1)
+    return default
+
+def _ans_bool(key: str, default: bool) -> bool:
+    """Answer for ask_yn() in non-interactive mode."""
+    if key not in _ANSWERS:
+        return default
+    val = _ANSWERS[key].strip().lower()
+    if val in ("y", "yes", "true", "1"):
+        return True
+    if val in ("n", "no", "false", "0"):
+        return False
+    fail(f"Invalid boolean answer for '{key}': {val!r}.",
+         " Use y/yes/true/1 or n/no/false/0.")
+    sys.exit(1)
+
+def ask(label: str, default: str = "", *, required: bool = False,
+        key: str = "") -> str:
+    if _NONINTERACTIVE:
+        return _ans_str(key or label, default, required=required)
     while True:
         suffix = f" (default: {default})" if default else ""
         sys.stderr.write(f"{C.C}? {label}{suffix}: {C._0}")
@@ -146,7 +268,9 @@ def ask(label: str, default: str = "", *, required: bool = False) -> str:
             continue
         return answer
 
-def ask_yn(label: str, default: bool = True) -> bool:
+def ask_yn(label: str, default: bool = True, *, key: str = "") -> bool:
+    if _NONINTERACTIVE:
+        return _ans_bool(key or label, default)
     hint = "[Y/n]" if default else "[y/N]"
     sys.stderr.write(f"{C.C}? {label} {hint}: {C._0}")
     sys.stderr.flush()
@@ -155,7 +279,21 @@ def ask_yn(label: str, default: bool = True) -> bool:
         return default
     return ch in ("y", "yes")
 
-def pick(label: str, options: List[str], default_idx: int = 0) -> str:
+def pick(label: str, options: List[str], default_idx: int = 0,
+         *, key: str = "") -> str:
+    if _NONINTERACTIVE:
+        if key in _ANSWERS:
+            val = _ANSWERS[key].strip()
+            if not val:
+                return options[default_idx]
+            if val in options:
+                return val
+            if val.isdigit() and 1 <= int(val) <= len(options):
+                return options[int(val) - 1]
+            fail(f"Invalid answer for '{key}': {val!r}.",
+                 f" Choose one of: {', '.join(options)}")
+            sys.exit(1)
+        return options[default_idx]
     _w(f"{C.C}  {label}{C._0}")
     for i, opt in enumerate(options, 1):
         _w(f"    {i}) {opt}")
@@ -243,6 +381,11 @@ class S:
 
     # Verification results — populated by phase_verify()
     verify_issues: List = []
+
+    # Shared secrets auto-generated on this node (non-interactive mode
+    # reports them in the result JSON so the orchestrator can wire the
+    # peer). The AMI password is node-local and never listed here.
+    generated_secrets: List[str] = []
 
     # Asterisk change tracking — set by _setup_ami() / _install_asterisk_dialplan()
     # so phase_start() can reload or restart Asterisk with the right urgency.
@@ -345,7 +488,8 @@ def detect_existing() -> Dict[str, Any]:
 def phase_type() -> None:
     heading("1 / 8 — Installation Type")
     c = pick("Deployment type:",
-             ["Single-node (all-in-one)", "Two-node (distributed)"], 0)
+             ["Single-node (all-in-one)", "Two-node (distributed)"], 0,
+             key="install_type")
     s.install_type = "single" if "Single" in c else "distributed"
 
     if s.install_type == "single":
@@ -353,7 +497,8 @@ def phase_type() -> None:
         info("All services on this machine.")
     else:
         c = pick("Role of THIS machine:",
-                 ["GSM node (Asterisk + modem)", "Telegram node (userbot)"], 0)
+                 ["GSM node (Asterisk + modem)", "Telegram node (userbot)"], 0,
+                 key="node_role")
         s.node_role = "gsm" if "GSM" in c else "telegram"
         info(f"Role: {s.node_role}")
 
@@ -374,7 +519,8 @@ def phase_existing() -> None:
         info("  Paths:", f" {', '.join(ex['paths'])}")
 
     c = pick("Action:",
-             ["Remove existing and start fresh", "Update in place", "Abort"], 1)
+             ["Remove existing and start fresh", "Update in place", "Abort"], 1,
+             key="action")
     if "Remove" in c:
         s.action = "remove"
     elif "Abort" in c:
@@ -420,12 +566,14 @@ def phase_diag() -> None:
             ok("Tailscale:", f" {s.ts_ip}")
         else:
             warn("Tailscale not installed (required for distributed mode).")
-            s.do_ts = ask_yn("Install Tailscale now?")
+            s.do_ts = ask_yn("Install Tailscale now?",
+                             key="install_tailscale")
     else:
         if s.has_ts:
             ok("Tailscale:", f" {s.ts_ip}")
         else:
-            s.do_ts_opt = ask_yn("Install Tailscale (recommended)?", False)
+            s.do_ts_opt = ask_yn("Install Tailscale (recommended)?", False,
+                                 key="install_tailscale_opt")
 
     if gsm:
         if s.tty_devs:
@@ -440,47 +588,57 @@ def phase_diag() -> None:
 def phase_gather() -> None:
     heading("4 / 8 — Configuration")
     _nid = s.node_id or os.uname().nodename
-    s.node_id = ask("Node ID", default=_nid)
+    s.node_id = ask("Node ID", default=_nid, key="node_id")
 
     gsm = s.node_role in ("gsm", "all-in-one")
     tg = s.node_role in ("telegram", "all-in-one")
 
     if gsm:
         info("", "--- GSM / Modem ---")
-        modems = s.usb_modems
-        if modems:
-            choices = list(modems) + ["Other (manual entry)"]
-            s.modem_model = pick("Select connected modem:", choices, 0)
-            if s.modem_model == "Other (manual entry)":
-                s.modem_model = ask("Enter modem model manually", required=True)
+        if _NONINTERACTIVE:
+            # The lsusb option list is dynamic — a static answers file
+            # can't pick among it, so the model is given directly.
+            if not s.modem_model:
+                s.modem_model = _ans_str("modem_model", "")
         else:
-            warn("No USB modems detected via lsusb.")
-            s.modem_model = ask("Enter modem model manually",
-                                required=True, default=s.modem_model)
+            modems = s.usb_modems
+            if modems:
+                choices = list(modems) + ["Other (manual entry)"]
+                s.modem_model = pick("Select connected modem:", choices, 0)
+                if s.modem_model == "Other (manual entry)":
+                    s.modem_model = ask("Enter modem model manually",
+                                        required=True)
+            else:
+                warn("No USB modems detected via lsusb.")
+                s.modem_model = ask("Enter modem model manually",
+                                    required=True, default=s.modem_model)
         s.sim_phone = ask("SIM phone number (e.g. +79991234567)",
-                          default=s.sim_phone)
-        s.dongle_name = ask("chan_dongle device name", default=s.dongle_name or "gsm")
+                          default=s.sim_phone, key="sim_phone")
+        s.dongle_name = ask("chan_dongle device name",
+                            default=s.dongle_name or "gsm", key="dongle_name")
 
         s.ami_pw = _ensure_ami()
-        new_pw = ask("AMI password (empty = use auto-detected)", required=False)
+        new_pw = ask("AMI password (empty = use auto-detected)", required=False,
+                     key="ami_password")
         if new_pw:
             s.ami_pw = new_pw
 
     if tg:
         info("", "--- Telegram ---")
         s.tg_api_id = ask("Telegram API_ID (my.telegram.org/apps)",
-                          default=s.tg_api_id)
+                          default=s.tg_api_id, key="tg_api_id")
         s.tg_api_hash = ask("Telegram API_HASH",
-                            default=s.tg_api_hash)
+                            default=s.tg_api_hash, key="tg_api_hash")
         s.tg_username = ask("Telegram username (without @)",
-                            default=s.tg_username)
+                            default=s.tg_username, key="tg_username")
 
     info("", "--- Secrets ---")
     if s.node_role in ("gsm", "all-in-one"):
         tok = ask("Agent token (empty = auto)",
-                  required=False, default=s.agent_token)
+                  required=False, default=s.agent_token, key="agent_token")
         if not tok:
             tok = _rand(32)
+            s.generated_secrets.append("agent_token")
             warn(f"Agent token: {tok}")
             warn("(Save — needed on Telegram node.)")
         s.agent_token = tok
@@ -488,18 +646,20 @@ def phase_gather() -> None:
         # node owns Asterisk and generates pjsip.conf with it; the
         # Telegram node's bridge authenticates with the same value.
         bsec = ask("Bridge secret (SIP credential, empty = auto)",
-                   required=False, default=s.bridge_secret)
+                   required=False, default=s.bridge_secret,
+                   key="bridge_secret")
         if not bsec:
             bsec = _rand(32)
+            s.generated_secrets.append("bridge_secret")
             warn(f"Bridge secret: {bsec}")
             warn("(Save — needed on Telegram node for the voice bridge.)")
         s.bridge_secret = bsec
 
     if s.node_role == "telegram":
         s.agent_token = ask("Agent token (must match GSM node)",
-                            default=s.agent_token)
+                            default=s.agent_token, key="agent_token")
         s.bridge_secret = ask("Bridge secret (must match GSM node)",
-                              default=s.bridge_secret)
+                              default=s.bridge_secret, key="bridge_secret")
 
     # HTTP secret — shared by the GSM node's agent (it authenticates to
     # the userbot's event endpoints) and the Telegram node's HTTP
@@ -509,12 +669,13 @@ def phase_gather() -> None:
     # agent -> userbot notifications).
     if s.node_role == "telegram":
         sec = ask("HTTP secret (must match GSM node)",
-                  default=s.http_secret)
+                  default=s.http_secret, key="http_secret")
     else:
         sec = ask("HTTP secret (empty = auto)",
-                  required=False, default=s.http_secret)
+                  required=False, default=s.http_secret, key="http_secret")
         if not sec:
             sec = _rand(32)
+            s.generated_secrets.append("http_secret")
             warn(f"HTTP secret: {sec}")
             warn("(Save — needed on Telegram node.)")
     s.http_secret = sec
@@ -523,14 +684,14 @@ def phase_gather() -> None:
         info("", "--- Network ---")
         _own = s.ts_ip or s.own_ip or ""
         if not _own:
-            _own = ask("This node's Tailscale IP")
+            _own = ask("This node's Tailscale IP", key="own_ip")
         s.own_ip = _own
         if s.node_role == "gsm":
             s.peer_ip = ask("Telegram node Tailscale IP",
-                            required=True, default=s.peer_ip)
+                            required=True, default=s.peer_ip, key="peer_ip")
         else:
             s.peer_ip = ask("GSM node Tailscale IP",
-                            required=True, default=s.peer_ip)
+                            required=True, default=s.peer_ip, key="peer_ip")
     else:
         s.own_ip = "127.0.0.1"
         s.peer_ip = "127.0.0.1"
@@ -538,7 +699,34 @@ def phase_gather() -> None:
     info("", "--- ACL ---")
     s.acl_ids = ask(
         "Telegram user ID(s) (space-separated, e.g. 123456789; each gets admin access to all ops)",
-        required=True, default=s.acl_ids)
+        required=True, default=s.acl_ids, key="acl_ids")
+
+    if _NONINTERACTIVE:
+        _validate_noninteractive()
+
+def _validate_noninteractive() -> None:
+    """Fail fast in non-interactive mode when required values are empty.
+
+    Interactively, Enter = default is a user decision. Unattended, an
+    empty required value is an error the orchestrator must fix — exit 1
+    with the missing answer keys listed.
+    """
+    missing: List[str] = []
+    if s.node_role in ("gsm", "all-in-one") and not s.modem_model:
+        missing.append("modem_model")
+    if s.node_role == "telegram":
+        # A pure Telegram node auto-generates nothing — every value
+        # must come from the answers file (peer parity).
+        for attr in ("tg_api_id", "tg_api_hash", "tg_username",
+                     "agent_token", "bridge_secret", "http_secret"):
+            if not getattr(s, attr):
+                missing.append(attr)
+    if s.install_type == "distributed" and not s.own_ip:
+        missing.append("own_ip")
+    if missing:
+        fail("Answers file leaves required values empty:",
+             " " + ", ".join(missing))
+        sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 5 — Remove / Install
@@ -1218,7 +1406,10 @@ def phase_telegram() -> None:
     heading("6 / 8 — Telegram Login")
     info("Authenticates the userbot with Telegram.")
     info(f"Session file: {DATA_DIR}/sim_session.session")
-    if not ask_yn("Log in now?"):
+    # Unattended installs skip the login (it needs the terminal: phone
+    # number + code). Log in afterwards with: install.py --tg-login
+    if not ask_yn("Log in now?", default=not _NONINTERACTIVE,
+                  key="tg_login"):
         warn("Skipped — do it manually before starting the userbot."); return
 
     info("Prompt:", f" {SVC_USER}...")
@@ -1532,20 +1723,35 @@ def phase_verify() -> None:
         info(f"Peer ({peer_label} node):", f" {s.peer_ip}")
         info("", "  This check requires the peer node to be installed and running.")
 
-        if ask_yn(f"Is the {peer_label} node ({s.peer_ip}) up and running?"):
-            r = run_q(f'curl -sf --max-time 10 http://{s.peer_ip}:8090/v1/health '
-                      f'-H "Authorization: Bearer {s.agent_token}"')
+        if ask_yn(f"Is the {peer_label} node ({s.peer_ip}) up and running?",
+                  key="peer_ready"):
+            # The health surface depends on the peer's role: a GSM peer
+            # runs the agent (:8090, Bearer token); a Telegram peer runs
+            # only the userbot (:8088, unauthenticated operational
+            # endpoint — docs/security-review.md).
+            if gsm:
+                r = run_q(f"curl -sf --max-time 10 "
+                          f"http://{s.peer_ip}:8088/health")
+                manual = f"   curl -v http://{s.peer_ip}:8088/health"
+                svc = "simbridge-userbot"
+            else:
+                r = run_q(f'curl -sf --max-time 10 '
+                          f'http://{s.peer_ip}:8090/v1/health '
+                          f'-H "Authorization: Bearer {s.agent_token}"')
+                manual = (f'   curl -v http://{s.peer_ip}:8090/v1/health '
+                          f'-H "Authorization: Bearer {{token}}"')
+                svc = "simbridge-agent"
             if r.returncode == 0:
                 _check(f"Connectivity to {peer_label} node ({s.peer_ip})", True)
             else:
                 detail = (f"    curl returned exit code {r.returncode}\n"
                           f"    stderr: {r.stderr.strip()[:200]}")
-                fix = (f"1. Verify {peer_label} node is on Tailscale: tailscale status\n"
-                       f"2. Check agent is running: systemctl status simbridge-agent\n"
-                       f"3. Verify token matches on both nodes\n"
-                       f"4. Test manually:\n"
-                       f"   curl -v http://{s.peer_ip}:8090/v1/health "
-                       f'-H "Authorization: Bearer {{token}}"')
+                steps = [f"1. Verify {peer_label} node is on Tailscale: tailscale status",
+                         f"2. Check the service: systemctl status {svc}"]
+                if not gsm:
+                    steps.append("3. Verify the agent token matches on both nodes")
+                steps.append(f"{len(steps) + 1}. Test manually:\n{manual}")
+                fix = "\n".join(steps)
                 _check(f"Connectivity to {peer_label} node ({s.peer_ip})", False,
                        detail, fix)
         else:
@@ -1761,6 +1967,11 @@ def _load_existing_config() -> None:
         s.node_id = yaml["node.id"]
         info("Loaded existing node_id:", s.node_id)
 
+    # node.role — needed by --tg-login, whose phase guard checks it.
+    if "node.role" in yaml and not s.node_role:
+        s.node_role = yaml["node.role"]
+        info("Loaded existing node role:", s.node_role)
+
     if "asterisk.dongle" in yaml and s.dongle_name == "gsm":
         s.dongle_name = yaml["asterisk.dongle"]
         info("Loaded existing dongle_name:", s.dongle_name)
@@ -1901,14 +2112,93 @@ def _ensure_ami() -> str:
     return pw
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Non-interactive result
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _write_result() -> None:
+    """Write the machine-readable result JSON (--result FILE).
+
+    This is the wiring contract for the remote orchestrator: it carries
+    the secrets this node holds or generated and the verification
+    outcome, so the peer can be configured without re-asking. chmod
+    0600 — the file contains secrets (Rule 5).
+    """
+    detect_tailscale()  # may have been installed by phase_install()
+    verify = {"passed": [], "failed": [], "skipped": [], "fixes": {}}
+    for label, failed, fix in s.verify_issues:
+        if failed:
+            verify["failed"].append(label)
+            if fix:
+                verify["fixes"][label] = fix
+        elif "SKIP" in label.upper():
+            verify["skipped"].append(label)
+        else:
+            verify["passed"].append(label)
+    result = {
+        "ok": not verify["failed"],
+        "node_id": s.node_id,
+        "role": s.node_role,
+        "install_type": s.install_type,
+        "version": s.src_version or __version__,
+        "tailscale_ip": s.ts_ip,
+        "own_ip": s.own_ip,
+        "peer_ip": s.peer_ip,
+        "agent_token": s.agent_token,
+        "http_secret": s.http_secret,
+        "bridge_secret": s.bridge_secret,
+        "generated_secrets": list(s.generated_secrets),
+        "verify": verify,
+    }
+    p = Path(_RESULT_PATH)
+    p.write_text(json.dumps(result, indent=2) + "\n")
+    p.chmod(0o600)
+    ok("Result written:", f" {p}")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    global _NONINTERACTIVE, _ANSWERS, _RESULT_PATH
+    ap = argparse.ArgumentParser(
+        description="SimBridge installer — interactive or unattended "
+                    "(see the module docstring for the answers file format).")
+    ap.add_argument("--answers", metavar="FILE",
+                    help="key=value answers file; runs unattended")
+    ap.add_argument("--result", metavar="FILE",
+                    help="write a machine-readable result JSON "
+                         "(requires --answers)")
+    ap.add_argument("--tg-login", action="store_true",
+                    help="run only the Telegram login phase on an "
+                         "existing installation, then exit")
+    args = ap.parse_args()
+
     if os.getuid() != 0:
         fail("Run as root:", " sudo python3 install.py"); sys.exit(1)
 
-    if sys.stderr.isatty():
+    if args.tg_login:
+        if args.answers or args.result:
+            fail("--tg-login is incompatible with --answers/--result.",
+                 " (the login needs the terminal)")
+            sys.exit(1)
+        _load_existing_config()
+        if not s.node_role:
+            fail("No existing installation found at", f" {CONF_FILE}")
+            sys.exit(1)
+        phase_telegram()
+        ok("", "Done!")
+        return
+
+    if args.answers:
+        _NONINTERACTIVE = True
+        _ANSWERS = _load_answers(args.answers)
+        _RESULT_PATH = args.result or ""
+        _w(f"Non-interactive mode (answers file: {args.answers})")
+    elif args.result:
+        fail("--result requires --answers.", "")
+        sys.exit(1)
+
+    if sys.stderr.isatty() and not _NONINTERACTIVE:
         _w(f"\n{C.B}{'=' * 58}{C._0}")
         _w(f"{C.B}  SimBridge Interactive Installer{C._0}")
         _w(f"{C.B}  Telegram <-> GSM Telephony{C._0}")
@@ -1924,6 +2214,13 @@ def main() -> None:
     phase_start()
     phase_verify()
     phase_summary()
+
+    if _NONINTERACTIVE:
+        if _RESULT_PATH:
+            _write_result()
+        if any(failed for _, failed, _ in s.verify_issues):
+            fail("Installed, but verification failed — see above.", "")
+            sys.exit(2)
 
     ok("", "Done!")
 
