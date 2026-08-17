@@ -37,7 +37,7 @@ _STATE_FIELDS = (
     "agent_token", "http_secret", "bridge_secret",
     "own_ip", "peer_ip", "acl_ids",
     "do_ts", "do_ts_opt", "usb_modems", "ts_ip", "has_ts",
-    "node_id", "generated_secrets", "verify_issues",
+    "node_id", "generated_secrets", "verify_issues", "ast_config_changed",
 )
 _LIST_FIELDS = ("usb_modems", "generated_secrets", "verify_issues")
 
@@ -449,3 +449,129 @@ class TestChownAsterisk:
         target.write_text("")
         install._chown_asterisk(target)   # must not raise
         assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# _setup_ami — manager.conf include directive + chown/chmod enforcement
+# ---------------------------------------------------------------------------
+
+class TestSetupAmi:
+    @pytest.fixture()
+    def ami_env(self, tmp_path, monkeypatch, ni_state):
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install.s.ami_pw = "test-ami-secret-123"
+        return ast
+
+    def test_fresh_writes_hash_include(self, ami_env):
+        install._setup_ami()
+        main_txt = (ami_env / "manager.conf").read_text()
+        custom_txt = (ami_env / "manager_custom.conf").read_text()
+        # Asterisk's include directive is '#include' — a bare 'Include'
+        # line is silently dropped, so the [simbridge] user never loaded.
+        assert "#include manager_custom.conf" in main_txt
+        assert "Include manager_custom.conf" not in main_txt.replace(
+            "#include manager_custom.conf", "")
+        assert "secret = test-ami-secret-123" in custom_txt
+        assert install.s.ast_config_changed is True
+
+    def test_legacy_include_normalized(self, ami_env):
+        (ami_env / "manager.conf").write_text(
+            "[general]\nenabled = yes\nport = 5038\n"
+            "Include manager_custom.conf\n")
+        install._setup_ami()
+        txt = (ami_env / "manager.conf").read_text()
+        assert txt.count("#include manager_custom.conf") == 1
+        assert "Include manager_custom.conf" not in txt.replace(
+            "#include manager_custom.conf", "")
+        assert "enabled = yes" in txt
+        assert install.s.ast_config_changed is True
+
+    def test_hash_include_idempotent(self, ami_env):
+        (ami_env / "manager.conf").write_text(
+            "[general]\nenabled = yes\nport = 5038\n"
+            "#include manager_custom.conf\n")
+        install._setup_ami()
+        txt = (ami_env / "manager.conf").read_text()
+        assert txt.count("#include manager_custom.conf") == 1
+
+    def test_chown_enforced_when_content_matches(self, ami_env, monkeypatch):
+        install._setup_ami()          # first run: creates both files
+        chowns = []
+        monkeypatch.setattr(install, "_chown_asterisk",
+                            lambda p: chowns.append(str(p)))
+        install.s.ast_config_changed = False
+        install._setup_ami()          # second run: content already right
+        # Ownership/perm is enforced even when the content matches — a
+        # file left root:root by an earlier crashed run still drifts.
+        # manager.conf is untouched (no content change) → only the
+        # custom file is re-chowned.
+        assert chowns == [str(ami_env / "manager_custom.conf")]
+        assert install.s.ast_config_changed is False
+
+
+# ---------------------------------------------------------------------------
+# phase_verify — chan_dongle module detection (running, not active)
+# ---------------------------------------------------------------------------
+
+class TestDongleModuleOutput:
+    # Real `asterisk -rx 'module show like dongle'` output (verified on
+    # the GSM node) — note the Status column: "Running", not "active".
+    _RUNNING_TABLE = (
+        "Module                         Description"
+        "                              Use Count  Status      Support Level\n"
+        "chan_dongle.so                 Huawei 3G Dongle Channel Driver"
+        "          0          Running          extended\n"
+        "1 modules loaded"
+    )
+
+    def test_returns_immediately_when_module_listed(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(install, "run_q",
+                            lambda cmd: types.SimpleNamespace(
+                                stdout=self._RUNNING_TABLE, returncode=0))
+        monkeypatch.setattr(install.time, "sleep", sleeps.append)
+        out = install._dongle_module_output(retries=5, delay=0.0)
+        assert "chan_dongle" in out
+        assert sleeps == []
+
+    def test_retries_while_asterisk_settles(self, monkeypatch):
+        outs = iter(["0 modules loaded", self._RUNNING_TABLE])
+        monkeypatch.setattr(install, "run_q",
+                            lambda cmd: types.SimpleNamespace(
+                                stdout=next(outs), returncode=0))
+        monkeypatch.setattr(install.time, "sleep", lambda _d: None)
+        out = install._dongle_module_output(retries=3, delay=0.0)
+        assert "chan_dongle" in out
+
+    def test_detection_uses_running_not_active(self):
+        # `module show` reports Status "Running" — "active" (the
+        # systemctl vocabulary) never appears in the table.
+        assert install._dongle_module_loaded(self._RUNNING_TABLE) is True
+        assert install._dongle_module_loaded("0 modules loaded") is False
+
+
+# ---------------------------------------------------------------------------
+# _allowed_peers_yaml — own_ip must be in the allowlist (P4)
+# ---------------------------------------------------------------------------
+
+class TestAllowedPeersYaml:
+    def test_distributed_includes_own_ip(self, ni_state):
+        install.s.peer_ip = "100.95.195.40"
+        install.s.own_ip = "100.124.155.106"
+        assert install._allowed_peers_yaml() == \
+            '    - "100.95.195.40"\n    - "100.124.155.106"'
+
+    def test_single_dedupes_loopback(self, ni_state):
+        install.s.peer_ip = "127.0.0.1"
+        install.s.own_ip = "127.0.0.1"
+        assert install._allowed_peers_yaml() == '    - "127.0.0.1"'
+
+    def test_empty_ips_fall_back_to_loopback(self, ni_state):
+        assert install._allowed_peers_yaml() == '    - "127.0.0.1"'
+
+    def test_dedupes_when_ips_equal(self, ni_state):
+        install.s.peer_ip = "100.64.0.2"
+        install.s.own_ip = "100.64.0.2"
+        assert install._allowed_peers_yaml() == '    - "100.64.0.2"'

@@ -55,6 +55,7 @@ import json
 import os
 import re
 import sys
+import time
 import grp
 import pwd
 import secrets
@@ -911,9 +912,10 @@ def _setup_ami() -> None:
     """Configure Asterisk AMI for the simbridge user.
 
     The secret lives ONLY in manager_custom.conf (survives package updates
-    to manager.conf). manager.conf is patched to enable AMI and Include the
-    custom file; a legacy inline [simbridge] section (written by older
-    installer versions) is removed so the password has one source of truth.
+    to manager.conf). manager.conf is patched to enable AMI and
+    #include the custom file; a legacy inline [simbridge] section (written
+    by older installer versions) is removed so the password has one source
+    of truth.
     """
     custom = Path(f"{AST_DIR}/manager_custom.conf")
     main_conf = Path(f"{AST_DIR}/manager.conf")
@@ -933,16 +935,17 @@ def _setup_ami() -> None:
             ok("AMI configured.", str(custom))
         else:
             custom.write_text(custom_cfg)
-            _chown_asterisk(custom)
-            custom.chmod(0o640)
             s.ast_config_changed = True
             ok("AMI user configured.", str(custom))
     except FileNotFoundError:
         custom.write_text(custom_cfg)
-        _chown_asterisk(custom)
-        custom.chmod(0o640)
         s.ast_config_changed = True
         ok("AMI user configured.", str(custom))
+    # Enforce ownership/perm even when content is unchanged — a file left
+    # root:root by an earlier crashed run still works for Asterisk, but
+    # the drift is a Rule-4 hazard on package updates.
+    _chown_asterisk(custom)
+    custom.chmod(0o640)
 
     # ── manager.conf: enabled=yes + Include, no legacy inline section ──
     if not main_conf.exists():
@@ -951,7 +954,7 @@ def _setup_ami() -> None:
             "enabled = yes\n"
             "port = 5038\n"
             "bindaddr = 127.0.0.1\n"
-            "Include manager_custom.conf\n"
+            "#include manager_custom.conf\n"
         )
         _chown_asterisk(main_conf)
         main_conf.chmod(0o640)
@@ -971,9 +974,14 @@ def _setup_ami() -> None:
             txt = txt.replace("[general]", "[general]\nenabled = yes", 1)
         else:
             txt = txt.rstrip("\n") + "\n[general]\nenabled = yes\n"
-    include_line = "Include manager_custom.conf"
-    if include_line not in txt:
-        txt = txt.rstrip("\n") + "\n" + include_line + "\n"
+    # Asterisk's include directive is '#include <file>' — a bare
+    # "Include" line is silently dropped by the config parser, so the
+    # [simbridge] user never loads and every AMI login fails with
+    # "Authentication failed". Strip any variant (legacy or correct),
+    # then append exactly one correct directive.
+    txt = re.sub(r"(?m)^\s*#?include\s+manager_custom\.conf\s*\n?",
+                 "", txt, flags=re.IGNORECASE)
+    txt = txt.rstrip("\n") + "\n#include manager_custom.conf\n"
     if txt != orig:
         main_conf.write_text(txt)
         _chown_asterisk(main_conf)
@@ -982,6 +990,22 @@ def _setup_ami() -> None:
         ok("manager.conf patched.")
     else:
         ok("manager.conf OK.")
+
+def _allowed_peers_yaml() -> str:
+    """YAML list for agent/userbot allowed_peers: the peer node plus
+    this node's own tailnet IP — the on-node verify curls the agent
+    from own_ip, not from the peer, so omitting it 403s the check that
+    is supposed to prove the allowlist works. Deduped; the 127.0.0.1
+    fallback covers single (where both IPs are loopback).
+    """
+    peers: List[str] = []
+    for _ip in (s.peer_ip, s.own_ip):
+        if _ip and _ip not in peers:
+            peers.append(_ip)
+    if not peers:
+        peers = ["127.0.0.1"]
+    return "\n".join(f'    - "{_ip}"' for _ip in peers)
+
 
 def _write_config() -> None:
     heading("Writing Configuration")
@@ -1011,12 +1035,12 @@ agent:
   token_env: SIMBRIDGE_AGENT_TOKEN
   userbot_url: http://{tul}:8088
   allowed_peers:
-    - "{s.peer_ip}"
+{_allowed_peers_yaml()}
 userbot_http:
   listen: "{ul}"
   secret_env: SIMBRIDGE_HTTP_SECRET
   allowed_peers:
-    - "{s.peer_ip}"
+{_allowed_peers_yaml()}
 asterisk:
   ari_url: http://127.0.0.1:8088/ari
   dongle: {s.dongle_name}
@@ -1544,6 +1568,28 @@ def _check(label: str, ok_: bool, detail: str = "", fix: str = "") -> None:
     s.verify_issues.append((label, not ok_, fix))
 
 
+def _dongle_module_output(retries: int = 10, delay: float = 3.0) -> str:
+    """Query the chan_dongle module list, retrying while Asterisk
+    settles after (re)start — the ctl socket appears ~1-2 s after
+    main(), and a verify that ran too early would report the module
+    missing on a healthy node."""
+    out = ""
+    for _ in range(retries):
+        r = run_q("asterisk -rx 'module show like dongle' 2>/dev/null")
+        out = r.stdout
+        if "dongle" in out.lower():
+            break
+        time.sleep(delay)
+    return out
+
+
+def _dongle_module_loaded(out: str) -> bool:
+    """`module show` reports the module Status as "Running" — not
+    "active" (a detection written for `systemctl is-active` output
+    can never match a `module show` table)."""
+    return "dongle" in out.lower() and "running" in out.lower()
+
+
 def phase_verify() -> None:
     heading("8 / 8 — Verification")
     gsm = s.node_role in ("gsm", "all-in-one")
@@ -1590,22 +1636,23 @@ def phase_verify() -> None:
 
         # 3. chan_dongle module (only meaningful if Asterisk is running)
         if ast_active:
-            r = run_q("asterisk -rx 'module show like dongle' 2>/dev/null")
-            dongle_loaded = "dongle" in r.stdout.lower() and "active" in r.stdout.lower()
+            out = _dongle_module_output()
+            dongle_loaded = _dongle_module_loaded(out)
             _check("chan_dongle module loaded", dongle_loaded,
-                   f"    Output: {r.stdout.strip()[:200]}",
+                   f"    Output: {out.strip()[:200]}",
                    "asterisk -rx 'module load chan_dongle.so'")
 
-            # 4. Dongle status
+            # 4. Dongle status (chan_dongle exposes `dongle show
+            #    devices`, not `dongle show status`)
             if dongle_loaded:
-                r = run_q("asterisk -rx 'dongle show status' 2>/dev/null")
-                has_status = r.returncode == 0 and "No such command" not in r.stdout
-                if not has_status:
-                    detail = r.stdout.strip().replace("\n", "\n    ")
-                    fix = ("Check chan_dongle version. Command may be:\n"
-                           "  asterisk -rx 'core show help' | grep dongle")
-                else:
-                    detail = r.stdout.strip().replace("\n", "\n    ")
+                r = run_q("asterisk -rx 'dongle show devices' 2>/dev/null")
+                has_status = (r.returncode == 0
+                              and bool(s.dongle_name)
+                              and s.dongle_name in r.stdout)
+                detail = r.stdout.strip().replace("\n", "\n    ")
+                fix = "" if has_status else (
+                    "Dongle not listed — check /etc/asterisk/dongle.conf "
+                    "and: asterisk -rx 'dongle show devices'")
                 _check("Dongle modem status", has_status,
                        f"    {detail}", fix)
         else:

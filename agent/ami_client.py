@@ -11,6 +11,13 @@ Security: parameters are sent as first-class AMI header fields
 ("Message: <text>"), never interpolated into a command string. AMI is a
 line-based protocol, so values containing raw newlines are rejected with
 ValueError instead of corrupting the stream.
+
+Concurrency: the client is a single request/response stream, so every
+transaction (connect, command, close) is serialized on one lock, and a
+failed login drops the streams — a half-open, unauthenticated socket can
+never be shared by two coroutines awaiting readline() on the same
+StreamReader (that race raised "readuntil() called while another
+coroutine is already waiting for incoming data" in production).
 """
 
 from __future__ import annotations
@@ -19,6 +26,11 @@ import asyncio
 import io
 import re
 from typing import Optional
+
+# A hung AMI socket must not hold the transaction lock forever: the
+# poller, the watchdog and the reconnector all funnel through it, so
+# one wedged read would stall every AMI operation in the process.
+AMI_READ_TIMEOUT = 15.0
 
 
 class AMISendError(Exception):
@@ -51,6 +63,14 @@ class AMIClient:
         self._dongle = dongle
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
+        # AMI is one request/response stream: every transaction must be
+        # atomic, and a reconnect must not swap the streams mid-transaction
+        # (see module docstring for the production race this prevents).
+        # Created lazily in _get_lock(): on Python 3.9 asyncio.Lock()
+        # binds to the current event loop at construction, so building it
+        # here would attach a client constructed outside a running loop
+        # (send_sms_sync, tests) to the wrong one.
+        self._lock: Optional[asyncio.Lock] = None
 
     async def connect(self) -> None:
         """Open AMI TCP connection and log in.
@@ -59,35 +79,73 @@ class AMIClient:
         Do NOT wait for a blank line after greeting — some Asterisk versions
         (chan_dongle configurations) close idle connections before sending it.
         Send Login immediately after reading the greeting to avoid timeout.
+
+        On any failure the streams are dropped, so a failed login never
+        leaves a live, unauthenticated socket that another coroutine
+        (poller, watchdog) could race us on.
         """
-        self._reader, self._writer = await asyncio.open_connection(
-            self._host, self._port
-        )
+        async with self._get_lock():
+            self._reader, self._writer = await asyncio.open_connection(
+                self._host, self._port
+            )
+            try:
+                # Read greeting line (e.g. "Asterisk Call Manager/7.0.3")
+                try:
+                    greeting = await asyncio.wait_for(
+                        self._reader.readline(), timeout=AMI_READ_TIMEOUT
+                    )
+                except asyncio.TimeoutError as e:
+                    raise ConnectionError(
+                        f"AMI greeting timed out after {AMI_READ_TIMEOUT:.0f}s"
+                    ) from e
+                if not greeting:
+                    raise ConnectionError(
+                        "AMI server closed connection immediately"
+                    )
 
-        # Read greeting line (e.g. "Asterisk Call Manager/7.0.3")
-        greeting = await self._reader.readline()
-        if not greeting:
-            raise ConnectionError("AMI server closed connection immediately")
-
-        # Send login immediately — do NOT wait for blank line
-        await self._send_action({
-            "Action": "Login",
-            "UserName": self._username,
-            "Secret": self._password,
-        })
-        resp = await self._read_response()
-        if resp.get("Response") not in ("Success", "Followed"):
-            raise ConnectionError(f"AMI login failed: {resp}")
+                # Send login immediately — do NOT wait for blank line
+                await self._send_action({
+                    "Action": "Login",
+                    "UserName": self._username,
+                    "Secret": self._password,
+                })
+                resp = await self._read_response()
+                if resp.get("Response") not in ("Success", "Followed"):
+                    raise ConnectionError(f"AMI login failed: {resp}")
+            except BaseException:
+                # Drop the streams on every failure path — including
+                # cancellation — before re-raising.
+                self._drop()
+                raise
 
     async def close(self) -> None:
-        if self._writer:
-            self._writer.close()
-            try:
-                await self._writer.wait_closed()
-            except Exception:
-                pass
+        async with self._get_lock():
+            writer = self._writer
             self._reader = None
             self._writer = None
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    def _drop(self) -> None:
+        """Release the streams without waiting (no lock — callers either
+        hold it or are unwinding a failed transaction)."""
+        writer, self._writer = self._writer, None
+        self._reader = None
+        if writer is not None:
+            writer.close()
+
+    def _get_lock(self) -> asyncio.Lock:
+        """The transaction lock, created on first use inside the running
+        loop (see the _lock comment in __init__). Creation is a single
+        synchronous step, so two coroutines on the same loop can never
+        observe different locks."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     # chan_dongle GSMRegistrationStatus values that mean the modem is usable.
     _REGISTERED_STATES = {"Registered, home network", "Registered, roaming"}
@@ -112,18 +170,19 @@ class AMIClient:
         """
         flattened = re.sub(r"[\r\n]+", " ", text)
         action_id = f"sms-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "DongleSendSMS",
-                "Device": self._dongle,
-                "Number": to,
-                "Message": flattened,
-                "Validity": "1440",
-                "Report": "yes",
-                "ActionID": action_id,
-            }
-        )
-        resp = await self._read_response()
+        async with self._get_lock():
+            await self._send_action(
+                {
+                    "Action": "DongleSendSMS",
+                    "Device": self._dongle,
+                    "Number": to,
+                    "Message": flattened,
+                    "Validity": "1440",
+                    "Report": "yes",
+                    "ActionID": action_id,
+                }
+            )
+            resp = await self._read_response()
         if resp.get("Response") == "Error" or resp.get("Action") == "failure":
             raise AMISendError(resp.get("Message", "DongleSendSMS failed"), resp)
         return resp
@@ -138,24 +197,25 @@ class AMIClient:
         Returns {} if the device is not found.
         """
         action_id = f"status-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "DongleShowDevices",
-                "Device": self._dongle,
-                "ActionID": action_id,
-            }
-        )
-        # Reply shape: a list-ack message, then one DongleDeviceEntry
-        # per matching device, then a list-complete message. Unrelated
-        # events can interleave — skip anything that is not the entry.
-        entry: dict[str, str] = {}
-        for _ in range(32):  # bounded: a device list is short (1-3 entries)
-            resp = await self._read_response()
-            if resp.get("Message") == "DongleDeviceEntry":
-                entry = resp
-                break
-            if resp.get("Message") == "ListComplete":
-                break
+        async with self._get_lock():
+            await self._send_action(
+                {
+                    "Action": "DongleShowDevices",
+                    "Device": self._dongle,
+                    "ActionID": action_id,
+                }
+            )
+            # Reply shape: a list-ack message, then one DongleDeviceEntry
+            # per matching device, then a list-complete message. Unrelated
+            # events can interleave — skip anything that is not the entry.
+            entry: dict[str, str] = {}
+            for _ in range(32):  # bounded: a device list is short (1-3 entries)
+                resp = await self._read_response()
+                if resp.get("Message") == "DongleDeviceEntry":
+                    entry = resp
+                    break
+                if resp.get("Message") == "ListComplete":
+                    break
         if not entry:
             return {}
         return self._normalize_device_entry(entry)
@@ -218,8 +278,9 @@ class AMIClient:
                 # AMI allows multiple Variable headers — use the last one
                 action["Variable"] = f"{k}={v}"
 
-        await self._send_action(action)
-        return await self._read_response()
+        async with self._get_lock():
+            await self._send_action(action)
+            return await self._read_response()
 
     async def hangup_channel(
         self,
@@ -231,54 +292,42 @@ class AMIClient:
         Used for symmetric hangup — terminating the other leg when one leg ends.
         """
         action_id = f"hang-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "Hangup",
-                "Channel": channel_id,
-                "Reason": reason,
-                "ActionID": action_id,
-            }
-        )
-        return await self._read_response()
+        async with self._get_lock():
+            await self._send_action(
+                {
+                    "Action": "Hangup",
+                    "Channel": channel_id,
+                    "Reason": reason,
+                    "ActionID": action_id,
+                }
+            )
+            return await self._read_response()
 
     async def answer_channel(self, channel_id: str) -> dict:
-        """Answer a ringing channel via AMI.
+        """Answer a ringing channel.
 
-        Used to answer the GSM leg when the Telegram user accepts.
+        Deliberately unsupported via AMI: there is no "Answer" AMI action
+        and the Asterisk 18 CLI has no ``channel <chan> answer`` verb
+        (only originate/redirect/request-hangup — verified via
+        ``core show help``). In the shipped architecture the GSM channel
+        is answered by the dialplan: ``Dial(SIP/${BRIDGE_ENDPOINT})``
+        auto-answers it when the bridge's UAS answers the INVITE. ARI's
+        ``POST /channels/{id}/answer`` would be the AMI-side equivalent,
+        but ARI is deliberately not enabled (see module docstring).
+
+        Raising is deliberate, not an error path: the legacy
+        implementation sent two actions (Redirect + Command) but read
+        only one response, which desynchronizes the single
+        request/response AMI stream for every subsequent transaction.
+
+        Raises:
+            NotImplementedError: always — AMI cannot answer a channel.
         """
-        action_id = f"answ-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "Redirect",
-                "Channel": channel_id,
-                "Context": "default",
-                "Extension": "s",
-                "Priority": "1",
-                "ActionID": action_id,
-            }
+        raise NotImplementedError(
+            "AMI cannot answer a channel (no AMI action, no CLI verb); "
+            f"the dialplan Dial() answers {channel_id} when the bridge "
+            "endpoint connects — ARI is required for AMI-side answer"
         )
-        # Use Originate with wait=0 to answer a ringing channel, or use the
-        # simpler approach: originate to Local/s@answer
-        # Actually: use a direct AMI action — Answer — but it doesn't exist
-        # The standard approach is to use Channel(url) or Originate(Local/..)
-        # For chan_dongle, the channel answers when Dial() is issued.
-        # We use Originate to a Local channel that answers the existing channel.
-        return await self._send_answer(channel_id)
-
-    async def _send_answer(self, channel_id: str) -> dict:
-        """Answer a channel by originating to it with Answer action.
-
-        AMI 'Answer' action: answers a ringing channel.
-        """
-        action_id = f"ansr-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "Command",
-                "Command": f"channel {channel_id} answer",
-                "ActionID": action_id,
-            }
-        )
-        return await self._read_response()
 
     async def list_channels(self) -> list[dict]:
         """List all active Asterisk channels via AMI CoreShowChannels.
@@ -286,13 +335,14 @@ class AMIClient:
         Used for orphan channel detection after cleanup.
         """
         action_id = f"list-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "CoreShowChannels",
-                "ActionID": action_id,
-            }
-        )
-        return [await self._read_response()]
+        async with self._get_lock():
+            await self._send_action(
+                {
+                    "Action": "CoreShowChannels",
+                    "ActionID": action_id,
+                }
+            )
+            return [await self._read_response()]
 
     async def set_channel_variable(
         self,
@@ -305,16 +355,17 @@ class AMIClient:
         Used to signal state changes to the dialplan (e.g., TG_ACCEPTED=1).
         """
         action_id = f"var-{id(self)}-{asyncio.get_event_loop().time()}"
-        await self._send_action(
-            {
-                "Action": "SetVariable",
-                "Channel": channel_id,
-                "Variable": variable,
-                "Value": value,
-                "ActionID": action_id,
-            }
-        )
-        return await self._read_response()
+        async with self._get_lock():
+            await self._send_action(
+                {
+                    "Action": "SetVariable",
+                    "Channel": channel_id,
+                    "Variable": variable,
+                    "Value": value,
+                    "ActionID": action_id,
+                }
+            )
+            return await self._read_response()
 
     async def _send_action(self, fields: dict) -> None:
         """Send an AMI action message.
@@ -341,13 +392,26 @@ class AMIClient:
         await self._writer.drain()
 
     async def _read_response(self) -> dict:
-        """Read one AMI response message."""
+        """Read one AMI response message.
+
+        Bounded by AMI_READ_TIMEOUT: a wedged socket must not hold the
+        transaction lock forever, and a silent drop of the streams turns
+        the stall into a clean reconnect cycle.
+        """
         if not self._reader:
             raise ConnectionError("AMI client not connected")
 
         headers: dict[str, str] = {}
         while True:
-            line = await self._reader.readline()
+            try:
+                line = await asyncio.wait_for(
+                    self._reader.readline(), timeout=AMI_READ_TIMEOUT
+                )
+            except asyncio.TimeoutError as e:
+                self._drop()
+                raise ConnectionError(
+                    f"AMI read timed out after {AMI_READ_TIMEOUT:.0f}s"
+                ) from e
             if line in (b"\r\n", b"\n", b""):
                 break
             text = line.decode().strip()

@@ -39,7 +39,10 @@ Design note (Rule 1): the orchestrator duplicates NO on-node logic.
 The only new mechanism is the post-deploy cross-node health check,
 which the installer cannot do: on the first pass each node is
 installed with `peer_ready=false` because its peer is not up yet.
-The PC performs the check from the tailnet after both nodes are up.
+After both nodes are up, the orchestrator curls each endpoint FROM
+the opposite node over ssh — the real production path (a PC-side
+curl would come from the PC's tailnet IP, which allowed_peers does
+not list, and 403 on the very path being validated).
 
 Prerequisites:
   - distributed deploys require the nodes to be ALREADY JOINED to the
@@ -60,7 +63,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -453,23 +455,18 @@ def install_node(node: Node, transport: str, sh: Shared,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Post-deploy cross-node check (PC-side, tailnet-local)
+# Post-deploy cross-node check (runs FROM the opposite node)
 # ══════════════════════════════════════════════════════════════════════════════
-
-def check_url(url: str, token: Optional[str] = None) -> Tuple[bool, str]:
-    req = urllib.request.Request(url)
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status == 200, r.read(200).decode("utf-8", "replace")
-    except Exception as e:                      # noqa: BLE001 — report any
-        return False, str(e)
-
 
 def cross_check(nodes: List[Node], sh: Shared,
                 transport: str) -> List[str]:
-    """Operational health of both endpoints. Returns problem list."""
+    """Operational health of both endpoints. Returns problem list.
+
+    Each endpoint is curled FROM the other node — the real production
+    path. A PC-side curl would come from the PC's tailnet IP, which is
+    not in allowed_peers, so it would 403 on the very path it is meant
+    to validate.
+    """
     problems: List[str] = []
     if sh.install_type == "single":
         n = nodes[0]
@@ -486,14 +483,16 @@ def cross_check(nodes: List[Node], sh: Shared,
         return problems
     gsm = next(n for n in nodes if n.role == "gsm")
     tg = next(n for n in nodes if n.role == "telegram")
-    for label, url, tok in (
-        ("TG node /health", f"http://{tg.own_ip}:{USERBOT_PORT}/health", None),
-        ("GSM agent /v1/health",
-         f"http://{gsm.own_ip}:{AGENT_PORT}/v1/health", sh.agent_token),
+    for label, from_node, cmd in (
+        ("GSM agent /v1/health", tg,
+         f"curl -sf -m 10 -H 'Authorization: Bearer {sh.agent_token}'"
+         f" http://{gsm.own_ip}:{AGENT_PORT}/v1/health"),
+        ("TG node /health", gsm,
+         f"curl -sf -m 10 http://{tg.own_ip}:{USERBOT_PORT}/health"),
     ):
-        good, detail = check_url(url, tok)
-        if not good:
-            problems.append(f"{label} ({url}) failed: {detail[:120]}")
+        rc, _ = run_remote(from_node, transport, cmd, timeout=30)
+        if rc != 0:
+            problems.append(f"{label} unreachable from {from_node.name}")
     return problems
 
 

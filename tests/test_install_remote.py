@@ -3,10 +3,11 @@
 deploy/install_remote.py is imported as a module — safe: module-level
 code only defines constants and dataclasses; main() is guarded.
 
-The transport layer (run_remote / upload_remote / check_url / q) is
-monkeypatched with fakes, so the full orchestration — preflight,
-bootstrap, answers generation, install, result fetch, cross-check,
-report — runs in-process without any network.
+The transport layer (run_remote / upload_remote / q) is monkeypatched
+with fakes, so the full orchestration — preflight, bootstrap, answers
+generation, install, result fetch, cross-check, report — runs in-process
+without any network. The cross-check curls each endpoint FROM the
+opposite node over the (fake) transport, so it is exercised here too.
 """
 
 from __future__ import annotations
@@ -414,16 +415,19 @@ class TestOrchestrateTwoNode:
     def test_full_success(self, fake_remote, monkeypatch, capsys):
         fake_remote.ips = {"node-a": "100.64.0.2",
                            "node-b": "100.64.0.3"}
-        checked = []
-        monkeypatch.setattr(
-            ir, "check_url",
-            lambda url, token=None: (checked.append(url) or
-                                     (True, "{}")))
         rc = run_orchestrate(monkeypatch, TWO_Q)
         assert rc == 0
-        # Cross-check from the PC hits the right endpoints.
-        assert f"http://100.64.0.3:{ir.USERBOT_PORT}/health" in checked
-        assert f"http://100.64.0.2:{ir.AGENT_PORT}/v1/health" in checked
+        # Cross-check runs FROM the opposite node — the real production
+        # path (a PC-side curl would come from the PC's tailnet IP,
+        # which is not in allowed_peers, and 403 the very path being
+        # validated).
+        curls = {n: [c for (nn, c) in fake_remote.calls
+                     if nn == n and "curl -sf" in c]
+                 for n in ("node-a", "node-b")}
+        assert any(f"http://100.64.0.2:{ir.AGENT_PORT}/v1/health" in c
+                   for c in curls["node-b"])
+        assert any(f"http://100.64.0.3:{ir.USERBOT_PORT}/health" in c
+                   for c in curls["node-a"])
         ag, at = uploaded_answers(fake_remote, "node-a"), \
             uploaded_answers(fake_remote, "node-b")
         assert "node_role = \"GSM node (Asterisk + modem)\"" in ag
@@ -465,10 +469,18 @@ class TestOrchestrateFailures:
         assert "sweep timer" in out
 
     def test_cross_check_failure(self, fake_remote, monkeypatch, capsys):
-        monkeypatch.setattr(ir, "check_url",
-                            lambda url, token=None: (False, "refused"))
         fake_remote.ips = {"node-a": "100.64.0.2",
                            "node-b": "100.64.0.3"}
+        real_run = fake_remote.run
+
+        def run_fail_curl(node, transport, cmd, timeout=None,
+                          stream=False, stdin=None):
+            if "curl -sf" in cmd:
+                return 22, ""
+            return real_run(node, transport, cmd, timeout=timeout,
+                            stream=stream, stdin=stdin)
+
+        monkeypatch.setattr(ir, "run_remote", run_fail_curl)
         rc = run_orchestrate(monkeypatch, TWO_Q)
         assert rc == 2
         out = capsys.readouterr().out
@@ -480,8 +492,6 @@ class TestOrchestrateFailures:
         # cross-check was skipped — NOT "both endpoints healthy".
         fake_remote.ips = {"node-a": "100.64.0.2",
                            "node-b": "100.64.0.3"}
-        monkeypatch.setattr(ir, "check_url",
-                            lambda url, token=None: (True, "{}"))
         real_run = fake_remote.run
 
         def run_partial(node, transport, cmd, timeout=None,
