@@ -575,3 +575,45 @@ class TestAllowedPeersYaml:
         install.s.peer_ip = "100.64.0.2"
         install.s.own_ip = "100.64.0.2"
         assert install._allowed_peers_yaml() == '    - "100.64.0.2"'
+
+# ---------------------------------------------------------------------------
+# _merge_env — env file format: KEY=VALUE without spaces (systemd
+# EnvironmentFile AND bash `source` both parse it; the legacy spaced
+# "KEY = VALUE" broke `source`, and pre-existing spaced lines must
+# self-normalize on the next installer run)
+# ---------------------------------------------------------------------------
+
+class TestMergeEnvFormat:
+    def test_writes_key_eq_value_without_spaces(self, tmp_path, monkeypatch,
+                                                ni_state):
+        monkeypatch.setattr(install, "ENV_FILE", str(tmp_path / "env"))
+        install.s.agent_token = "tok123"
+        install.s.ami_pw = "pw456"
+        install._merge_env()
+        kv = [l for l in (tmp_path / "env").read_text().splitlines()
+              if l and not l.startswith("#")]
+        assert kv == ["SIMBRIDGE_AGENT_TOKEN=tok123",
+                      "SIMBRIDGE_AMI_PASSWORD=pw456"]
+
+    def test_spaced_legacy_lines_self_normalize(self, tmp_path, monkeypatch,
+                                                ni_state):
+        env = tmp_path / "env"
+        env.write_text("SIMBRIDGE_AGENT_TOKEN = oldtok\n")
+        monkeypatch.setattr(install, "ENV_FILE", str(env))
+        # Same value: no value change, but the line is rewritten in the
+        # canonical no-space format.
+        install.s.agent_token = "oldtok"
+        install._merge_env()
+        text = env.read_text()
+        assert "SIMBRIDGE_AGENT_TOKEN=oldtok" in text
+        assert " = " not in text
+
+    def test_extra_keys_survive(self, tmp_path, monkeypatch, ni_state):
+        env = tmp_path / "env"
+        env.write_text("EXTRA_KEY=keepme\n")
+        monkeypatch.setattr(install, "ENV_FILE", str(env))
+        install.s.http_secret = "hs789"
+        install._merge_env()
+        text = env.read_text()
+        assert "EXTRA_KEY=keepme" in text
+        assert "SIMBRIDGE_HTTP_SECRET=hs789" in text

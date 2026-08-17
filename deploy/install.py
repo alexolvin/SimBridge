@@ -1121,6 +1121,13 @@ def _merge_env() -> None:
     Existing keys (including ones added by hand) keep their position,
     extra keys survive, collected values update their keys in place,
     and new keys are appended at the end. Stays chmod 0600 (Rule 5).
+
+    Lines are written ``KEY=VALUE`` with no spaces around ``=``: that is
+    the format both systemd EnvironmentFile and bash ``source`` parse
+    (the old spaced ``KEY = VALUE`` broke ``source`` — the agent token
+    extracted that way came out empty). The reader below is
+    format-agnostic, so pre-existing spaced lines self-normalize on the
+    next run.
     """
     p = Path(ENV_FILE)
     wanted: Dict[str, str] = {}
@@ -1146,7 +1153,7 @@ def _merge_env() -> None:
     raw = p.read_text().splitlines() if p.exists() else []
     if not raw:
         lines = ["# SimBridge secrets — NEVER commit (Rule 5)", ""]
-        lines += [f"{k} = {v}" for k, v in wanted.items()]
+        lines += [f"{k}={v}" for k, v in wanted.items()]
         p.write_text("\n".join(lines) + "\n")
         p.chmod(0o600)
         ok("Secrets written.", ENV_FILE)
@@ -1164,7 +1171,7 @@ def _merge_env() -> None:
                 seen.add(k)
                 if v.strip() != wanted[k]:
                     changed += 1
-                lines.append(f"{k} = {wanted[k]}")
+                lines.append(f"{k}={wanted[k]}")
                 continue
         lines.append(line)
 
@@ -1173,7 +1180,7 @@ def _merge_env() -> None:
         if lines and lines[-1].strip():
             lines.append("")
         for k in added:
-            lines.append(f"{k} = {wanted[k]}")
+            lines.append(f"{k}={wanted[k]}")
 
     p.write_text("\n".join(lines) + "\n")
     p.chmod(0o600)
