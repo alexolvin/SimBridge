@@ -147,8 +147,25 @@ class AMIClient:
             self._lock = asyncio.Lock()
         return self._lock
 
-    # chan_dongle GSMRegistrationStatus values that mean the modem is usable.
+    # chan_dongle GSMRegistrationStatus values that mean the modem is usable
+    # (verified against the deployed module: `strings chan_dongle.so` lists
+    # exactly "Registered, home network" / "Registered, roaming" as the
+    # usable states, plus "Not registered, [but searching|not searching]"
+    # and "Registration denied").
     _REGISTERED_STATES = {"Registered, home network", "Registered, roaming"}
+
+    # chan_dongle's reply to DongleShowDevices, verified against the
+    # compiled module on the deployed Asterisk build (`strings
+    # chan_dongle.so`): an ack ("Device status list will follow"), then
+    # "Event: DongleDeviceEntry" per device, then
+    # "Event: DongleShowDevicesComplete". The markers live in the Event:
+    # header, NOT Message: — the earlier Message:-only checks never
+    # matched, so every poll read past the list until the 15 s read
+    # timeout dropped the stream (poller failure → watchdog reset storm
+    # → /v1/health hangs, which failed the installer's health verify).
+    # Some builds emit the same headers as Message: — accept both.
+    _ENTRY_MARKER = "DongleDeviceEntry"
+    _COMPLETE_MARKERS = ("DongleShowDevicesComplete", "ListComplete")
 
     async def send_sms(self, to: str, text: str) -> dict:
         """Send SMS via the native DongleSendSMS AMI action.
@@ -207,18 +224,42 @@ class AMIClient:
             )
             # Reply shape: a list-ack message, then one DongleDeviceEntry
             # per matching device, then a list-complete message. Unrelated
-            # events can interleave — skip anything that is not the entry.
+            # events can interleave — skip anything that is not an entry.
+            # The reply is drained to the terminator: stopping at the
+            # entry would leave the Complete message in the stream, where
+            # the NEXT call would read it first and misreport an empty
+            # device list.
             entry: dict[str, str] = {}
             for _ in range(32):  # bounded: a device list is short (1-3 entries)
                 resp = await self._read_response()
-                if resp.get("Message") == "DongleDeviceEntry":
-                    entry = resp
-                    break
-                if resp.get("Message") == "ListComplete":
+                if self._is_device_entry(resp):
+                    if not entry:
+                        entry = resp
+                    continue
+                if self._is_list_complete(resp):
                     break
         if not entry:
             return {}
         return self._normalize_device_entry(entry)
+
+    @classmethod
+    def _is_device_entry(cls, resp: dict) -> bool:
+        """True for a DongleDeviceEntry message.
+
+        Matches the Event:/Message: header marker; the field-based
+        fallback (GSMRegistrationStatus appears only on entries) guards
+        against a future build renaming the header.
+        """
+        hdr = resp.get("Event", "") or resp.get("Message", "")
+        if cls._ENTRY_MARKER in hdr:
+            return True
+        return "GSMRegistrationStatus" in resp and "Device" in resp
+
+    @classmethod
+    def _is_list_complete(cls, resp: dict) -> bool:
+        """True for the DongleShowDevices list-terminator message."""
+        hdr = resp.get("Event", "") or resp.get("Message", "")
+        return any(m in hdr for m in cls._COMPLETE_MARKERS)
 
     @classmethod
     def _normalize_device_entry(cls, entry: dict[str, str]) -> dict:
