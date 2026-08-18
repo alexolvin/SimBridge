@@ -8,6 +8,7 @@ Tests: TS04-3 (PJSIP endpoint), TS04-4 (real call — MANUAL_VERIFY),
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -756,16 +757,21 @@ class TestPjsipConfig:
         assert "allow=ulaw,alaw" in self.pjsip
         assert "disallow=all" in self.pjsip
 
-    def test_dtmf_rfc2833(self):
-        assert "dtmf_mode=rfc2833" in self.pjsip
+    def test_dtmf_rfc4733(self):
+        # Asterisk 18 spelling: the pre-16 value "rfc2833" is rejected
+        # by ast_sip_str_to_dtmf and drops the whole endpoint object
+        # (live incident 2026-08-17/18, 3p14-aaa).
+        assert "dtmf_mode=rfc4733" in self.pjsip
 
     def test_binds_loopback_in_single_node_mode(self):
         """Single node: the bridge is local, so Asterisk binds 127.0.0.1."""
         assert "bind=127.0.0.1" in self.pjsip
 
     def test_no_external_media_addr_in_single_node_mode(self):
-        """Nothing to publish for loopback media."""
+        """Nothing to publish for loopback media (either historical
+        spelling of the transport option)."""
         assert "external_media_addr" not in self.pjsip
+        assert "external_media_address" not in self.pjsip
 
     def test_auth_credentials(self):
         """Bidirectional userpass auth with the generated bridge secret."""
@@ -775,6 +781,131 @@ class TestPjsipConfig:
 
     def test_aor_points_at_bridge(self):
         assert "contact=sip:127.0.0.1:5062" in self.pjsip
+
+    def test_sorcery_type_lines_present(self):
+        """Asterisk 13+ (sorcery) format: every section must carry its
+        type= line. res_sorcery_config loads sections via the criterion
+        "pjsip.conf,criteria=type=<TYPE>", so a section without type= is
+        silently ignored (transport never binds, "pjsip show endpoints"
+        -> "No objects found"). Regression: live incident 2026-08-17
+        (3p14-aaa) — generated config pre-dated the sorcery requirement."""
+        for section, type_line in (
+            ("[global]", "type=global"),
+            ("[transport-udp]", "type=transport"),
+            ("[tg-bridge]", "type=endpoint"),
+            ("[tg-bridge-auth]", "type=auth"),
+            ("[tg-bridge-aor]", "type=aor"),
+        ):
+            block = self.pjsip.split(section)[1].split("\n[")[0]
+            assert type_line in block, f"{section} missing {type_line}"
+
+    def test_aor_has_no_legacy_chan_sip_options(self):
+        """Regression: live incident 2026-08-17/18 (3p14-aaa). The
+        generated aor carried `qualify=no` — a legacy chan_sip option
+        that has no pjsip aor counterpart. EPEL 18 sorcery rejects the
+        unknown option and drops the whole aor object, which cascades:
+        the endpoint referencing the aor is dropped too, so "pjsip show
+        endpoints" shows nothing even though chan_pjsip is Running.
+        Guard: the aor block must contain only valid pjsip aor options."""
+        aor_block = self.pjsip.split("[tg-bridge-aor]")[1].split("\n[")[0]
+        valid_aor_options = {
+            "type", "max_contacts", "contact", "qualify_frequency",
+            "qualify_timeout", "remove_contact", "default_expiry",
+            "minimum_expiry", "allow_overwrite", "hold_via_codec",
+            "user", "rpid", "direct_media",
+        }
+        for line in aor_block.strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            key = line.split("=", 1)[0].strip()
+            assert key in valid_aor_options, (
+                f"pjsip aor option not in the EPEL 18 schema: {line!r} "
+                f"(sorcery drops the whole aor object on unknown keys)")
+
+    def test_endpoint_has_no_legacy_or_transport_options(self):
+        """Regression: live incident 2026-08-17/18 (3p14-aaa). The
+        generated endpoint carried keys Asterisk 18 does not accept
+        there: rtptimeout/rtpholdtimeout (chan_sip legacy — the pjsip
+        names are rtp_timeout / rtp_timeout_hold), nat_option (removed
+        in 18; comedia is built in), and local_net /
+        external_media_address (TRANSPORT fields, sorcery registration
+        in res/res_pjsip/config_transport.c). Any one of them drops the
+        whole endpoint object; ACO aborts at the first failing key, so
+        the journal only showed the dtmf_mode error. Guard: none of the
+        legacy/misplaced keys may appear in the endpoint block."""
+        endpoint_block = self.pjsip.split("[tg-bridge]")[1].split("\n[")[0]
+        for legacy in ("rtptimeout=", "rtpholdtimeout=", "nat_option=",
+                       "local_net=", "external_media_addr=",
+                       "external_media_address="):
+            assert legacy not in endpoint_block, (
+                f"{legacy!r} in the endpoint block — an unknown key "
+                f"drops the whole pjsip object in Asterisk 18")
+
+
+# =========================================================================
+# Stage 04 dialplan — the outgoing GSM leg must live in the context
+# the pjsip endpoint routes to (S04.3, 2026-08-18 finding)
+# =========================================================================
+
+class TestStage04Dialplan:
+    """Static analysis of the Stage 04 outgoing-call leg.
+
+    The generated pjsip endpoint sets context=<endpoint> (tg-bridge),
+    so the bridge's INVITE lands in the [tg-bridge] dialplan context.
+    The outgoing leg used to sit in [sms-send], where the first _X.
+    exten (DongleSendSMS) shadowed it: a duplicate "_X. priority 1"
+    logs "already in use", the leg could never fire, and the INVITE
+    had no context at all (2026-08-18 deploy audit, 3p14-aaa journal
+    WARNINGs).
+    """
+
+    @pytest.fixture(autouse=True)
+    def load_dialplan(self):
+        dialplan_path = Path(__file__).parent.parent / "asterisk" / "extensions.conf"
+        self.dialplan = dialplan_path.read_text()
+
+    def _context(self, name: str) -> str:
+        m = re.search(rf"\[{re.escape(name)}\](.*?)(?=\n\[|\Z)",
+                      self.dialplan, re.S)
+        assert m, f"[{name}] context not found"
+        return m.group(1)
+
+    def test_tg_bridge_context_exists_with_outgoing_leg(self):
+        ctx = self._context("tg-bridge")
+        assert "AGI(notify-agent-agi.py,outgoing-accepted)" in ctx
+        assert "Dial(Dongle/${MODEM_ID}/${EXTEN}," \
+               "${OUTBOUND_GSM_RING_SECONDS})" in ctx
+        # the h-exten closes the call state when the SIP leg dies
+        assert "exten => h,1," in ctx
+
+    def test_outgoing_leg_not_in_sms_send(self):
+        """The SMS-send context is for the DongleSendSMS app only —
+        any Dongle() leg there would be shadowed by the first _X."""
+        ctx = self._context("sms-send")
+        assert "outgoing-accepted" not in ctx
+        assert "Dial(Dongle/" not in ctx
+
+    def test_no_duplicate_exten_priority_in_any_context(self):
+        # A duplicate (exten, priority) pair never executes: Asterisk
+        # logs "already in use" and the first exten wins — the second
+        # is silently dead code.
+        for ctx_name in re.findall(r"^\[([A-Za-z0-9_-]+)\]$",
+                                   self.dialplan, re.M):
+            body = self._context(ctx_name)
+            seen = set()
+            for line in body.splitlines():
+                m = re.match(
+                    r"(?:exten|same)\s*(?:=>|=)\s*"
+                    r"([A-Za-z0-9_*.+-]+),(\d+),",
+                    line.strip())
+                if not m:
+                    continue  # "same => n" priorities are not duplicates
+                key = (m.group(1), m.group(2))
+                assert key not in seen, (
+                    f"duplicate exten {key[0]} priority {key[1]} in "
+                    f"[{ctx_name}] — the second is dead code")
+                seen.add(key)
 
 
 # =========================================================================
@@ -911,7 +1042,7 @@ class TestPjsipDistributed:
 
     Same generator as TestPjsipConfig, with a remote bridge host and a
     Tailscale node IP — the distributed differences (bind address,
-    external_media_addr) are what this class asserts.
+    external_media_address) are what this class asserts.
     """
 
     @pytest.fixture(autouse=True)
@@ -933,13 +1064,21 @@ class TestPjsipDistributed:
         """local_net is set to Tailscale CGNAT range."""
         assert "local_net=100.64.0.0/10" in self.pjsip
 
-    def test_nat_option(self):
-        """nat_option is configured for tailnet."""
-        assert "nat_option=rtp" in self.pjsip
+    def test_no_nat_option(self):
+        """nat_option does not exist in Asterisk 18 (comedia is built
+        in) — an unknown key would drop the whole endpoint object."""
+        assert "nat_option" not in self.pjsip
 
-    def test_external_media_addr_published(self):
-        """external_media_addr publishes the Tailscale IP for remote RTP."""
-        assert "external_media_addr=100.64.0.1" in self.pjsip
+    def test_external_media_address_published(self):
+        """external_media_address (a TRANSPORT field in Asterisk 18,
+        not an endpoint field) publishes the Tailscale IP for RTP."""
+        assert "external_media_address=100.64.0.1" in self.pjsip
+
+    def test_local_net_in_transport_section(self):
+        """local_net lives in the transport section, not the endpoint
+        (sorcery field registration in res/res_pjsip/config_transport.c)."""
+        transport_block = self.pjsip.split("[transport-udp]")[1].split("\n[")[0]
+        assert "local_net=100.64.0.0/10" in transport_block
 
     def test_no_srtp(self):
         """No SRTP transport configured — Tailscale already encrypts."""

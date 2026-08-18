@@ -86,7 +86,7 @@ Scope: Full repository — `main` branch at HEAD.
 **Status: MITIGATED**
 
 - **Clean call teardown** (S04.4): `terminate_bridged_calls()` in `core/call_control.py`. If the tailnet drops mid-call, both legs are terminated and the user is notified.
-- **Link drop detection** (S04.4): PJSIP `rtptimeout=60` / `rtpholdtimeout=30` drop dead RTP legs; the check-timeouts dialplan extension force-terminates stuck BRIDGED calls (audit `partial_hangup`).
+- **Link drop detection** (S04.4): PJSIP `rtp_timeout=60` / `rtp_timeout_hold=30` (Asterisk 18 endpoint options) drop dead RTP legs; the check-timeouts dialplan extension force-terminates stuck BRIDGED calls (audit `partial_hangup`).
 - **No orphan channels**: Symmetric hangup (`routes.py:call_hangup`) terminates both GSM and bridge legs.
 - **Status**: CODE+UNITS (teardown paths unit-tested). Live `tailscale down` mid-call evidence = Pass C (MANUAL_VERIFY — see HANDOFF-S04).
 

@@ -62,8 +62,15 @@ class TestDialplanStructure:
             )
 
     def test_generated_globals_included(self):
-        """S03.2: timings/paths come from the generated globals file."""
-        assert "#include => asterisk-globals.conf" in self.dialplan
+        """S03.2: timings/paths come from the generated globals file.
+
+        Plain #include form only: the "=>" prefix is NOT supported by
+        the Asterisk 18 config engine (main/config.c dequotes "..." and
+        <...> only, then tries to open the literal string "=> file") —
+        a missing include aborts dialplan loading. Live incident
+        2026-08-17 (3p14-aaa): pbx_config declined, 0 contexts."""
+        assert "#include asterisk-globals.conf" in self.dialplan
+        assert "#include =>" not in self.dialplan
 
     def test_blacklist_via_agi(self):
         """Blacklist check is an AGI script (fail-open), not a shell grep

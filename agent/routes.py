@@ -1273,7 +1273,7 @@ async def call_check_timeouts(
             # result: if Asterisk is dead there is no channel left for
             # h-exten to report, and a retry loop would hold the modem
             # reservation forever. If a hangup fails against a LIVE
-            # Asterisk, the leg self-heals (user hangup / rtptimeout=60)
+            # Asterisk, the leg self-heals (user hangup / rtp_timeout=60)
             # and the dialplan's h-exten ENDED then hits the terminal
             # state as a 404 no-op.
             for channel_id in call.get_active_channel_ids():

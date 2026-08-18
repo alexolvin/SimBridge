@@ -12,6 +12,10 @@ Covered:
 - _validate_noninteractive (Telegram node parity)
 - _write_result (JSON contract + 0600)
 - _load_existing_config node.role parsing (for --tg-login)
+- _merge_env KEY=VALUE format (no spaces, legacy self-normalization)
+- _render_modules_conf / _write_modules_conf (S06.2 load list: backup,
+  hard-fail on missing required module, restart flag)
+- phase_start restart-vs-reload policy (modules.conf needs a restart)
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ _STATE_FIELDS = (
     "own_ip", "peer_ip", "acl_ids",
     "do_ts", "do_ts_opt", "usb_modems", "ts_ip", "has_ts",
     "node_id", "generated_secrets", "verify_issues", "ast_config_changed",
+    "ast_modules_changed", "ast_core_changed",
 )
 _LIST_FIELDS = ("usb_modems", "generated_secrets", "verify_issues")
 
@@ -617,3 +622,370 @@ class TestMergeEnvFormat:
         text = env.read_text()
         assert "EXTRA_KEY=keepme" in text
         assert "SIMBRIDGE_HTTP_SECRET=hs789" in text
+
+
+# ---------------------------------------------------------------------------
+# modules.conf — the module load list (S06.2, 2026-08-17 incident):
+# the EPEL default lists modules Asterisk 18 no longer ships and omits
+# res_pjsip's hard dependencies, so the PJSIP chain loaded silently
+# broken and the voice bridge was dead with a "valid" pjsip.conf on disk.
+# ---------------------------------------------------------------------------
+
+def _mk_module_dir(tmp_path, omit=()):
+    mdir = tmp_path / "modules"
+    mdir.mkdir()
+    for m in install.AST_MODULES_LOAD:
+        if m not in omit:
+            (mdir / m).touch()
+    return mdir
+
+
+class TestRenderModulesConf:
+    def test_loads_only_installed_in_dependency_order(self):
+        txt = install._render_modules_conf(set(install.AST_MODULES_LOAD))
+        assert "[modules]" in txt
+        assert "autoload=no" in txt
+        i_sorcery = txt.index("res_sorcery_memory.so")
+        i_pjsip = txt.index("load = res_pjsip.so")
+        i_chan = txt.index("chan_pjsip.so")
+        assert i_sorcery < i_pjsip < i_chan
+        # Dead legacy entries from the EPEL default must not resurface.
+        assert "res_pjsip_transport_udp" not in txt
+        assert "res_pjsip_auth.so" not in txt
+
+    def test_omits_missing_optional_module(self):
+        installed = set(install.AST_MODULES_LOAD) - {"chan_dongle.so"}
+        txt = install._render_modules_conf(installed)
+        assert "chan_dongle.so" not in txt
+        assert "chan_pjsip.so" in txt
+
+    def test_aeap_core_loads_before_engine(self):
+        # res_speech_aeap.so links ast_aeap_message_type_json from
+        # res_aeap.so and the EPEL 18 loader does not auto-load
+        # dependencies (live 2026-08-18, 3p14-aaa: undefined-symbol
+        # load error) — the list order is load-bearing.
+        txt = install._render_modules_conf(set(install.AST_MODULES_LOAD))
+        assert txt.index("load = res_aeap.so") < \
+            txt.index("load = res_speech_aeap.so")
+
+
+class TestWriteModulesConf:
+    def test_backs_up_and_marks_changed(self, tmp_path, monkeypatch,
+                                        ni_state):
+        mdir = _mk_module_dir(tmp_path)
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        (ast / "modules.conf").write_text("[modules]\nautoload=no\n")
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        monkeypatch.setattr(install, "AST_MODULE_DIRS", (str(mdir),))
+        install.s.ast_modules_changed = False
+        install._write_modules_conf()
+        txt = (ast / "modules.conf").read_text()
+        assert "autoload=no" in txt
+        assert "load = chan_pjsip.so" in txt
+        assert install.s.ast_modules_changed is True
+        assert len(list(ast.glob("modules.conf.bak-*"))) == 1
+
+    def test_unchanged_content_no_backup_no_flag(self, tmp_path,
+                                                 monkeypatch, ni_state):
+        mdir = _mk_module_dir(tmp_path)
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        monkeypatch.setattr(install, "AST_MODULE_DIRS", (str(mdir),))
+        install._write_modules_conf()
+        first = (ast / "modules.conf").read_text()
+        install.s.ast_modules_changed = False
+        install._write_modules_conf()
+        assert install.s.ast_modules_changed is False
+        assert (ast / "modules.conf").read_text() == first
+        assert not list(ast.glob("modules.conf.bak-*"))
+
+    def test_missing_required_module_hard_exits(self, tmp_path, monkeypatch,
+                                                ni_state, capsys):
+        mdir = _mk_module_dir(tmp_path, omit={"res_pjsip.so"})
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        monkeypatch.setattr(install, "AST_MODULE_DIRS", (str(mdir),))
+        with pytest.raises(SystemExit) as e:
+            install._write_modules_conf()
+        assert e.value.code == 1
+        assert "res_pjsip.so" in capsys.readouterr().err
+
+    def test_missing_chan_dongle_is_not_fatal(self, tmp_path, monkeypatch,
+                                              ni_state):
+        mdir = _mk_module_dir(tmp_path, omit={"chan_dongle.so"})
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        monkeypatch.setattr(install, "AST_MODULE_DIRS", (str(mdir),))
+        install.s.ast_modules_changed = False
+        install._write_modules_conf()  # must not raise
+        assert "chan_dongle.so" not in (ast / "modules.conf").read_text()
+        assert install.s.ast_modules_changed is True
+
+
+# ---------------------------------------------------------------------------
+# astagidir — the directory AGI() resolves scripts from (live finding
+# 2026-08-18, 3p14-aaa): the EPEL default points at
+# /usr/share/asterisk/agi-bin, an empty package dir, while the installer
+# links the scripts into /usr/lib64/asterisk/agi-bin — scripts in a dir
+# Asterisk does not scan are the same as missing scripts.
+# ---------------------------------------------------------------------------
+
+AGIDIR_TARGET = "/usr/lib64/asterisk/agi-bin"
+
+
+class TestEnsureAgidir:
+    def test_pins_wrong_default(self, tmp_path, monkeypatch, ni_state):
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        (ast / "asterisk.conf").write_text(
+            "[directories]\nastagidir => /usr/share/asterisk/agi-bin\n"
+        )
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install.s.ast_core_changed = False
+        install._ensure_agidir(AGIDIR_TARGET)
+        txt = (ast / "asterisk.conf").read_text()
+        assert f"astagidir => {AGIDIR_TARGET}" in txt
+        assert "/usr/share/asterisk/agi-bin" not in txt
+        # astagidir is a start-time core setting (main/options.c,
+        # "core, can't reload") — the change must force a restart,
+        # not a core reload
+        assert install.s.ast_core_changed is True
+        assert install.s.ast_config_changed is False
+        # backup is created and keeps the pre-change value
+        baks = list(ast.glob("asterisk.conf.bak-*"))
+        assert len(baks) == 1
+        assert "/usr/share/asterisk/agi-bin" in baks[0].read_text()
+
+    def test_inserts_after_template_header(self, tmp_path, monkeypatch,
+                                           ni_state):
+        # the EPEL package file opens with the template header
+        # "[directories](!)" — an equality match on "[directories]"
+        # would miss it and drop the line into the wrong section.
+        # The template header is ALSO a functional bug (see
+        # test_normalizes_template_header_even_when_value_correct),
+        # so the rewrite must leave a plain header behind.
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        (ast / "asterisk.conf").write_text(
+            "[directories](!)\n"
+            "; commented default\n"
+            ";astagidir => /usr/share/asterisk/agi-bin\n"
+            "[files]\n"
+        )
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install._ensure_agidir(AGIDIR_TARGET)
+        lines = (ast / "asterisk.conf").read_text().splitlines()
+        assert "(!)" not in "\n".join(lines)
+        i_hdr = lines.index("[directories]")
+        assert lines[i_hdr + 1] == f"astagidir => {AGIDIR_TARGET}"
+
+    def test_normalizes_template_header_even_when_value_correct(
+            self, tmp_path, monkeypatch, ni_state):
+        # Live root cause (3p14-aaa, 2026-08-18): "[directories](!)"
+        # marks the section as a TEMPLATE category — invisible to
+        # ast_variable_browse() (main/config.c: an empty filter matches
+        # !cat->ignored). With a CORRECT astagidir value AND a full
+        # restart, the process still reported the build default. The
+        # header must be normalized even when the value already matches.
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        (ast / "asterisk.conf").write_text(
+            f"[directories](!)\nastagidir => {AGIDIR_TARGET}\n"
+        )
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install.s.ast_core_changed = False
+        install._ensure_agidir(AGIDIR_TARGET)
+        lines = (ast / "asterisk.conf").read_text().splitlines()
+        assert lines[0] == "[directories]"
+        assert f"astagidir => {AGIDIR_TARGET}" in lines
+        assert install.s.ast_core_changed is True
+        # the backup keeps the broken header for the rollback
+        baks = list(ast.glob("asterisk.conf.bak-*"))
+        assert len(baks) == 1
+        assert "[directories](!)" in baks[0].read_text()
+        # second run: plain header + correct value — no change, no new
+        # backup, flag untouched (idempotency of the normalization)
+        install.s.ast_core_changed = False
+        install._ensure_agidir(AGIDIR_TARGET)
+        assert (ast / "asterisk.conf").read_text().splitlines() == lines
+        assert len(list(ast.glob("asterisk.conf.bak-*"))) == 1
+        assert install.s.ast_core_changed is False
+
+    def test_appends_section_when_absent(self, tmp_path, monkeypatch,
+                                         ni_state):
+        # the installer-created minimal conf has no [directories] at all
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        (ast / "asterisk.conf").write_text(
+            "[files]\nastriskdir => /var/lib/asterisk\n"
+        )
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install._ensure_agidir(AGIDIR_TARGET)
+        txt = (ast / "asterisk.conf").read_text()
+        i_sec = txt.index("[directories]")
+        assert f"astagidir => {AGIDIR_TARGET}" in txt[i_sec:]
+
+    def test_unchanged_no_backup_keeps_flag(self, tmp_path, monkeypatch,
+                                            ni_state):
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        conf = f"[directories]\nastagidir => {AGIDIR_TARGET}\n"
+        (ast / "asterisk.conf").write_text(conf)
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install.s.ast_core_changed = True  # a prior change survives
+        install._ensure_agidir(AGIDIR_TARGET)
+        assert (ast / "asterisk.conf").read_text() == conf
+        assert not list(ast.glob("asterisk.conf.bak-*"))
+        assert install.s.ast_core_changed is True
+
+    def test_missing_file_warns_not_fatal(self, tmp_path, monkeypatch,
+                                          ni_state, capsys):
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        install._ensure_agidir(AGIDIR_TARGET)  # must not raise
+        assert "astagidir" in capsys.readouterr().err
+        assert not (ast / "asterisk.conf").exists()
+
+
+class TestAgiDirFromConfig:
+    def test_reads_active_line(self, tmp_path, monkeypatch):
+        # the commented-out default (EPEL ships it as ";astagidir =>")
+        # must not shadow the active line
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        (ast / "asterisk.conf").write_text(
+            "[directories]\n;astagidir => /usr/share/asterisk/agi-bin\n"
+            f"astagidir => {AGIDIR_TARGET}\n"
+        )
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        assert install._agi_dir_from_config() == AGIDIR_TARGET
+
+    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
+        ast = tmp_path / "asterisk"
+        ast.mkdir()
+        monkeypatch.setattr(install, "AST_DIR", str(ast))
+        assert install._agi_dir_from_config() == ""
+
+
+# ---------------------------------------------------------------------------
+# /run/lock — chan_dongle's lock files need sticky 1777 (live finding
+# 2026-08-18, 3p14-aaa: the RHEL9 default 0755 broke lock_create() for
+# the asterisk user). /run is tmpfs, so the mode is re-applied at boot
+# from a tmpfiles.d entry.
+# ---------------------------------------------------------------------------
+
+class TestEnsureRunLock:
+    def _patch(self, tmp_path, monkeypatch):
+        lock = tmp_path / "lock"
+        tf = tmp_path / "tmpfiles" / "run-lock.conf"
+        monkeypatch.setattr(install, "RUN_LOCK_DIR", str(lock))
+        monkeypatch.setattr(install, "RUN_LOCK_TMPFILES", str(tf))
+        return lock, tf
+
+    def test_fixes_mode_and_writes_tmpfiles(self, tmp_path, monkeypatch):
+        lock, tf = self._patch(tmp_path, monkeypatch)
+        lock.mkdir()
+        lock.chmod(0o755)  # the RHEL9 default
+        install._ensure_run_lock()
+        assert (lock.stat().st_mode & 0o7777) == 0o1777
+        assert f"d {lock} 1777 root root -" in tf.read_text()
+
+    def test_idempotent_no_backup(self, tmp_path, monkeypatch):
+        lock, tf = self._patch(tmp_path, monkeypatch)
+        lock.mkdir()
+        lock.chmod(0o1777)
+        install._ensure_run_lock()
+        first = tf.read_text()
+        install._ensure_run_lock()
+        assert tf.read_text() == first
+        assert not list(tf.parent.glob("run-lock.conf.bak-*"))
+
+    def test_missing_dir_still_persists_mode(self, tmp_path, monkeypatch):
+        # /run may be absent (test box): the tmpfiles "d" type creates
+        # the directory at boot, so the entry must still be written
+        lock, tf = self._patch(tmp_path, monkeypatch)
+        install._ensure_run_lock()  # must not raise
+        assert tf.exists()
+        assert f"d {lock} 1777 root root -" in tf.read_text()
+
+
+class TestPhaseStartRestartPolicy:
+    """modules.conf (like the unit EnvironmentFile) is only read at
+    process start — a load-list change must restart Asterisk, not
+    `core reload` (a reload applies nothing and the node keeps running
+    the broken load list — the 2026-08-17 failure mode)."""
+
+    def _prime(self):
+        install.s.node_role = "gsm"
+        install.s.action = "update"
+        install.s.own_ip = "127.0.0.1"
+        install.s.ast_env_changed = False
+        install.s.ast_config_changed = False
+        install.s.ast_modules_changed = True
+
+    def test_modules_change_triggers_restart(self, monkeypatch, ni_state):
+        self._prime()
+        cmds = []
+
+        def fake_run_ok(cmd):
+            cmds.append(cmd)
+            return "is-active" in cmd  # everything already active
+
+        monkeypatch.setattr(install, "run_ok", fake_run_ok)
+        # Never let the test touch real /etc on a box without Asterisk.
+        monkeypatch.setattr(install, "_write_default_asterisk_conf",
+                            lambda: None)
+        install.phase_start()
+        assert any("systemctl restart asterisk" in c for c in cmds)
+        assert not any("core reload" in c for c in cmds)
+
+    def test_config_only_change_stays_non_disruptive(self, monkeypatch,
+                                                     ni_state):
+        self._prime()
+        install.s.ast_modules_changed = False
+        install.s.ast_config_changed = True
+        cmds = []
+
+        def fake_run_ok(cmd):
+            cmds.append(cmd)
+            return "is-active" in cmd
+
+        def fake_run_q(cmd, *a, **k):
+            cmds.append(cmd)  # core reload goes through run_q
+            return types.SimpleNamespace(
+                returncode=0, stdout="reload complete\n")
+
+        monkeypatch.setattr(install, "run_ok", fake_run_ok)
+        monkeypatch.setattr(install, "run_q", fake_run_q)
+        monkeypatch.setattr(install, "_write_default_asterisk_conf",
+                            lambda: None)
+        install.phase_start()
+        assert not any("systemctl restart asterisk" in c for c in cmds)
+        assert any("core reload" in c for c in cmds)
+
+    def test_core_config_change_triggers_restart(self, monkeypatch,
+                                                 ni_state):
+        # astagidir and friends live in asterisk.conf [directories],
+        # which main/options.c loads with "core, can't reload" —
+        # a core reload would leave the old value in effect
+        # (verified live 2026-08-18, 3p14-aaa).
+        self._prime()
+        install.s.ast_modules_changed = False
+        install.s.ast_core_changed = True
+        cmds = []
+
+        def fake_run_ok(cmd):
+            cmds.append(cmd)
+            return "is-active" in cmd
+
+        monkeypatch.setattr(install, "run_ok", fake_run_ok)
+        monkeypatch.setattr(install, "_write_default_asterisk_conf",
+                            lambda: None)
+        install.phase_start()
+        assert any("systemctl restart asterisk" in c for c in cmds)
+        assert not any("core reload" in c for c in cmds)

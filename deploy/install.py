@@ -139,6 +139,87 @@ AGI_BIN_DIRS   = ("/usr/lib64/asterisk/agi-bin", "/usr/lib/asterisk/agi-bin")
 # AGI hook scripts linked into the AGI dir (called by extensions.conf)
 AGI_SCRIPTS    = ("tg-sms-agi.py", "tg-voice-agi.py",
                   "tg-blacklist-agi.py", "notify-agent-agi.py")
+# /run/lock — chan_dongle writes its per-device lock files here. It
+# must be sticky 1777 (the RHEL9 default is 0755, which breaks
+# lock_create() for the asterisk user), and /run is tmpfs, so the mode
+# is re-applied at boot from a tmpfiles.d entry (live finding
+# 2026-08-18, 3p14-aaa).
+RUN_LOCK_DIR       = "/run/lock"
+RUN_LOCK_TMPFILES  = "/etc/tmpfiles.d/simbridge-run-lock.conf"
+
+# ── Asterisk module load list (modules.conf) ──────────────────────────────
+# EPEL's default modules.conf predates SimBridge: it lists modules that
+# Asterisk 18 consolidated into res_pjsip (res_pjsip_auth,
+# res_pjsip_transport_udp — no longer shipped) and omits
+# res_sorcery_memory / res_sorcery_astdb, res_pjsip's hard dependencies.
+# The PJSIP chain then fails to load silently and the voice bridge is
+# dead (2026-08-17 incident, 3p14-aaa). The installer now owns
+# modules.conf and generates the load list from the installed .so files.
+#
+# Load order = dependency order: the EPEL 18 loader does NOT auto-load
+# required modules (verified live). dnsmgr (first in res_pjsip's
+# .requires) is built into the core binary on 18.x — res/res_dnsmgr.c
+# was removed upstream — so there is no .so to load for it.
+# app_voicemail is deliberately absent: S04 voicemail is built from
+# MixMonitor+Playback and the asterisk-voicemail subpackage is not
+# installed (loading a missing .so spews errors at every startup).
+AST_MODULE_DIRS = ("/usr/lib64/asterisk/modules",
+                   "/usr/lib/asterisk/modules")
+AST_MODULES_LOAD = (
+    "res_sorcery_config.so", "res_sorcery_memory.so",
+    "res_sorcery_astdb.so",
+    "res_pjproject.so", "res_pjsip.so", "res_pjsip_session.so",
+    "res_pjsip_endpoint_identifier_ip.so",
+    "res_pjsip_endpoint_identifier_user.so",
+    "res_pjsip_authenticator_digest.so",  # pjsip.conf auth_type=userpass
+    "res_pjsip_nat.so",                   # pjsip comedia NAT traversal
+                                          # (built into Asterisk 18; the
+                                          # legacy nat_option key is gone)
+    "res_pjsip_pubsub.so",                # required by chan_pjsip
+    "chan_pjsip.so",
+    "chan_dongle.so",                     # third-party (wiringSoft)
+    "codec_alaw.so", "codec_ulaw.so", "codec_gsm.so",
+    "codec_resample.so",
+    "format_wav.so", "format_gsm.so", "format_pcm.so",
+    "app_dial.so", "app_mixmonitor.so", "app_playback.so",
+    "app_system.so", "app_record.so", "res_clioriginate.so",
+    "func_db.so", "func_callerid.so", "func_strings.so",
+    "func_base64.so",
+    "res_speech.so",       # res_agi links ast_speech_change (EPEL 18)
+    "res_aeap.so",         # AEAP core — hard dep of res_speech_aeap
+                           # (exports ast_aeap_message_type_json; live
+                           # 2026-08-18, 3p14-aaa: undefined-symbol
+                           # load error without it)
+    "res_speech_aeap.so",  # AEAP engine, optional (nm: does NOT export
+                           # ast_speech_change — res_speech.so does)
+    "cdr_csv.so", "res_agi.so",
+    "pbx_config.so", "pbx_spool.so",
+)
+# Excluded from the required set:
+#  - chan_dongle.so: third-party driver (wiringSoft RPM / PPA), not a
+#    distro package — its absence is a warning, and the chan_dongle
+#    verification check reports it.
+#  - res_aeap.so: the AEAP core — hard dep of res_speech_aeap
+#    (ast_aeap_message_type_json); the loader does not auto-load
+#    dependencies, so it is listed (in load order) right before the
+#    engine. Same optionality: distro builds without AEAP skip both.
+#  - res_speech_aeap.so: the AEAP speech engine — only needed for the
+#    Speech() app; nm evidence (3p14-aaa, 2026-08-18) shows it does not
+#    export ast_speech_change, so res_agi only depends on res_speech.so.
+#    Some distro builds may not ship it — hard-failing would be wrong.
+AST_MODULES_OPTIONAL = ("chan_dongle.so", "res_aeap.so",
+                        "res_speech_aeap.so")
+AST_MODULES_REQUIRED = tuple(m for m in AST_MODULES_LOAD
+                             if m not in AST_MODULES_OPTIONAL)
+
+# PJSIP section names — must stay in sync with
+# scripts/generate_asterisk_config.py (the generator is the source of
+# truth for the file; these constants are what verification looks for).
+BRIDGE_ENDPOINT  = "tg-bridge"
+BRIDGE_TRANSPORT = "transport-udp"
+# Load-bearing dialplan contexts (asterisk/extensions.conf is the source
+# of truth — keep in sync).
+DIALPLAN_CONTEXTS = ("incoming-mobile", "tg-bridge")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Terminal I/O
@@ -392,6 +473,12 @@ class S:
     # so phase_start() can reload or restart Asterisk with the right urgency.
     ast_env_changed: bool = False     # unit EnvironmentFile changed -> restart
     ast_config_changed: bool = False  # dialplan/globals/AMI changed -> core reload
+    ast_modules_changed: bool = False  # modules.conf load list changed -> restart
+    ast_core_changed: bool = False   # asterisk.conf [directories] changed
+                                     # -> restart (the core config file is
+                                     # read once at process start:
+                                     # main/options.c loads it with the
+                                     # "core, can't reload" flag)
 
 s = S()
 
@@ -1058,7 +1145,7 @@ sim:
   phone: "{s.sim_phone}"
   modem_model: "{s.modem_model}"
 voice:
-  bridge_endpoint: tg-bridge
+  bridge_endpoint: {BRIDGE_ENDPOINT}
   bridge_host: {vh}
   bridge_port: 5062
   srtp: false
@@ -1205,6 +1292,102 @@ def _agi_bin_dir() -> str:
             return d
     return AGI_BIN_DIRS[0]
 
+def _agi_dir_from_config() -> str:
+    """Read the effective astagidir from /etc/asterisk/asterisk.conf."""
+    p = Path(f"{AST_DIR}/asterisk.conf")
+    try:
+        for ln in p.read_text().splitlines():
+            if re.match(r"^\s*astagidir\s*=>", ln):
+                return ln.partition("=>")[2].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _ensure_agidir(agidir: str) -> None:
+    """Pin asterisk.conf [directories] astagidir to our AGI dir.
+
+    The AGI application resolves scripts from astagidir, which res_agi
+    reads from asterisk.conf at startup. The EPEL default points at a
+    directory that does NOT receive our symlinks (those go to
+    _agi_bin_dir()), so every AGI() call would fail with "script not
+    found" even though the scripts are deployed (live finding
+    2026-08-18, 3p14-aaa: astagidir=/usr/share/asterisk/agi-bin, an
+    empty package dir).
+
+    TWO gotchas make this non-obvious (both verified live 2026-08-18):
+
+    1. Template marker. The package-shipped section header is
+       "[directories](!)". In the Asterisk config grammar the "(!)"
+       marker makes the category a TEMPLATE (main/config.c section
+       header parse: "!\" -> cat->ignored = 1), and template
+       categories are invisible to ast_variable_browse()
+       (does_category_match: "automatically match if not a
+       template"). The core therefore reads ZERO [directories]
+       values and silently falls back to the build-time defaults —
+       astagidir included. This is an upstream inconsistency:
+       configs/samples/asterisk.conf.sample (18.26.4) ships exactly
+       this header. The header must be rewritten to plain
+       "[directories]" for anything in the section to take effect.
+
+    2. Start-time only. astagidir is read in main/options.c via
+       ast_config_load2(..., "" /* core, can't reload */) — the core
+       config file is parsed once at process start, and res_agi
+       resolves scripts from the startup-cached
+       ast_config_AST_AGI_DIR (res/res_agi.c). A changed value
+       requires a FULL RESTART, not core reload (verified live: after
+       core reload, "core show settings" still reported the old
+       directory).
+    """
+    p = Path(f"{AST_DIR}/asterisk.conf")
+    if not p.exists():
+        warn("asterisk.conf missing — cannot pin astagidir.")
+        return
+    target = f"astagidir => {agidir}"
+    out: List[str] = []
+    seen = False
+    changed = False
+    for ln in p.read_text().splitlines():
+        stripped = ln.strip()
+        if re.match(r"^\[directories\]", stripped, re.IGNORECASE):
+            # "[directories](!)" is a TEMPLATE category — invisible
+            # to the core parser (see docstring). Normalize to a
+            # plain header or the whole section stays dead.
+            if stripped != "[directories]":
+                ln = "[directories]"
+                changed = True
+        if re.match(r"^\s*astagidir\s*=>", ln):
+            seen = True
+            if ln.strip() != target:
+                out.append(target)
+                changed = True
+            else:
+                out.append(ln)
+        else:
+            out.append(ln)
+    if not seen:
+        # no active astagidir line: insert into [directories] or add
+        # the section (the installer-created minimal conf has none).
+        for i, ln in enumerate(out):
+            if ln.strip().lower().startswith("[directories]"):
+                out.insert(i + 1, target)
+                break
+        else:
+            out.extend(["", "[directories]", target])
+        changed = True
+    if not changed:
+        ok("astagidir already points to the AGI dir.", str(p))
+        return
+    bak = (f"{p}.bak-"
+           f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+    Path(bak).write_text(p.read_text())
+    warn("Existing asterisk.conf backed up:", bak)
+    p.write_text("\n".join(out) + "\n")
+    p.chmod(0o644)
+    s.ast_core_changed = True
+    ok("astagidir pinned:", target)
+
+
 def _strip_section(txt: str, name: str) -> str:
     """Remove a '[name]' section from Asterisk config text (legacy cleanup)."""
     out: List[str] = []
@@ -1217,12 +1400,88 @@ def _strip_section(txt: str, name: str) -> str:
             out.append(ln)
     return "\n".join(out) + "\n"
 
+def _module_dir() -> "Path | None":
+    """Asterisk's module directory (compile-time constant per package)."""
+    for d in AST_MODULE_DIRS:
+        if Path(d).is_dir():
+            return Path(d)
+    return None
+
+
+def _render_modules_conf(installed: set) -> str:
+    """Render modules.conf content for the given set of installed .so.
+
+    Pure function — unit-testable without touching /etc. Only modules
+    from AST_MODULES_LOAD are emitted, in load order: the list is the
+    source of truth, the disk is the filter.
+    """
+    lines = [
+        "; SimBridge — Asterisk module load list (generated)",
+        "; Do NOT edit by hand — re-run the installer to change it.",
+        ";",
+        "; Load order = dependency order: the EPEL 18 loader does not",
+        "; auto-load required modules (verified live).",
+        "",
+        "[modules]",
+        "autoload=no",
+        "",
+    ]
+    for mod in AST_MODULES_LOAD:
+        if mod in installed:
+            lines.append(f"load = {mod}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_modules_conf() -> None:
+    """Own /etc/asterisk/modules.conf (S06.2).
+
+    Asterisk starts exactly this load list (autoload=no); the EPEL
+    default predates SimBridge and leaves the PJSIP chain broken
+    (see the AST_MODULE_DIRS comment). Writes the list for the
+    modules that actually exist on disk; a missing required module
+    is a hard error — a node without res_pjsip/chan_dongle cannot do
+    its job. A changed load list only applies on restart —
+    phase_start() restarts Asterisk when s.ast_modules_changed.
+    """
+    mdir = _module_dir()
+    if mdir is None:
+        warn("Asterisk module directory not found — modules.conf "
+             "left as-is.")
+        return
+    installed = {p.name for p in mdir.glob("*.so")}
+    missing = [m for m in AST_MODULES_REQUIRED if m not in installed]
+    if missing:
+        fail("Required Asterisk modules missing:",
+             f" {', '.join(missing)}")
+        fail("Install the Asterisk packages for your distribution "
+             "(base + PJSIP subpackage) and re-run the installer.")
+        sys.exit(1)
+    content = _render_modules_conf(installed)
+    dst = Path(f"{AST_DIR}/modules.conf")
+    old = dst.read_text() if dst.exists() else None
+    if old == content:
+        ok("Modules.conf unchanged.", str(dst))
+        return
+    if old is not None:
+        bak = (f"{dst}.bak-"
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+        Path(bak).write_text(old)
+        warn("Existing modules.conf backed up:", bak)
+    dst.write_text(content)
+    dst.chmod(0o644)
+    s.ast_modules_changed = True
+    ok("Modules.conf (module load list):", str(dst))
+
+
 def _install_asterisk_dialplan() -> None:
-    """Install dialplan, generated globals, VM prompt and AGI hooks.
+    """Install dialplan, module load list, generated globals, VM prompt
+    and AGI hooks.
 
     Everything is written BEFORE Asterisk is (re)loaded: extensions.conf
     #includes asterisk-globals.conf, which must exist at load time.
-    phase_start() applies the reload (config) or restart (environment).
+    phase_start() applies the restart (environment / modules.conf /
+    asterisk.conf [directories] — read only at process start) or the
+    core reload (dialplan / globals / AMI).
     """
     heading("Installing Asterisk Dialplan")
 
@@ -1247,6 +1506,12 @@ def _install_asterisk_dialplan() -> None:
         ok("Dialplan:", AST_EXTENSIONS)
     else:
         ok("Dialplan unchanged.", AST_EXTENSIONS)
+
+    # 1b. modules.conf — the module load list (S06.2). Done right after
+    #     the dialplan: both are read at startup, and a modules.conf
+    #     that cannot load chan_pjsip/pbx_config makes the dialplan
+    #     dead on arrival.
+    _write_modules_conf()
 
     # 2. Voicemail prompt — must exist BEFORE step 3: the generator
     #    probes it to emit PROMPT_DURATION (S03.1 greeting trim).
@@ -1324,6 +1589,11 @@ def _install_asterisk_dialplan() -> None:
         except OSError as e:
             warn(f"AGI link {name} failed:", str(e))
 
+    # 4b. astagidir — pin the setting to the dir we just linked into.
+    #     Scripts in the wrong dir are scripts that do not exist: the
+    #     EPEL default astagidir points at an empty package directory.
+    _ensure_agidir(agi_dir)
+
     # 5. Asterisk env drop-in — AGI hooks inherit /etc/simbridge/env
     #    (Rule 5: secrets never in unit files or dialplan)
     dropin_txt = ("[Service]\n"
@@ -1390,6 +1660,41 @@ def _chown(p: str, rec: bool = False) -> None:
     except (OSError, LookupError):
         pass
 
+def _ensure_run_lock() -> None:
+    """Make /run/lock sticky world-writable for chan_dongle's locks.
+
+    The RHEL/AlmaLinux 9 default is 0755, which makes chan_dongle's
+    lock_create() fail for the asterisk user at every startup (live
+    finding 2026-08-18, 3p14-aaa — non-fatal, but error spam on each
+    boot). /run is tmpfs and wiped on reboot, so the mode must be
+    re-applied from tmpfiles.d ("d" guarantees the mode even if the
+    directory already exists).
+    """
+    d = Path(RUN_LOCK_DIR)
+    if d.exists() and (d.stat().st_mode & 0o7777) != 0o1777:
+        try:
+            d.chmod(0o1777)
+            ok("/run/lock mode fixed:", "1777")
+        except OSError as e:
+            warn("/run/lock chmod failed:", str(e))
+    txt = ("# chan_dongle lock files: /run is tmpfs — re-apply the sticky\n"
+           "# mode at every boot (the RHEL9 default 0755 breaks locks).\n"
+           f"d {RUN_LOCK_DIR} 1777 root root -\n")
+    tf = Path(RUN_LOCK_TMPFILES)
+    if tf.exists() and tf.read_text() == txt:
+        ok("run/lock tmpfiles entry unchanged.")
+        return
+    if tf.exists():
+        bak = (f"{tf}.bak-"
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+        Path(bak).write_text(tf.read_text())
+        warn("Existing tmpfiles entry backed up:", bak)
+    tf.parent.mkdir(parents=True, exist_ok=True)
+    tf.write_text(txt)
+    tf.chmod(0o644)
+    ok("run/lock tmpfiles entry:", str(tf))
+
+
 def _set_perms() -> None:
     heading("Setting Permissions")
     _chown(INSTALL_DIR, rec=True)
@@ -1400,6 +1705,7 @@ def _set_perms() -> None:
     # recursive simbridge chown above must not stick (see the unit docs).
     if s.node_role in ("gsm", "all-in-one"):
         _chown_asterisk(Path(f"{DATA_DIR}/recordings"))
+        _ensure_run_lock()
     Path(CONF_FILE).chmod(0o640)
     Path(ENV_FILE).chmod(0o600)
     sess = Path(f"{DATA_DIR}/sim_session.session")
@@ -1508,10 +1814,14 @@ def phase_start() -> None:
                 r = run_q("systemctl status asterisk --no-pager 2>&1 | tail -8")
                 _w(r.stdout)
                 info("Check logs: sudo journalctl -u asterisk --no-pager -n 20")
-        elif s.ast_env_changed:
-            # EnvironmentFile is read at process start — a full restart is
-            # required. Active calls will be dropped.
-            warn("Asterisk environment changed — restarting "
+        elif s.ast_env_changed or s.ast_modules_changed \
+                or s.ast_core_changed:
+            # EnvironmentFile, modules.conf and asterisk.conf
+            # [directories] are all read at process start — a full
+            # restart is required (core reload applies none of them:
+            # main/options.c loads the core config with the
+            # "core, can't reload" flag). Active calls will be dropped.
+            warn("Asterisk start-time configuration changed — restarting "
                  "(active calls will be dropped).")
             if run_ok("systemctl restart asterisk"):
                 ok("Asterisk restarted.")
@@ -1595,6 +1905,61 @@ def _dongle_module_loaded(out: str) -> bool:
     "active" (a detection written for `systemctl is-active` output
     can never match a `module show` table)."""
     return "dongle" in out.lower() and "running" in out.lower()
+
+
+def _module_running(module: str, retries: int = 10, delay: float = 3.0) -> bool:
+    """`module show like <module>` reports Status "Running" — retrying
+    while Asterisk settles after (re)start (same rationale as
+    _dongle_module_output)."""
+    pat = re.compile(rf"(?<!\w){re.escape(module)}\.so(?!\w)")
+    for _ in range(retries):
+        r = run_q(f"asterisk -rx 'module show like {module}' 2>/dev/null")
+        if any("Running" in ln and pat.search(ln)
+               for ln in r.stdout.splitlines()):
+            return True
+        time.sleep(delay)
+    return False
+
+
+def _pjsip_endpoint_up(endpoint: str, retries: int = 10,
+                       delay: float = 3.0) -> bool:
+    """The bridge endpoint is registered AND its transport is bound —
+    retrying while sorcery objects settle after (re)start.
+
+    File existence is not proof: on 3p14-aaa (2026-08-17) pjsip.conf
+    existed while `pjsip show endpoints` said "No objects found" —
+    the legacy modules.conf left the PJSIP chain unloaded, and a
+    pre-sorcery config (sections without type=) is ignored silently.
+    """
+    for _ in range(retries):
+        r = run_q("asterisk -rx 'pjsip show endpoints' 2>/dev/null")
+        if endpoint in r.stdout:
+            t = run_q("asterisk -rx 'pjsip show transports' 2>/dev/null")
+            if BRIDGE_TRANSPORT in t.stdout:
+                return True
+        time.sleep(delay)
+    return False
+
+
+def _dialplan_contexts_up(retries: int = 10, delay: float = 3.0) -> bool:
+    """The load-bearing S04 contexts exist in the running dialplan.
+
+    A fresh start that loses asterisk-globals.conf (the #include
+    target) or whose pbx_config declined to load ends with 0 contexts
+    — and every SMS/voice path dies silently. Context names come from
+    DIALPLAN_CONTEXTS (asterisk/extensions.conf is the source of truth).
+    """
+    for _ in range(retries):
+        up = True
+        for ctx in DIALPLAN_CONTEXTS:
+            r = run_q(f"asterisk -rx 'dialplan show {ctx}' 2>/dev/null")
+            if "exten =>" not in r.stdout:
+                up = False
+                break
+        if up:
+            return True
+        time.sleep(delay)
+    return False
 
 
 def phase_verify() -> None:
@@ -1717,20 +2082,94 @@ def phase_verify() -> None:
                    f"generate_asterisk_config.py {CONF_FILE} -o {AST_GLOBALS}")
         _check("Asterisk globals file", globals_ok, detail, fix)
 
-        # 7b. PJSIP voice-bridge endpoint (S04.2) — without it the
-        #     bridge cannot register and no live call can be bridged.
+        # 7b. PJSIP voice-bridge (S04.2) — without the endpoint +
+        #     transport in the RUNNING instance the bridge cannot ring
+        #     or be rung. A file-existence check alone passed on
+        #     3p14-aaa (2026-08-17) while the instance reported
+        #     "No objects found".
         pjsip_ok = Path(AST_PJSIP).exists()
         _check("PJSIP voice-bridge config (S04)", pjsip_ok,
                f"    {AST_PJSIP} missing — voice bridge cannot register."
                if not pjsip_ok else "",
                "Re-run the installer (PJSIP step) with SIMBRIDGE_BRIDGE_SECRET set")
+        if ast_active and pjsip_ok:
+            pjsip_mod = _module_running("chan_pjsip")
+            _check("chan_pjsip module running (S04)", pjsip_mod,
+                   "    pjsip.conf is present but chan_pjsip is not loaded.\n"
+                   "    Check modules.conf (the installer now manages it)."
+                   if not pjsip_mod else "",
+                   "Re-run the installer, or: asterisk -rx 'module load chan_pjsip'")
+            if pjsip_mod:
+                ep_ok = _pjsip_endpoint_up(BRIDGE_ENDPOINT)
+                _check(f"PJSIP bridge endpoint '{BRIDGE_ENDPOINT}' (S04)",
+                       ep_ok,
+                       "    Endpoint or transport not registered in the\n"
+                       "    running instance. Check pjsip.conf: every section\n"
+                       "    needs a type= line (Asterisk 13+ sorcery format),\n"
+                       "    then re-check: asterisk -rx 'pjsip show endpoints'\n"
+                       "    and 'pjsip show transports'."
+                       if not ep_ok else "",
+                       "Re-run the installer (PJSIP step); systemctl restart asterisk")
 
-        # 8. AGI hooks reachable from Asterisk
+        # 7c. Dialplan loaded in the running instance — a start that
+        #     loses asterisk-globals.conf or whose pbx_config declined
+        #     to load ends with 0 contexts and every path dies silently.
+        if ast_active:
+            dp_ok = _dialplan_contexts_up()
+            _check("Dialplan contexts loaded", dp_ok,
+                   "    'dialplan show' is missing the S04 contexts — the\n"
+                   "    dialplan was not loaded at Asterisk startup.\n"
+                   "    journalctl -u asterisk | grep -iE 'pbx|include'"
+                   if not dp_ok else "",
+                   "systemctl restart asterisk; "
+                   "journalctl -u asterisk -n 30 --no-pager")
+
+        # 8. AGI hooks reachable from Asterisk — both the symlinks and
+        #     the astagidir setting: scripts present in a directory
+        #     Asterisk does not scan are the same as scripts that do
+        #     not exist (live finding 2026-08-18: the EPEL default
+        #     astagidir pointed at an empty /usr/share/asterisk/agi-bin
+        #     while the symlinks sat in /usr/lib64/asterisk/agi-bin).
         agi_dir = _agi_bin_dir()
         missing = [n for n in AGI_SCRIPTS if not (Path(agi_dir) / n).exists()]
         _check(f"AGI hooks in {agi_dir}", not missing,
                f"    Missing: {', '.join(missing)}" if missing else "",
                "Re-run the installer (AGI link step)")
+        cfg_dir = _agi_dir_from_config()
+        _check("astagidir points at the AGI dir", cfg_dir == agi_dir,
+               f"    asterisk.conf astagidir={cfg_dir or '<unset>'}, but the\n"
+               f"    hooks are linked in {agi_dir} — AGI() would not find\n"
+               f"    them (scripts in the unscanned dir = missing)."
+               if cfg_dir != agi_dir else "",
+               "Re-run the installer (astagidir step), "
+               "then: systemctl restart asterisk — astagidir is a "
+               "start-time core setting (main/options.c loads the core "
+               "config with the \"core, can't reload\" flag), so a core "
+               "reload does not apply it")
+
+        # 8b. The RUNNING process resolved the same directory. The
+        #     config file can be correct while the process still holds
+        #     the old value: astagidir is read once at process start,
+        #     and a [directories](!) template header makes the whole
+        #     section invisible to the core parser even after a
+        #     restart (live finding 2026-08-18: config said
+        #     /usr/lib64/asterisk/agi-bin, `core show settings` said
+        #     /usr/share/asterisk/agi-bin).
+        if ast_active:
+            r = run_q("asterisk -rx 'core show settings' 2>/dev/null")
+            rt_dir = ""
+            for ln in r.stdout.splitlines():
+                if "AGI Scripts directory" in ln:
+                    rt_dir = ln.split(":", 1)[1].strip()
+            _check("running process uses the AGI dir", rt_dir == agi_dir,
+                   f"    Process reports {rt_dir or '<not found>'} while\n"
+                   f"    the hooks are linked in {agi_dir} — AGI() will\n"
+                   f"    not find them.\n"
+                   f"    (astagidir is start-time only, and a\n"
+                   f"    [directories](!) template header silences the\n"
+                   f"    whole section — the installer normalizes it.)"
+                   if rt_dir != agi_dir else "",
+                   "systemctl restart asterisk")
 
     # ═══ Telegram checks ═══
     if tg:

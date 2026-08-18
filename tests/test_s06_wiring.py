@@ -122,7 +122,7 @@ class TestPjsipBind:
         text = self._gen(tmp_path, self.DIST, node_ip="100.70.1.9")
         assert "bind=100.70.1.9" in text
         assert "0.0.0.0" not in text
-        assert "external_media_addr=100.70.1.9" in text
+        assert "external_media_address=100.70.1.9" in text
 
     def test_distributed_without_node_ip_refused(self, tmp_path):
         with pytest.raises(SystemExit) as ei:
@@ -135,7 +135,7 @@ class TestPjsipBind:
                          "bridge_port": 5062}}
         text = self._gen(tmp_path, cfg)
         assert "bind=127.0.0.1" in text
-        assert "external_media_addr" not in text
+        assert "external_media_address" not in text
 
 
 # ---------------------------------------------------------------------------

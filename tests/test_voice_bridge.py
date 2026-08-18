@@ -49,9 +49,11 @@ class TestBridgeSelection:
         """PJSIP config: only ulaw/alaw (GSM-compatible)."""
         assert "allow=ulaw,alaw" in self.doc
 
-    def test_pjsip_config_dtmf_rfc2833(self):
-        """PJSIP config: DTMF via RFC2833."""
-        assert "dtmf_mode=rfc2833" in self.doc
+    def test_pjsip_config_dtmf_rfc4733(self):
+        """PJSIP config: DTMF via RFC 2833 — Asterisk 18 spelling is
+        rfc4733 (the pre-16 value "rfc2833" is rejected by
+        ast_sip_str_to_dtmf and drops the whole endpoint object)."""
+        assert "dtmf_mode=rfc4733" in self.doc
 
     def test_voicemail_fallback_documented(self):
         """S03.4: voicemail is a named, same-context fallback branch that

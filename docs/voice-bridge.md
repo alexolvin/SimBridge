@@ -257,12 +257,14 @@ one mechanism, the generator). Single-node output:
 
 ```ini
 [global]
+type=global
 user_agent=SimBridge
 
 [transport-udp]
 type=transport
 protocol=udp
 bind=127.0.0.1
+local_net=100.64.0.0/10
 
 [tg-bridge]
 type=endpoint
@@ -270,16 +272,14 @@ transport=transport-udp
 context=tg-bridge
 disallow=all
 allow=ulaw,alaw
-dtmf_mode=rfc2833
+dtmf_mode=rfc4733
 ; S04.2: Asterisk MUST relay the media — the bridge is the far party,
 ; direct (pass-through) media would expose the bridge's address to the
 ; Dongle and break on NAT.
 direct_media=no
-rtptimeout=60
-rtpholdtimeout=30
+rtp_timeout=60
+rtp_timeout_hold=30
 ice_support=no
-local_net=100.64.0.0/10
-nat_option=rtp
 auth=tg-bridge-auth
 outbound_auth=tg-bridge-auth
 aors=tg-bridge-aor
@@ -294,8 +294,15 @@ password=<SIMBRIDGE_BRIDGE_SECRET>
 type=aor
 max_contacts=1
 contact=sip:127.0.0.1:5062
-qualify=no
 ```
+
+> Every option above is audited against the Asterisk 18 sorcery field
+> registrations (res/res_pjsip/*). A section carrying any unknown key is
+> dropped as a whole (live incident 2026-08-17/18, 3p14-aaa: the
+> pre-16 spelling `dtmf_mode=rfc2833` plus legacy chan_sip keys
+> `rtptimeout`/`rtpholdtimeout`/`nat_option` and a chan_sip `qualify`
+> on the aor left the node with a running chan_pjsip and zero
+> registered objects).
 
 - Inbound auth is **mandatory**: without it, anyone who can reach the
   transport could dial arbitrary GSM numbers through the modem
@@ -304,9 +311,11 @@ qualify=no
   dialplan context (outgoing GSM leg, above).
 
 **Distributed diff** (generator, when `voice.bridge_host` is not
-loopback and the node has a Tailscale IP): `bind=0.0.0.0`,
-`external_media_addr=<GSM node Tailscale IP>` added to the endpoint, and
-`contact=sip:<bridge_host>:5062` in the AOR. See § Distributed Mode.
+loopback and the node has a Tailscale IP): `bind=<this node's Tailscale
+IP>` (a wildcard SIP listener is a finding, not a feature — S06.1),
+`external_media_address=<this node's Tailscale IP>` added to the
+TRANSPORT, and `contact=sip:<bridge_host>:5062` in the AOR. See
+§ Distributed Mode.
 
 ## Media Flow
 
@@ -442,7 +451,7 @@ voice:
 ```
 
 That is the only code-relevant difference. All other changes are made by
-the PJSIP generator (bind, external_media_addr, AOR contact — § PJSIP
+the PJSIP generator (bind, external_media_address, AOR contact — § PJSIP
 Endpoint). There is no second mechanism: the same generator, the same
 endpoint, parameterized.
 
@@ -454,25 +463,27 @@ resolve reliably across all nodes in the tailnet.
 
 ### PJSIP local_net and NAT Settings
 
-For the distributed mode, the generated PJSIP endpoint must be configured so
-that Asterisk does not apply external-address rewriting to Tailscale peers.
-The Tailscale CGNAT range is `100.64.0.0/10`:
+For the distributed mode, the generated PJSIP transport declares the
+Tailscale CGNAT range `100.64.0.0/10` as local so that Asterisk does not
+apply external-address rewriting to Tailscale peers. NAT traversal
+(comedia) is built into Asterisk 18 pjsip — there is no nat option to
+configure (the legacy `nat_option` key no longer exists). `local_net`
+and `external_media_address` are TRANSPORT fields (sorcery registration
+in res/res_pjsip/config_transport.c), not endpoint fields:
 
 ```ini
-[tg-bridge]
-type=endpoint
-...
-bind=0.0.0.0
+[transport-udp]
+type=transport
+protocol=udp
+bind=100.x.x.x  # this node's Tailscale IP (S06.1: no wildcard bind)
 local_net=100.64.0.0/10
-external_media_addr=100.x.x.x  # GSM node's Tailscale IP
-nat_option=rtp
+external_media_address=100.x.x.x  # this node's Tailscale IP
 ```
 
-- `local_net` — tells Asterisk that peers on this network should be addressed
-  directly (no NAT traversal)
-- `external_media_addr` — the IP the bridge should send RTP to (GSM node's
-  Tailscale IP). In single-node mode this is not needed.
-- `nat_option=rtp` — use RTP for media address detection on the tailnet
+- `local_net` — tells Asterisk that peers on this network should be
+  addressed directly (no NAT traversal)
+- `external_media_address` — the IP to advertise for this side's RTP
+  (this node's Tailscale IP). Not needed in single-node mode.
 
 ### Link Drop Handling
 
