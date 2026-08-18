@@ -10,7 +10,20 @@ Regression coverage:
     design passed them as AGI argv, which is comma-split;
   - user data must reach the network only as JSON/multipart bodies,
     never via a shell;
-  - AGI failures must not wedge the dialplan (script always answers).
+  - AGI failures must not wedge the dialplan (script always answers);
+  - GET VARIABLE answers must follow the REAL Asterisk 18 wire format
+    ("200 result=1 (<value>)" / "200 result=0", res/res_agi.c) — the
+    driver emulates it exactly. The pre-fix scripts assumed "200
+    <value>" and this driver fed them that, so the two were mutually
+    consistent; in production an unset variable came back as the
+    literal string "result=0" and crashed the script (2026-08-18).
+  - AGI commands must be LF-terminated: the daemon strips only the
+    trailing \\n of a command line (res/res_agi.c, run_agi — identical
+    in unpatched upstream 18.26.4), so a CRLF command leaves \\r on
+    the variable name (GET VARIABLE -> result=0, SET VARIABLE creates
+    a "NAME\\r" variable). Live-verified on 3p14-aaa, 2026-08-19. The
+    driver reads the pipe as raw bytes and strips only \\n, emulating
+    this exactly (see TestAgiWireFormat).
 """
 
 from __future__ import annotations
@@ -47,6 +60,15 @@ def run_agi(script: str, argv: list[str], variables: dict[str, str],
 
     Feeds the environment block, answers GET VARIABLE / SET VARIABLE
     requests, and returns (final_response, info).
+
+    The script's stdout is read as RAW BYTES and only a trailing
+    ``\\n`` is stripped — exactly what the real daemon does (res/
+    res_agi.c, run_agi: "get rid of trailing newline, if any"). A
+    script that sends CRLF-terminated commands therefore arrives with
+    a ``\\r`` on the variable name and gets ``result=0`` here, as in
+    production (verified live on 3p14-aaa, 2026-08-19). Reading in
+    text mode would apply universal-newline translation and hide the
+    ``\\r`` — a "kinder" driver that masks the exact production bug.
     """
     env = dict(os.environ)
     env["SIMBRIDGE_HOME"] = str(REPO)
@@ -58,29 +80,44 @@ def run_agi(script: str, argv: list[str], variables: dict[str, str],
     proc = subprocess.Popen(
         [sys.executable, str(SCRIPTS / script), *argv],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        env=env, text=True,
+        env=env,
     )
 
+    # The real daemon's setup_env terminates the env block with CRLF;
+    # the scripts rstrip both, so feed it faithfully.
     for key, value in (env_block or {}).items():
-        proc.stdin.write(f"{key}: {value}\r\n")
-    proc.stdin.write("\r\n")
+        proc.stdin.write(f"{key}: {value}\r\n".encode())
+    proc.stdin.write(b"\r\n")
     proc.stdin.flush()
 
     final = ""
     set_vars: dict[str, str] = {}
+    raw_lines: list[str] = []
 
     def drive() -> None:
         nonlocal final
-        for line in proc.stdout:
-            line = line.rstrip("\r\n")
+        for raw in proc.stdout:
+            raw_line = raw.decode(errors="replace")
+            raw_lines.append(raw_line)
+            # Daemon-faithful: strip the trailing \n only.
+            line = raw_line.rstrip("\n")
             if line.startswith("GET VARIABLE "):
                 name = line.split(" ", 2)[2]
-                proc.stdin.write(f"200 {variables.get(name, '')}\r\n")
+                # Real Asterisk 18 wire format (res/res_agi.c,
+                # handle_getvariable): set -> "200 result=1 (<value>)",
+                # unset -> "200 result=0", LF-terminated. Emulate it
+                # exactly — a driver that is "kinder" than the real
+                # server hides parser bugs (see module docstring).
+                if name in variables:
+                    proc.stdin.write(
+                        f"200 result=1 ({variables[name]})\n".encode())
+                else:
+                    proc.stdin.write(b"200 result=0\n")
                 proc.stdin.flush()
             elif line.startswith("SET VARIABLE "):
                 key, _, value = line[len("SET VARIABLE "):].partition(" ")
                 set_vars[key] = value
-                proc.stdin.write("200 result=1\r\n")
+                proc.stdin.write(b"200 result=1\n")
                 proc.stdin.flush()
             elif line.startswith("200 "):
                 final = line
@@ -92,12 +129,13 @@ def run_agi(script: str, argv: list[str], variables: dict[str, str],
     if thread.is_alive():
         proc.kill()
     proc.wait(timeout=5)
-    stderr = proc.stderr.read()
+    stderr = proc.stderr.read().decode(errors="replace")
 
     return final, {
         "returncode": proc.returncode,
         "stderr": stderr,
         "set_vars": set_vars,
+        "raw_lines": raw_lines,
     }
 
 
@@ -106,8 +144,11 @@ def run_agi(script: str, argv: list[str], variables: dict[str, str],
 # ---------------------------------------------------------------------------
 
 class _CaptureServer:
-    def __init__(self) -> None:
+    def __init__(self, responses: dict[str, bytes] | None = None) -> None:
+        """responses: optional path -> raw response body override
+        (default: "{}" for every path)."""
         captured: list[dict] = []
+        responses = dict(responses or {})
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
@@ -117,10 +158,11 @@ class _CaptureServer:
                     "headers": dict(self.headers),
                     "body": self.rfile.read(length),
                 })
+                body = responses.get(self.path, b"{}")
                 self.send_response(200)
-                self.send_header("Content-Length", "2")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(b"{}")
+                self.wfile.write(body)
 
             def log_message(self, *args) -> None:  # silence
                 pass
@@ -274,6 +316,23 @@ class TestTgSmsAgi:
         )
         assert final.startswith("200 error="), final
 
+    def test_unset_fwd_url_is_not_parsed_as_literal(self):
+        """FWD_URL unset -> real Asterisk answers "200 result=0". The
+        script must treat it as empty (fall back to the default URL),
+        not as the literal string "result=0" — the old parser returned
+        that string, which became a URL and crashed the script in
+        production (ValueError: unknown url type, 2026-08-18)."""
+        final, info = run_agi(
+            "tg-sms-agi.py", ["ring"],
+            variables={"SMS_FROM": "+79000000000", "MODEM_ID": "gsm"},
+        )
+        # The default URL (127.0.0.1:8088) has nothing listening on the
+        # GSM node, so the forward fails — but it must be a clean,
+        # reported failure: a final 200 line, exit 0, no traceback.
+        assert final.startswith("200 "), final
+        assert info["returncode"] == 0
+        assert "Traceback" not in info["stderr"], info["stderr"]
+
 
 # ---------------------------------------------------------------------------
 # tg-voice-agi.py
@@ -287,7 +346,7 @@ class TestTgVoiceAgi:
                        "CALLER": "+79000000000",
                        "FWD_URL": http_server.url,
                        "EH_MAX": "3"},
-            env_block={"UNIQUEID": "test-unique-1"},
+            env_block={"agi_uniqueid": "test-unique-1"},
             extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
         )
         assert final.startswith("200 forwarded type=recording_missing"), final
@@ -310,7 +369,7 @@ class TestTgVoiceAgi:
             "tg-voice-agi.py", [],
             variables={"VMFILE": str(wav), "CALLER": "+79000000000",
                        "FWD_URL": "http://127.0.0.1:1", "EH_MAX": "3"},
-            env_block={"UNIQUEID": "test-unique-3"},
+            env_block={"agi_uniqueid": "test-unique-3"},
             extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
         )
         assert final.startswith("200 error="), final
@@ -327,7 +386,7 @@ class TestTgVoiceAgi:
             "tg-voice-agi.py", [],
             variables={"VMFILE": str(wav), "CALLER": "+79000000000",
                        "FWD_URL": http_server.url, "EH_MAX": "3"},
-            env_block={"UNIQUEID": "test-unique-2"},
+            env_block={"agi_uniqueid": "test-unique-2"},
             extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
         )
         assert final.startswith("200 forwarded type=early_hangup"), final
@@ -351,7 +410,7 @@ class TestTgVoiceAgi:
             variables={"VMFILE": str(wav), "CALLER": "+79000000000",
                        "FWD_URL": http_server.url, "EH_MAX": "3",
                        "VM_PROMPT_DURATION": "8.444"},
-            env_block={"UNIQUEID": "test-unique-4"},
+            env_block={"agi_uniqueid": "test-unique-4"},
             extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
         )
         assert final.startswith("200 forwarded type=normal"), final
@@ -404,3 +463,125 @@ class TestTgBlacklistAgi:
                               variables={"BL_PATH": "/nonexistent"})
         assert final.startswith("200 ok"), final
         assert info["set_vars"] == {"BL_BLOCKED": "0"}
+
+
+# ---------------------------------------------------------------------------
+# notify-agent-agi.py
+# ---------------------------------------------------------------------------
+
+class TestNotifyAgentAgi:
+    def test_complete_without_call_id_is_skipped(self):
+        """CALL_ID unset -> real Asterisk answers "200 result=0". The
+        script must skip (no call registered), not POST to the literal
+        path "/v1/call/result=0/complete" (old parser bug)."""
+        final, info = run_agi(
+            "notify-agent-agi.py", ["complete", "ANSWERED"],
+            variables={},
+            extra_env={"AGENT_URL": "http://127.0.0.1:1"},
+        )
+        assert final == "200 skipped=no_call_id", final
+        assert info["returncode"] == 0
+
+    def test_incoming_sets_call_id_channel_variable(self):
+        """The call_id from the agent's JSON is written to the channel
+        via SET VARIABLE CALL_ID (the dialplan gates the Dial on it)."""
+        srv = _CaptureServer(
+            responses={"/v1/call/incoming": b'{"call_id": "call-42"}'}
+        )
+        try:
+            final, info = run_agi(
+                "notify-agent-agi.py", ["incoming", "+790000000000"],
+                variables={},
+                env_block={"agi_channel": "Dongle/gsm-00000001"},
+                extra_env={"AGENT_URL": srv.url,
+                           "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+            )
+        finally:
+            srv.stop()
+        assert final == "200 registered", final
+        assert info["set_vars"] == {"CALL_ID": "call-42"}
+        (req,) = srv.captured
+        assert req["path"] == "/v1/call/incoming"
+        payload = json.loads(req["body"])
+        assert payload == {"phone_number": "+790000000000",
+                           "gsm_channel_id": "Dongle/gsm-00000001"}
+
+    def test_complete_posts_status_for_set_call_id(self):
+        """CALL_ID set -> parsed from the real "200 result=1 (value)"
+        format and used in the path (the old parser would have POSTed
+        to "/v1/call/result=1 (call-42)/complete")."""
+        srv = _CaptureServer()
+        try:
+            final, info = run_agi(
+                "notify-agent-agi.py", ["complete", "ANSWERED"],
+                variables={"CALL_ID": "call-42"},
+                extra_env={"AGENT_URL": srv.url,
+                           "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+            )
+        finally:
+            srv.stop()
+        assert final == "200 ok=answered", final
+        (req,) = srv.captured
+        assert req["path"] == "/v1/call/call-42/complete"
+        payload = json.loads(req["body"])
+        assert payload == {"status": "answered", "dialstatus": "ANSWERED"}
+
+
+# ---------------------------------------------------------------------------
+# Wire format: AGI commands must be LF-terminated
+# ---------------------------------------------------------------------------
+
+class TestAgiWireFormat:
+    """Asterisk 18.26.4 strips only the trailing ``\\n`` of an AGI
+    command line (res/res_agi.c, run_agi — the EPEL build's file is
+    byte-identical to unpatched upstream 18.26.4). A CRLF-terminated
+    command leaves a ``\\r`` on the payload: GET VARIABLE looks up
+    "NAME\\r" (result=0) and SET VARIABLE creates a "NAME\\r" channel
+    variable the dialplan can never see. Live-verified on 3p14-aaa,
+    2026-08-19 (same probe: EPOCH via LF -> result=1, via CRLF ->
+    result=0). The driver emulates the daemon byte-for-byte, so a
+    CRLF regression also fails every behavioral test above; these
+    tests make the wire format itself the explicit assertion.
+    """
+
+    def test_sms_script_sends_lf_only(self, http_server):
+        final, info = run_agi(
+            "tg-sms-agi.py", ["sms"],
+            variables={"SMS_FROM": "+79000000000", "SMS_TEXT": "x",
+                        "FWD_URL": http_server.url, "MODEM_ID": "gsm"},
+            extra_env={"SIMBRIDGE_HTTP_SECRET": "s"},
+        )
+        assert final.startswith("200 forwarded"), final
+        offenders = [r for r in info["raw_lines"] if "\r" in r]
+        assert not offenders, f"CRLF in AGI command lines: {offenders}"
+
+    def test_blacklist_script_sends_lf_only(self, tmp_path):
+        (tmp_path / "blacklist.txt").write_text("")
+        final, info = run_agi(
+            "tg-blacklist-agi.py", [],
+            variables={"CALLER": "+79000000000",
+                       "BL_PATH": str(tmp_path / "blacklist.txt")},
+        )
+        assert final.startswith("200 ok"), final
+        assert info["set_vars"] == {"BL_BLOCKED": "0"}
+        offenders = [r for r in info["raw_lines"] if "\r" in r]
+        assert not offenders, f"CRLF in AGI command lines: {offenders}"
+
+    def test_notify_script_sends_lf_only(self):
+        srv = _CaptureServer(
+            responses={"/v1/call/incoming": b'{"call_id": "call-42"}'}
+        )
+        try:
+            final, info = run_agi(
+                "notify-agent-agi.py", ["incoming", "+790000000000"],
+                variables={},
+                env_block={"agi_channel": "Dongle/gsm-00000001"},
+                extra_env={"AGENT_URL": srv.url,
+                           "SIMBRIDGE_AGENT_TOKEN": "t"},
+            )
+        finally:
+            srv.stop()
+        assert final == "200 registered", final
+        assert info["set_vars"] == {"CALL_ID": "call-42"}
+        offenders = [r for r in info["raw_lines"] if "\r" in r]
+        assert not offenders, f"CRLF in AGI command lines: {offenders}"

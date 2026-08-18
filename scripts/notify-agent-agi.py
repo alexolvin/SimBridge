@@ -33,7 +33,7 @@ The agent URL and auth token come from the process environment
 via the Asterisk systemd drop-in). Secrets never traverse the dialplan
 — channel variables are visible via AMI/CLI. User data (caller number)
 arrives as AGI arguments (argv) — no shell is involved (P0-3). The
-channel identity (ASTERAISK_CHANNEL from the AGI environment) is passed
+channel identity (agi_channel from the AGI environment) is passed
 in the JSON payloads so the agent can AMI-hangup the right channel when
 enforcing the call duration limit.
 
@@ -75,7 +75,15 @@ def _log(msg: str) -> None:
 
 
 def _write(line: str) -> None:
-    sys.stdout.write(line + "\r\n")
+    """Send one AGI line to the daemon, LF-terminated.
+
+    The daemon strips only the trailing ``\\n`` of a command line
+    (res/res_agi.c, run_agi; identical in unpatched upstream
+    18.26.4); a CRLF line leaves a ``\\r`` on the payload — the
+    variable name in GET/SET VARIABLE — and breaks exact-name
+    lookups. Live-verified on 3p14-aaa, probe 2026-08-19.
+    """
+    sys.stdout.write(line + "\n")
     sys.stdout.flush()
 
 
@@ -101,13 +109,18 @@ def read_agi_env() -> dict[str, str]:
 def agi_get_variable(name: str) -> str:
     """GET VARIABLE <name>; return the value ("" if unset).
 
-    Dead-safe: res/res_agi.c serves GET VARIABLE on hungup channels.
+    Asterisk 18 responds ``200 result=1 (<value>)`` for a set
+    variable and ``200 result=0`` for an unset one (res/res_agi.c,
+    handle_getvariable). Dead-safe: the same handler serves GET
+    VARIABLE on hungup channels.
     """
     _write(f"GET VARIABLE {name}")
     line = sys.stdin.readline().strip()
-    if line.startswith("200"):
-        return line[3:].strip()
-    _log(f"WARNING: GET VARIABLE {name} -> {line!r}")
+    prefix = "200 result=1 ("
+    if line.startswith(prefix) and line.endswith(")"):
+        return line[len(prefix):-1]
+    if line != "200 result=0":
+        _log(f"WARNING: GET VARIABLE {name} -> {line!r}")
     return ""
 
 
@@ -141,7 +154,9 @@ def main() -> None:
 
     agent_url = os.environ.get(AGENT_URL_ENV, DEFAULT_URL)
     agent_token = os.environ.get(AGENT_TOKEN_ENV, "")
-    channel = env.get("ASTERAISK_CHANNEL", "")
+    # Asterisk 18 AGI env keys are lowercase agi_* (res/res_agi.c,
+    # setup_env, 18.26.4) — NOT the uppercase names in older AGI docs.
+    channel = env.get("agi_channel", "")
 
     if event == "incoming":
         if len(sys.argv) < 3:

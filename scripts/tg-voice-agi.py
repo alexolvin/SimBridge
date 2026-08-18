@@ -13,7 +13,9 @@ calling StopMixMonitor").
 No user data reaches a shell (P0-3):
   - the recording path, caller ID, and forward URL arrive as channel
     variables (SET by the dialplan, read with GET VARIABLE);
-  - the correlation ID is the AGI environment's UNIQUEID;
+  - the correlation ID is the AGI environment's agi_uniqueid
+    (Asterisk 18 env keys are lowercase agi_* — res/res_agi.c,
+    setup_env, 18.26.4 — not the uppercase names in older AGI docs);
   - the HTTP secret comes from the process environment
     (SIMBRIDGE_HTTP_SECRET, inherited from Asterisk's EnvironmentFile).
 
@@ -71,8 +73,12 @@ def _log(msg: str) -> None:
 
 
 def _respond(status: str) -> None:
-    """Send the final AGI response and end the session."""
-    sys.stdout.write(f"200 {status}\r\n\r\n")
+    """Send the final AGI response and end the session.
+
+    LF-terminated — see agi_get_variable for the daemon's line-parse
+    behavior.
+    """
+    sys.stdout.write(f"200 {status}\n\n")
     sys.stdout.flush()
 
 
@@ -92,17 +98,27 @@ def read_agi_env() -> dict[str, str]:
 def agi_get_variable(name: str) -> str:
     """GET VARIABLE *name*; return the value ("" if unset).
 
-    The response is one ``200 <value>`` line. AGI is strictly
-    request/response, so a single readline is the complete response.
-    Dead-safe in Asterisk 18 (command table: "get variable" is marked
-    for dead/hungup channels).
+    Asterisk 18 responds ``200 result=1 (<value>)`` for a set
+    variable and ``200 result=0`` for an unset one (res/res_agi.c,
+    handle_getvariable: literal parens, LF-terminated, value capped
+    at 1023 chars). AGI is strictly request/response, so a single
+    readline is the complete response. Dead-safe in Asterisk 18
+    (command table: "get variable" is marked for dead/hungup
+    channels).
+
+    The command itself MUST be LF-terminated: the daemon strips only
+    the trailing ``\\n`` of a command line (res/res_agi.c, run_agi;
+    identical in unpatched upstream 18.26.4), so a CRLF command
+    leaves a ``\\r`` on the variable name and the exact-name lookup
+    fails (result=0). Live-verified on 3p14-aaa, probe 2026-08-19.
     """
-    sys.stdout.write(f"GET VARIABLE {name}\r\n")
+    sys.stdout.write(f"GET VARIABLE {name}\n")
     sys.stdout.flush()
     line = sys.stdin.readline()
     line = line.rstrip("\r\n")
-    if line.startswith("200 "):
-        return line[4:]
+    prefix = "200 result=1 ("
+    if line.startswith(prefix) and line.endswith(")"):
+        return line[len(prefix):-1]
     return ""
 
 
@@ -137,7 +153,7 @@ def main() -> None:
         prompt_duration = float(agi_get_variable("VM_PROMPT_DURATION") or 0)
     except ValueError:
         prompt_duration = 0.0
-    correlation = env.get("UNIQUEID", "")
+    correlation = env.get("agi_uniqueid", "")
     secret = os.environ.get(SECRET_ENV, "")
 
     if not vmfile:

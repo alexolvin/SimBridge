@@ -64,15 +64,25 @@ def read_agi_env() -> dict[str, str]:
 def agi_get_variable(name: str) -> str:
     """GET VARIABLE *name*; return the value ("" if unset).
 
-    The response is one ``200 <value>`` line. AGI is strictly
-    request/response, so a single readline is the complete response.
+    Asterisk 18 responds ``200 result=1 (<value>)`` for a set
+    variable and ``200 result=0`` for an unset one (res/res_agi.c,
+    handle_getvariable: literal parens, LF-terminated, value capped
+    at 1023 chars). AGI is strictly request/response, so a single
+    readline is the complete response.
+
+    The command itself MUST be LF-terminated: the daemon strips only
+    the trailing ``\\n`` of a command line (res/res_agi.c, run_agi;
+    identical in unpatched upstream 18.26.4), so a CRLF command
+    leaves a ``\\r`` on the variable name and the exact-name lookup
+    fails (result=0). Live-verified on 3p14-aaa, probe 2026-08-19.
     """
-    sys.stdout.write(f"GET VARIABLE {name}\r\n")
+    sys.stdout.write(f"GET VARIABLE {name}\n")
     sys.stdout.flush()
     line = sys.stdin.readline()
     line = line.rstrip("\r\n")
-    if line.startswith("200 "):
-        return line[4:]
+    prefix = "200 result=1 ("
+    if line.startswith(prefix) and line.endswith(")"):
+        return line[len(prefix):-1]
     return ""
 
 
@@ -104,11 +114,14 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 — fail-open by design
             _log(f"ERROR: blacklist check failed, failing open: {e}")
 
-    sys.stdout.write(f"SET VARIABLE BL_BLOCKED {'1' if blocked else '0'}\r\n")
+    # LF-terminated (see agi_get_variable): a CRLF here would create
+    # a channel variable named "BL_BLOCKED\r", invisible to the
+    # dialplan's GotoIf.
+    sys.stdout.write(f"SET VARIABLE BL_BLOCKED {'1' if blocked else '0'}\n")
     sys.stdout.flush()
     sys.stdin.readline()  # consume the SET VARIABLE response (AGI is
                           # strictly request/response)
-    sys.stdout.write(f"200 {'blocked' if blocked else 'ok'}\r\n\r\n")
+    sys.stdout.write(f"200 {'blocked' if blocked else 'ok'}\n\n")
     sys.stdout.flush()
 
 
