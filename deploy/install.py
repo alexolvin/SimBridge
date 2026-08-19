@@ -182,16 +182,19 @@ AST_MODULES_LOAD = (
     "codec_resample.so",
     "format_wav.so", "format_gsm.so", "format_pcm.so",
     "app_dial.so", "app_mixmonitor.so", "app_playback.so",
-    "app_system.so", "app_record.so", "res_clioriginate.so",
+    "app_system.so", "app_record.so", "app_originate.so",
+    "res_clioriginate.so",  # the `channel originate` / `channel redirect`
+                            # CLI verbs (Asterisk 18: NOT `originate`)
     "func_db.so", "func_callerid.so", "func_strings.so",
     "func_base64.so",
-    "res_speech.so",       # res_agi links ast_speech_change (EPEL 18)
-    "res_aeap.so",         # AEAP core — hard dep of res_speech_aeap
-                           # (exports ast_aeap_message_type_json; live
-                           # 2026-08-18, 3p14-aaa: undefined-symbol
-                           # load error without it)
-    "res_speech_aeap.so",  # AEAP engine, optional (nm: does NOT export
-                           # ast_speech_change — res_speech.so does)
+    "res_speech.so",       # res_agi links ast_speech_change (EPEL 18).
+                           # The AEAP chain (res_aeap/res_speech_aeap) is
+                           # deliberately ABSENT: res_aeap hard-requires
+                           # res_http_websocket, which the EPEL 18.26.4
+                           # build does not ship at all (live 2026-08-18,
+                           # 3p14-aaa: undefined-symbol load error), so
+                           # the chain can never load there; nothing in
+                           # the dialplan uses AEAP/Speech() apps.
     "cdr_csv.so", "res_agi.so",
     "pbx_config.so", "pbx_spool.so",
 )
@@ -199,16 +202,15 @@ AST_MODULES_LOAD = (
 #  - chan_dongle.so: third-party driver (wiringSoft RPM / PPA), not a
 #    distro package — its absence is a warning, and the chan_dongle
 #    verification check reports it.
-#  - res_aeap.so: the AEAP core — hard dep of res_speech_aeap
-#    (ast_aeap_message_type_json); the loader does not auto-load
-#    dependencies, so it is listed (in load order) right before the
-#    engine. Same optionality: distro builds without AEAP skip both.
-#  - res_speech_aeap.so: the AEAP speech engine — only needed for the
-#    Speech() app; nm evidence (3p14-aaa, 2026-08-18) shows it does not
-#    export ast_speech_change, so res_agi only depends on res_speech.so.
-#    Some distro builds may not ship it — hard-failing would be wrong.
-AST_MODULES_OPTIONAL = ("chan_dongle.so", "res_aeap.so",
-                        "res_speech_aeap.so")
+# The AEAP modules (res_http_websocket.so, res_aeap.so,
+# res_speech_aeap.so) are not in AST_MODULES_LOAD at all: EPEL 18.26.4
+# does not ship res_http_websocket, so res_aeap fails dependency
+# resolution and res_speech_aeap fails on the missing
+# ast_aeap_message_type_json symbol (live 2026-08-18, 3p14-aaa) —
+# loading them spews an error at every startup for zero benefit, since
+# the dialplan has no AEAP/Speech() usage. res_speech.so (a hard dep
+# of res_agi) stays in the load list.
+AST_MODULES_OPTIONAL = ("chan_dongle.so",)
 AST_MODULES_REQUIRED = tuple(m for m in AST_MODULES_LOAD
                              if m not in AST_MODULES_OPTIONAL)
 

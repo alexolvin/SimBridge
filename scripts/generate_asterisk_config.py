@@ -107,9 +107,23 @@ def generate(config: dict, output_path: str) -> None:
     content += f"TAILNET_CGNAT=100.64.0.0/10\n"
     # S01: event forwarding targets (P0-3: AGI scripts read these via
     # channel variables — FWD_URL, MODEM_ID — never hardcode in the dialplan)
+    # USERBOT_URL is where the userbot HTTP actually lives:
+    # agent.userbot_url (the same key the agent itself uses for
+    # /events/alert). On a gsm-role node that is the PEER telegram
+    # node — this node's own userbot_http.listen is a dead local
+    # address (live incident 2026-08-18: SMS forwards aimed at the
+    # node's own IP).
+    userbot_url = (config.get("agent", {}) or {}).get("userbot_url", "")
     userbot_listen = config.get("userbot_http", {}).get("listen", "127.0.0.1:8088")
+    if not userbot_url:
+        # Legacy config without agent.userbot_url: assume all-in-one
+        # (userbot on this node).
+        userbot_url = f"http://{userbot_listen}"
+        print(f"WARNING: agent.userbot_url missing — falling back to the "
+              f"local userbot_http.listen ({userbot_url}); on a gsm-role "
+              f"node set agent.userbot_url to the peer node's address")
     content += f"; Userbot HTTP (SMS/voicemail event forwarding)\n"
-    content += f"USERBOT_URL=http://{userbot_listen}\n"
+    content += f"USERBOT_URL={userbot_url}\n"
     paths = config.get("paths", {})
     blacklist = paths.get("blacklist", "/etc/simbridge/blacklist.txt")
     content += f"; Blacklist file (S02.2: incoming call/SMS check)\n"
@@ -128,7 +142,7 @@ def generate(config: dict, output_path: str) -> None:
     print(f"  BRIDGE_ENDPOINT = {bridge_endpoint}")
     print(f"  OUTBOUND_RING_TIMEOUT = {outbound_timeout}")
     print(f"  OUTBOUND_GSM_RING_SECONDS = {outbound_gsm_ring}")
-    print(f"  USERBOT_URL = http://{userbot_listen}")
+    print(f"  USERBOT_URL = {userbot_url}")
     print(f"  BLACKLIST_PATH = {blacklist}")
     print(f"  MODEM_ID = {a.get('dongle', 'gsm')}")
 

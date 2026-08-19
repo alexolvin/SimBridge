@@ -659,14 +659,21 @@ class TestRenderModulesConf:
         assert "chan_dongle.so" not in txt
         assert "chan_pjsip.so" in txt
 
-    def test_aeap_core_loads_before_engine(self):
-        # res_speech_aeap.so links ast_aeap_message_type_json from
-        # res_aeap.so and the EPEL 18 loader does not auto-load
-        # dependencies (live 2026-08-18, 3p14-aaa: undefined-symbol
-        # load error) — the list order is load-bearing.
+    def test_aeap_chain_absent(self):
+        # The EPEL 18.26.4 build does not ship res_http_websocket, so
+        # res_aeap fails dependency resolution and res_speech_aeap
+        # fails on the missing ast_aeap_message_type_json symbol
+        # (live 2026-08-18, 3p14-aaa). Loading them spews an error at
+        # every startup and the dialplan has no AEAP/Speech() usage —
+        # the chain must not appear in the rendered list at all.
+        # res_speech.so (a hard dep of res_agi) stays.
         txt = install._render_modules_conf(set(install.AST_MODULES_LOAD))
-        assert txt.index("load = res_aeap.so") < \
-            txt.index("load = res_speech_aeap.so")
+        assert "res_aeap.so" not in txt
+        assert "res_speech_aeap.so" not in txt
+        assert "res_http_websocket.so" not in txt
+        assert "load = res_speech.so" in txt
+        # Originate() is used by the dialplan ([tg-bridge] GSM leg).
+        assert "load = app_originate.so" in txt
 
 
 class TestWriteModulesConf:

@@ -127,23 +127,39 @@ class HealthChecker:
         return ComponentStatus("agent_process", healthy=True, detail="running")
 
     async def check_peer_node(self) -> ComponentStatus:
-        """Check if the peer Telegram node is reachable via HTTP."""
+        """Check if the userbot HTTP is reachable (peer node on a
+        gsm-role deployment, local userbot on all-in-one).
+
+        Probes ``agent.userbot_url`` — where the userbot actually
+        lives. The old code probed this node's own ``userbot_http.listen``
+        (live bug 2026-08-18: on a gsm node the userbot is on the
+        PEER telegram node, so the check was always red).
+        """
         import httpx
 
         if not self._cfg:
             return ComponentStatus("peer_node", healthy=False, detail="no config")
 
-        listen = self._cfg.get("userbot_http.listen", "")
-        if not listen:
-            return ComponentStatus("peer_node", healthy=False, detail="no userbot_http.listen")
+        userbot_url = (self._cfg.get("agent.userbot_url", "") or "").rstrip("/")
+        if not userbot_url:
+            return ComponentStatus(
+                "peer_node", healthy=False, detail="no agent.userbot_url"
+            )
 
-        secret_env = self._cfg.get("userbot_http.secret_env", "")
+        # The userbot HTTP server authenticates with the shared secret.
+        # Honor userbot_http.secret_env when present (all-in-one); the
+        # gsm node carries the same value as SIMBRIDGE_HTTP_SECRET —
+        # the env var the AGI forwarding scripts use for this endpoint.
+        secret_env = (self._cfg.get("userbot_http.secret_env", "")
+                      or "SIMBRIDGE_HTTP_SECRET")
         import os
         secret = os.environ.get(secret_env, "")
         if not secret:
-            return ComponentStatus("peer_node", healthy=False, detail="secret not set")
+            return ComponentStatus(
+                "peer_node", healthy=False, detail=f"secret {secret_env} not set"
+            )
 
-        url = f"http://{listen}/health"
+        url = f"{userbot_url}/health"
         try:
             async with httpx.AsyncClient(timeout=5.0) as http:
                 resp = await http.get(
