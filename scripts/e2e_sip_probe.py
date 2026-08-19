@@ -24,14 +24,22 @@ PASS criteria (all must hold):
 Exit code 0 = all criteria met, 1 = at least one failed.
 
 Usage (on the TG node):
+  . /etc/simbridge/env
   python3 e2e_sip_probe.py --gsm-ip 100.124.155.106 \
-      --secret "$(grep ^SIMBRIDGE_BRIDGE_SECRET /etc/simbridge/env | cut -d= -f2)"
+      --secret "$SIMBRIDGE_BRIDGE_SECRET"
+
+The advertised source IP (Via/Contact/SDP o=/c=) is taken from
+--local-ip, else $SIMBRIDGE_NODE_TAILSCALE_IP, else the source
+address the kernel selects for packets toward --gsm-ip. It must NOT
+be 0.0.0.0: for a non-NAT peer Asterisk sends RTP to the SDP c=
+address, so 0.0.0.0 would black-hole the media.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import secrets
 import socket
@@ -40,20 +48,42 @@ import sys
 import time
 
 
+def detect_local_ip(dest_ip: str, dest_port: int = 5060) -> str:
+    """Source address the kernel will use for packets to dest (UDP
+    connect() sets the default route without sending anything)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((dest_ip, dest_port))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 class Probe:
     def __init__(self, gsm_ip: str, secret: str, exten: str,
-                 timeout: float) -> None:
+                 timeout: float, local_ip: str = "") -> None:
         self.gsm_ip = gsm_ip
         self.secret = secret
         self.exten = exten
         self.timeout = timeout
-        self.uri = f"sip:{exten}@{gsm_ip}:5060;transport=udp"
+        # Request-URI: host only. Port 5060 / UDP are the SIP defaults (the
+        # packet is still sent to (gsm_ip, 5060) below).
+        self.uri = f"sip:{exten}@{gsm_ip}"
 
         # SIP socket (port 0 -> OS picks)
         self.sip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sip.bind(("", 0))
         self.sip.settimeout(0.5)
-        self.local_ip, self.local_port = self.sip.getsockname()[:2]
+        self.local_port = self.sip.getsockname()[1]
+        # A socket bound to "" reports "0.0.0.0" from getsockname(), but the
+        # kernel sources packets from the route's outgoing address. Advertise
+        # THAT real IP in Via/Contact/SDP: for a non-NAT peer Asterisk sends
+        # RTP to the SDP c= address, so 0.0.0.0 would black-hole the media.
+        self.local_ip = (local_ip
+                         or os.environ.get("SIMBRIDGE_NODE_TAILSCALE_IP", "")
+                         or detect_local_ip(gsm_ip))
 
         # RTP socket on a random high port
         self.rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -104,6 +134,9 @@ class Probe:
         extra = f"Authorization: Digest {auth}\r\n" if auth else ""
         head = self._headers("INVITE", self.uri,
                              extra + "Content-Type: application/sdp\r\n")
+        if auth:
+            print("--- INVITE (authenticated) as sent ---")
+            print(head)
         self.sip.sendto((head + f"Content-Length: {len(sdp)}\r\n\r\n"
                          + sdp).encode(), (self.gsm_ip, 5060))
 
@@ -146,7 +179,7 @@ class Probe:
             self.sip_buf += data
             while b"\r\n\r\n" in self.sip_buf:
                 head, _, rest = self.sip_buf.partition(b"\r\n\r\n")
-                m = re.search(rb"Content-Length: (\d+)", head, re.I)
+                m = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
                 n = int(m.group(1)) if m else 0
                 if len(rest) < n:
                     break
@@ -160,8 +193,21 @@ class Probe:
                 user: str, secret: str) -> str:
         realm = re.search(r'realm="([^"]+)"', challenge).group(1)
         nonce = re.search(r'nonce="([^"]+)"', challenge).group(1)
+        qop_m = re.search(r'qop="([^"]+)"', challenge)
+        qop = qop_m.group(1).split(",")[0] if qop_m else None
         ha1 = hashlib.md5(f"{user}:{realm}:{secret}".encode()).hexdigest()
         ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+        if qop:
+            # RFC 2617 §3.3.2: with qop the response covers
+            # HA1:nonce:nc:cnonce:qop:HA2
+            cnonce = secrets.token_hex(8)
+            nc = "00000001"
+            resp = hashlib.md5(
+                f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+            ).hexdigest()
+            return (f'Algorithm=MD5, username="{user}", realm="{realm}", '
+                    f'nonce="{nonce}", uri="{uri}", qop={qop}, '
+                    f'nc={nc}, cnonce="{cnonce}", response="{resp}"')
         resp = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
         return (f'Algorithm=MD5, username="{user}", realm="{realm}", '
                 f'nonce="{nonce}", uri="{uri}", response="{resp}"')
@@ -196,7 +242,7 @@ class Probe:
         if not m200:
             print("--- expected 200 OK with media, got:")
             for m in msgs[:3]:
-                print(m[:400])
+                print(m)
             return self._report()
         self.results["200_ok_media"] = True
 
@@ -261,10 +307,14 @@ def main() -> int:
                     help="SIMBRIDGE_BRIDGE_SECRET (shared SIP credential)")
     ap.add_argument("--exten", default="777",
                     help="dummy extension — never dialed (nocal branch)")
+    ap.add_argument("--local-ip", default="",
+                    help="advertised source IP in Via/Contact/SDP "
+                         "(default: $SIMBRIDGE_NODE_TAILSCALE_IP, then "
+                         "auto-detected from the route to --gsm-ip)")
     ap.add_argument("--timeout", type=float, default=20.0,
                     help="media-phase window in seconds")
     a = ap.parse_args()
-    probe = Probe(a.gsm_ip, a.secret, a.exten, a.timeout)
+    probe = Probe(a.gsm_ip, a.secret, a.exten, a.timeout, a.local_ip)
     return 0 if probe.run() else 1
 
 
