@@ -146,6 +146,9 @@ AGI_SCRIPTS    = ("tg-sms-agi.py", "tg-voice-agi.py",
 # 2026-08-18, 3p14-aaa).
 RUN_LOCK_DIR       = "/run/lock"
 RUN_LOCK_TMPFILES  = "/etc/tmpfiles.d/simbridge-run-lock.conf"
+# Re-asserts the tailscale `up` options at every boot (reboot
+# resilience — live finding 2026-08-18, 3p14-aaa power outage).
+TS_UP_UNIT         = "/etc/systemd/system/tailscale-up.service"
 
 # ── Asterisk module load list (modules.conf) ──────────────────────────────
 # EPEL's default modules.conf predates SimBridge: it lists modules that
@@ -273,7 +276,7 @@ KNOWN_KEYS = ("install_type", "node_role", "action",
               "ami_password",
               "tg_api_id", "tg_api_hash", "tg_username",
               "agent_token", "bridge_secret", "http_secret",
-              "own_ip", "peer_ip", "acl_ids",
+              "own_ip", "peer_ip", "acl_ids", "ts_tag",
               "tg_login", "peer_ready")
 
 def _load_answers(path: str) -> Dict[str, str]:
@@ -456,6 +459,7 @@ class S:
     own_ip: str = ""
     peer_ip: str = ""
     acl_ids: str = ""
+    ts_tag: str = ""                 # tailscale --advertise-tags (distributed)
 
     do_ts: bool = False              # install tailscale (distributed — required)
     do_ts_opt: bool = False          # install tailscale (single — optional)
@@ -782,6 +786,13 @@ def phase_gather() -> None:
         else:
             s.peer_ip = ask("GSM node Tailscale IP",
                             required=True, default=s.peer_ip, key="peer_ip")
+        # Node tag for the tailnet ACL (the ACL must allow it).
+        # Default follows the tag:<node-id-suffix> convention
+        # (3p14-aaa -> tag:aaa); empty = advertise no tag.
+        _suffix = s.node_id.rsplit("-", 1)[-1] if s.node_id else ""
+        s.ts_tag = ask("Tailscale tag to advertise (empty = none)",
+                       default=f"tag:{_suffix}" if _suffix else "",
+                       key="ts_tag")
     else:
         s.own_ip = "127.0.0.1"
         s.peer_ip = "127.0.0.1"
@@ -870,6 +881,10 @@ def phase_install() -> None:
     # ── Tailscale ──
     if s.do_ts or s.do_ts_opt:
         _install_tailscale()
+    if has_cmd("tailscale"):
+        # Re-apply the up options at every boot — fresh install and
+        # update-in-place alike (reboot resilience).
+        _write_tailscale_up()
 
     # ── Clone the repo ──
     _clone_repo()
@@ -949,6 +964,61 @@ def _install_tailscale() -> None:
         run(f"{s.mgr} update -y")
     run(s.pkg.format("tailscale"))
     run_ok("systemctl enable --now tailscaled")
+
+def _write_tailscale_up() -> None:
+    """Write the tailscale-up oneshot unit (reboot resilience).
+
+    tailscaled persists node identity across reboots, but the node's
+    `up` options (accepted routes, tags, SSH) are not part of any
+    guaranteed re-assert path: after the 2026-08-18 power outage,
+    3p14-aaa came up with tailscale-up.service in `failed` state and
+    its options left to whatever the daemon happened to restore. A
+    oneshot unit re-applying the exact options at every boot makes
+    recovery deterministic — the pattern verified live on 3p14-aaa.
+
+    --accept-dns=false: on RHEL9 with systemd-resolved a plain
+    `tailscale up` races for /etc/resolv.conf at boot and the unit
+    failed (journal 2026-08-18, 3p14-aaa). ExecStartPre sleep: the
+    control plane is not reachable on a cold boot. FailureAction=none:
+    a transient `up` failure must not block boot — tailscaled keeps
+    the previous identity and the options are re-asserted next boot.
+    """
+    opts = ["--accept-routes", "--ssh", "--timeout=60s",
+            "--accept-dns=false"]
+    tag = s.ts_tag.strip()
+    if tag:
+        opts.insert(1, f"--advertise-tags={tag}")
+    unit = (
+        "[Unit]\n"
+        "Description=SimBridge tailscale node options (re-applied at boot)\n"
+        "Requires=tailscaled.service\n"
+        "After=tailscaled.service iptables.service\n"
+        "FailureAction=none\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        "TimeoutStartSec=90\n"
+        "ExecStartPre=/bin/sleep 15\n"
+        f"ExecStart=/usr/bin/tailscale up {' '.join(opts)}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    p = Path(TS_UP_UNIT)
+    if p.exists() and p.read_text() == unit:
+        ok("tailscale-up unit unchanged.")
+        return
+    if p.exists():
+        bak = (f"{p}.bak-"
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+        Path(bak).write_text(p.read_text())
+        warn("Existing tailscale-up unit backed up:", bak)
+    p.write_text(unit)
+    p.chmod(0o644)
+    run_ok("systemctl daemon-reload")
+    run_ok("systemctl enable tailscale-up")
+    ok("tailscale-up unit written:", str(p))
 
 def _clone_repo() -> None:
     """Clone the SimBridge repo into a staging directory.
@@ -1231,6 +1301,11 @@ def _merge_env() -> None:
         wanted["SIMBRIDGE_BRIDGE_SECRET"] = s.bridge_secret
     if s.ami_pw:
         wanted["SIMBRIDGE_AMI_PASSWORD"] = s.ami_pw
+    # The AGI scripts import core.* from the deployed app tree and
+    # resolve its root from SIMBRIDGE_HOME (without it they fall back
+    # to a hardcoded default — Rule 1). Written on every role: harmless
+    # on telegram nodes, required on gsm nodes.
+    wanted["SIMBRIDGE_HOME"] = INSTALL_DIR
     # notify-agent-agi.py (S04) reads the agent URL from the environment —
     # the same value the YAML template gives to agent.listen (Rule 1).
     if s.node_role in ("gsm", "all-in-one"):
@@ -1669,8 +1744,21 @@ def _ensure_run_lock() -> None:
     lock_create() fail for the asterisk user at every startup (live
     finding 2026-08-18, 3p14-aaa — non-fatal, but error spam on each
     boot). /run is tmpfs and wiped on reboot, so the mode must be
-    re-applied from tmpfiles.d ("d" guarantees the mode even if the
-    directory already exists).
+    re-applied from tmpfiles.d.
+
+    The entry is a "d" + "z" pair, not a "d" alone: create lines
+    dedupe per path (first parsed wins — the distribution ships its
+    own "d /run/lock 0755" in /usr/lib/tmpfiles.d/legacy.conf, which
+    beat our "d" line at boot: "Duplicate line for path
+    \"/run/lock\", ignoring", journal 2026-08-18, 3p14-aaa
+    power-outage recovery),
+    so a d-only entry left the mode at 0755. A "z" line (chmod the
+    existing object) never dedupes against a "d" line — systemd v252
+    src/tmpfiles/tmpfiles.c, item_compatible(): only two ownership
+    (create) types collide — and is applied after create lines
+    (item_compare()), so the 1777 lands even when the distro line
+    creates the directory first. The "d" line covers systems without
+    the distro entry: it creates the directory itself.
     """
     d = Path(RUN_LOCK_DIR)
     if d.exists() and (d.stat().st_mode & 0o7777) != 0o1777:
@@ -1681,7 +1769,13 @@ def _ensure_run_lock() -> None:
             warn("/run/lock chmod failed:", str(e))
     txt = ("# chan_dongle lock files: /run is tmpfs — re-apply the sticky\n"
            "# mode at every boot (the RHEL9 default 0755 breaks locks).\n"
-           f"d {RUN_LOCK_DIR} 1777 root root -\n")
+           "# d- + z- pair: create lines dedupe per path (first parsed\n"
+           "# wins — the distro's legacy.conf \"d /run/lock 0755\" beat\n"
+           "# our d- line, journal 2026-08-18, 3p14-aaa), so the mode is\n"
+           "# forced by the z- line, which never dedupes against a d- line\n"
+           "# and is applied after create (systemd v252 tmpfiles.c).\n"
+           f"d {RUN_LOCK_DIR} 1777 root root -\n"
+           f"z {RUN_LOCK_DIR} 1777 root root -\n")
     tf = Path(RUN_LOCK_TMPFILES)
     if tf.exists() and tf.read_text() == txt:
         ok("run/lock tmpfiles entry unchanged.")

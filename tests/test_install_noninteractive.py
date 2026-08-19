@@ -39,7 +39,7 @@ _STATE_FIELDS = (
     "modem_model", "sim_phone", "dongle_name", "ami_pw",
     "tg_api_id", "tg_api_hash", "tg_username",
     "agent_token", "http_secret", "bridge_secret",
-    "own_ip", "peer_ip", "acl_ids",
+    "own_ip", "peer_ip", "acl_ids", "ts_tag",
     "do_ts", "do_ts_opt", "usb_modems", "ts_ip", "has_ts",
     "node_id", "generated_secrets", "verify_issues", "ast_config_changed",
     "ast_modules_changed", "ast_core_changed",
@@ -598,7 +598,18 @@ class TestMergeEnvFormat:
         kv = [l for l in (tmp_path / "env").read_text().splitlines()
               if l and not l.startswith("#")]
         assert kv == ["SIMBRIDGE_AGENT_TOKEN=tok123",
-                      "SIMBRIDGE_AMI_PASSWORD=pw456"]
+                      "SIMBRIDGE_AMI_PASSWORD=pw456",
+                      f"SIMBRIDGE_HOME={install.INSTALL_DIR}"]
+
+    def test_writes_simbridge_home(self, tmp_path, monkeypatch, ni_state):
+        # The AGI scripts resolve the deployed app-tree root from
+        # SIMBRIDGE_HOME; without it they fall back to a hardcoded
+        # default (Rule 1). Written on every role, even with no other
+        # secrets collected.
+        monkeypatch.setattr(install, "ENV_FILE", str(tmp_path / "env"))
+        install._merge_env()
+        text = (tmp_path / "env").read_text()
+        assert f"SIMBRIDGE_HOME={install.INSTALL_DIR}" in text
 
     def test_spaced_legacy_lines_self_normalize(self, tmp_path, monkeypatch,
                                                 ni_state):
@@ -919,6 +930,67 @@ class TestEnsureRunLock:
         install._ensure_run_lock()  # must not raise
         assert tf.exists()
         assert f"d {lock} 1777 root root -" in tf.read_text()
+
+    def test_z_line_alongside_d_line(self, tmp_path, monkeypatch):
+        # A d-only entry is silently dropped at boot: create lines
+        # dedupe per path (first parsed wins — the distro's
+        # legacy.conf "d /run/lock 0755" beat our line, journal
+        # 2026-08-18, 3p14-aaa). The z line coexists with any d line
+        # (systemd v252 item_compatible: only ownership types collide)
+        # and is applied after create (item_compare) — it must always
+        # be present.
+        lock, tf = self._patch(tmp_path, monkeypatch)
+        lock.mkdir()
+        lock.chmod(0o1777)
+        install._ensure_run_lock()
+        txt = tf.read_text()
+        assert f"d {lock} 1777 root root -" in txt
+        assert f"z {lock} 1777 root root -" in txt
+
+
+# ---------------------------------------------------------------------------
+# tailscale-up — oneshot re-applying the node's `up` options at every boot
+# (2026-08-18 power outage, 3p14-aaa: the unit came up `failed` — a plain
+# `tailscale up` raced systemd-resolved for /etc/resolv.conf; the options
+# were left to whatever the daemon happened to restore)
+# ---------------------------------------------------------------------------
+
+class TestWriteTailscaleUp:
+    def _patch(self, tmp_path, monkeypatch):
+        unit = tmp_path / "tailscale-up.service"
+        monkeypatch.setattr(install, "TS_UP_UNIT", str(unit))
+        monkeypatch.setattr(install, "run_ok", lambda cmd: None)
+        return unit
+
+    def test_unit_with_tag(self, tmp_path, monkeypatch, ni_state):
+        unit = self._patch(tmp_path, monkeypatch)
+        install.s.node_id = "3p14-aaa"
+        install.s.ts_tag = "tag:aaa"
+        install._write_tailscale_up()
+        txt = unit.read_text()
+        assert "Type=oneshot" in txt
+        assert "RemainAfterExit=yes" in txt
+        assert "FailureAction=none" in txt
+        assert "Requires=tailscaled.service" in txt
+        assert "WantedBy=multi-user.target" in txt
+        assert "--advertise-tags=tag:aaa" in txt
+        assert "--accept-dns=false" in txt
+        assert "--accept-routes" in txt
+
+    def test_empty_tag_omits_advertise(self, tmp_path, monkeypatch, ni_state):
+        unit = self._patch(tmp_path, monkeypatch)
+        install.s.ts_tag = ""
+        install._write_tailscale_up()
+        assert "--advertise-tags" not in unit.read_text()
+
+    def test_idempotent_no_backup(self, tmp_path, monkeypatch, ni_state):
+        unit = self._patch(tmp_path, monkeypatch)
+        install.s.ts_tag = "tag:aaa"
+        install._write_tailscale_up()
+        first = unit.read_text()
+        install._write_tailscale_up()
+        assert unit.read_text() == first
+        assert not list(unit.parent.glob("tailscale-up.service.bak-*"))
 
 
 class TestPhaseStartRestartPolicy:

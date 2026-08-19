@@ -121,6 +121,7 @@ class Shared:
     tg_api_hash: str = ""
     tg_username: str = ""
     acl_ids: str = ""
+    ts_tag: str = ""              # tailscale --advertise-tags override
     sim_phone: str = ""
     modem_model: str = ""
     dongle_name: str = "gsm"
@@ -289,6 +290,11 @@ def build_answers(node: Node, sh: Shared) -> Dict[str, str]:
     if sh.install_type == "distributed":
         d["own_ip"] = node.own_ip
         d["peer_ip"] = node.peer_ip
+        # The tailscale-up oneshot must re-assert the node's tag at
+        # every boot (reboot resilience). Convention: tag:<hostname
+        # suffix> (3p14-aaa -> tag:aaa); sh.ts_tag pins an explicit
+        # value for every node.
+        d["ts_tag"] = sh.ts_tag or f"tag:{node.name.rsplit('-', 1)[-1]}"
     # acl_ids is ALWAYS sent (never omitted when empty): install.py
     # marks it required=True and never falls back to the existing
     # value — the PC-side question enforces it accordingly.
@@ -575,6 +581,11 @@ def gather_params() -> Tuple[List[Node], Shared]:
                            " [Enter = keep on-node value]", "")
     sh.acl_ids = q("ACL Telegram user IDs (comma-separated)",
                    required=True)
+    if sh.install_type == "distributed":
+        # Optional override for every node; Enter keeps the
+        # tag:<hostname-suffix> convention (3p14-aaa -> tag:aaa).
+        sh.ts_tag = q("Tailscale node tag (applied to all nodes)"
+                      " [Enter = tag:<hostname suffix>]", "")
     sh.branch = q("Git branch to deploy", "main")
     return nodes, sh
 

@@ -222,6 +222,21 @@ class TestBuildAnswers:
         # GSM node carries no Telegram credentials (installer never asks).
         assert "tg_api_id" not in dg
         assert dt["tg_api_id"] == "1"
+        # Tailscale tag: the tag:<hostname-suffix> convention (no dash
+        # in these names -> the whole name).
+        assert dg["ts_tag"] == "tag:g" and dt["ts_tag"] == "tag:t"
+
+    def test_ts_tag_override_and_convention(self):
+        n = ir.Node(name="3p14-aaa", ssh_user="op", role="gsm",
+                    node_id="3p14-aaa", own_ip="100.64.0.2",
+                    peer_ip="100.64.0.3")
+        sh = ir.Shared(install_type="distributed", acl_ids="1",
+                       agent_token="t", bridge_secret="b", http_secret="h")
+        # Convention: the last hostname segment.
+        assert ir.build_answers(n, sh)["ts_tag"] == "tag:aaa"
+        # Explicit PC-side value pins every node.
+        sh.ts_tag = "tag:custom"
+        assert ir.build_answers(n, sh)["ts_tag"] == "tag:custom"
 
     def test_empty_optional_values_omitted(self):
         # Update mode: credential fields left blank on the PC must be
