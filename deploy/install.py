@@ -134,6 +134,13 @@ AST_PROMPT     = "/var/lib/asterisk/sounds/custom/vm-prompt.ulaw"
 # Drop-in giving the Asterisk process SimBridge's env — the AGI hooks
 # inherit their secrets from it (Rule 5: no secrets in units or dialplan).
 AST_DROPIN     = "/etc/systemd/system/asterisk.service.d/simbridge-env.conf"
+# Boot-guard drop-in: ExecStartPre waits for the Tailscale IP before
+# the PJSIP transport bind. A failed bind drops the transport object
+# entirely ("Cannot assign requested address", journal 2026-08-18,
+# 3p14-aaa) — no SIP until the next manual restart. Separate file so
+# each concern stays idempotent on its own (the main EPEL unit has no
+# ExecStartPre; drop-in Exec* lines append, not replace).
+AST_TS_DROPIN  = "/etc/systemd/system/asterisk.service.d/10-wait-tailnet.conf"
 # Asterisk's AGI application dir is a compile-time constant — detect it
 AGI_BIN_DIRS   = ("/usr/lib64/asterisk/agi-bin", "/usr/lib/asterisk/agi-bin")
 # AGI hook scripts linked into the AGI dir (called by extensions.conf)
@@ -1550,6 +1557,40 @@ def _write_modules_conf() -> None:
     ok("Modules.conf (module load list):", str(dst))
 
 
+def _write_ts_guard() -> None:
+    """Write the Asterisk boot-guard drop-in (reboot resilience).
+
+    In distributed mode the PJSIP transport binds a specific Tailscale
+    IP; at cold boot the IP may not be assigned yet, and the bind
+    failure drops the transport object entirely — "Cannot assign
+    requested address", journal 2026-08-18, 3p14-aaa. The guard
+    (scripts/wait-tailnet-ip.sh) waits up to 90 s for the IP; it no-ops
+    when no IP is configured (single-node), so it is safe to install
+    unconditionally. The repo ships the script 0644 and copytree
+    preserves mode — the exec bit is set here.
+    """
+    guard = Path(INSTALL_DIR) / "scripts" / "wait-tailnet-ip.sh"
+    if not guard.exists():
+        warn("Boot-guard script missing:", str(guard))
+        return
+    guard.chmod(0o755)
+    txt = f"[Service]\nExecStartPre={guard}\n"
+    p = Path(AST_TS_DROPIN)
+    if p.exists() and p.read_text() == txt:
+        ok("Asterisk boot-guard drop-in unchanged.")
+        return
+    if p.exists():
+        bak = (f"{p}.bak-"
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+        Path(bak).write_text(p.read_text())
+        warn("Existing boot-guard drop-in backed up:", bak)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(txt)
+    run_ok("systemctl daemon-reload")
+    s.ast_env_changed = True  # ExecStartPre takes effect at next start
+    ok("Asterisk boot-guard drop-in:", str(p))
+
+
 def _install_asterisk_dialplan() -> None:
     """Install dialplan, module load list, generated globals, VM prompt
     and AGI hooks.
@@ -1687,6 +1728,11 @@ def _install_asterisk_dialplan() -> None:
         warn("Phase 7 will restart Asterisk — active calls will be dropped.")
     else:
         ok("Asterisk env drop-in unchanged.")
+
+    # 5b. Boot guard — the PJSIP transport binds the Tailscale IP;
+    #     without the guard a cold boot can start Asterisk before the
+    #     IP exists and the transport is lost (no SIP until restart).
+    _write_ts_guard()
 
 def _install_systemd() -> None:
     heading("Installing systemd Units")

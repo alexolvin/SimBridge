@@ -42,7 +42,7 @@ _STATE_FIELDS = (
     "own_ip", "peer_ip", "acl_ids", "ts_tag",
     "do_ts", "do_ts_opt", "usb_modems", "ts_ip", "has_ts",
     "node_id", "generated_secrets", "verify_issues", "ast_config_changed",
-    "ast_modules_changed", "ast_core_changed",
+    "ast_modules_changed", "ast_core_changed", "ast_env_changed",
 )
 _LIST_FIELDS = ("usb_modems", "generated_secrets", "verify_issues")
 
@@ -991,6 +991,51 @@ class TestWriteTailscaleUp:
         install._write_tailscale_up()
         assert unit.read_text() == first
         assert not list(unit.parent.glob("tailscale-up.service.bak-*"))
+
+
+class TestWriteTsGuard:
+    """Asterisk boot-guard drop-in (ExecStartPre waits for the
+    Tailscale IP before the PJSIP transport bind)."""
+
+    def _patch(self, tmp_path, monkeypatch):
+        dropin = tmp_path / "10-wait-tailnet.conf"
+        monkeypatch.setattr(install, "AST_TS_DROPIN", str(dropin))
+        monkeypatch.setattr(install, "INSTALL_DIR", str(tmp_path / "app"))
+        scripts = tmp_path / "app" / "scripts"
+        scripts.mkdir(parents=True)
+        guard = scripts / "wait-tailnet-ip.sh"
+        guard.write_text("#!/bin/sh\nexit 0\n")
+        reloads = []
+        monkeypatch.setattr(install, "run_ok",
+                            lambda cmd: reloads.append(cmd))
+        return dropin, guard, reloads
+
+    def test_writes_dropin_exec_bit_and_restart_flag(
+            self, tmp_path, monkeypatch, ni_state):
+        dropin, guard, reloads = self._patch(tmp_path, monkeypatch)
+        install._write_ts_guard()
+        assert dropin.read_text() == (
+            f"[Service]\nExecStartPre={guard}\n")
+        assert guard.stat().st_mode & 0o111  # exec bit applied
+        assert "systemctl daemon-reload" in reloads
+        assert install.s.ast_env_changed  # phase 7 restarts Asterisk
+
+    def test_idempotent_no_reload_no_backup(
+            self, tmp_path, monkeypatch, ni_state):
+        dropin, guard, reloads = self._patch(tmp_path, monkeypatch)
+        install._write_ts_guard()
+        reloads.clear()
+        install._write_ts_guard()
+        assert reloads == []
+        assert not list(dropin.parent.glob("10-wait-tailnet.conf.bak-*"))
+
+    def test_missing_script_warns_no_dropin(
+            self, tmp_path, monkeypatch, ni_state, capsys):
+        dropin, guard, _ = self._patch(tmp_path, monkeypatch)
+        guard.unlink()
+        install._write_ts_guard()
+        assert not dropin.exists()
+        assert "missing" in capsys.readouterr().err
 
 
 class TestPhaseStartRestartPolicy:
