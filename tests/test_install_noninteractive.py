@@ -705,6 +705,30 @@ class TestRenderModulesConf:
         i_chan = txt.index("chan_pjsip.so")
         assert i_sdp < i_eng < i_chan
 
+    def test_bridge_technology_stack_loaded(self):
+        # 2026-08-20 (3p14-aaa): no module <depend>s on the bridge
+        # technology modules (verified in the strings of the installed
+        # EPEL .so files), so under autoload=no they load ONLY if
+        # listed here. With none of them loaded, Dial() cannot bridge
+        # the answered second leg (ast_bridge_basic_new ->
+        # find_best_technology -> NULL, "Could not create class basic.
+        # No technology to support it") and both legs are hung up at
+        # answer — the phone rings, gets picked up, and drops
+        # immediately. Regression test for the load list never
+        # catching up with the runtime state.
+        for m in ("bridge_builtin_features.so",
+                  "bridge_builtin_interval_features.so",
+                  "bridge_holding.so",
+                  "bridge_simple.so",
+                  "bridge_native_rtp.so",
+                  "bridge_softmix.so"):
+            assert m in install.AST_MODULES_LOAD
+        txt = install._render_modules_conf(set(install.AST_MODULES_LOAD))
+        i_feat = txt.index("load = bridge_builtin_features.so")
+        i_mix = txt.index("load = bridge_softmix.so")
+        i_chan = txt.index("chan_pjsip.so")
+        assert i_feat < i_mix < i_chan
+
 
 class TestWriteModulesConf:
     def test_backs_up_and_marks_changed(self, tmp_path, monkeypatch,

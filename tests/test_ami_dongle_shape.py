@@ -23,11 +23,13 @@ a fresh event loop via _run().
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "agent"))
 
+import ami_client  # noqa: E402
 from ami_client import AMIClient  # noqa: E402
 
 
@@ -62,13 +64,40 @@ ENTRY = (
 )
 COMPLETE = b"Event: DongleShowDevicesComplete\r\n\r\n"
 
+# A call-lifecycle event with no ActionID — what a live call floods
+# into the AMI stream (one 17 s call measured 64+ of these,
+# 2026-08-20 3p14-aaa).
+BURST_EVENT = (
+    b"Event: Newstate\r\n"
+    b"Channel: Dongle/gsm-00000001\r\n"
+    b"State: 6\r\n"
+    b"CallerIDNum: +79267523624\r\n"
+    b"\r\n"
+)
 
-async def _make_server(with_entry=True, entry=ENTRY, legacy_headers=False):
+
+async def _make_server(
+    with_entry=True,
+    entry=ENTRY,
+    legacy_headers=False,
+    lead_events=0,
+    mid_events=0,
+    stale_complete=False,
+    complete_actionid=False,
+):
     """Fake AMI server: greeting, Login ack, then DongleShowDevices reply.
 
     legacy_headers=True emits the entry/terminator under Message:
     headers (the format the old code assumed) to pin backwards
     compatibility.
+
+    Burst knobs (regression for the 32-cap exhaustion):
+    lead_events — call events written BEFORE the list-ack (stale
+    backlog from an in-flight call); mid_events — events written
+    BETWEEN the entry and the terminator; stale_complete — one bare
+    leftover terminator written first (what an interrupted old-code
+    drain leaves in the stream); complete_actionid — the terminator
+    carries our ActionID (the deployed chan_dongle shape).
     """
     if legacy_headers:
         entry = entry.replace(b"Event: ", b"Message: ")
@@ -102,11 +131,29 @@ async def _make_server(with_entry=True, entry=ENTRY, legacy_headers=False):
                     for l in action.splitlines():
                         if l.startswith("ActionID:"):
                             aid = l.split(":", 1)[1].strip()
+                    if stale_complete:
+                        writer.write(COMPLETE)
+                    for _ in range(lead_events):
+                        writer.write(BURST_EVENT)
                     writer.write(ACK.format(aid=aid).encode())
                     if with_entry:
                         writer.write(entry)
-                    writer.write(complete)
+                    for _ in range(mid_events):
+                        writer.write(BURST_EVENT)
+                    if complete_actionid:
+                        writer.write(
+                            b"Event: DongleShowDevicesComplete\r\n"
+                            b"ActionID: " + aid.encode() + b"\r\n"
+                            b"EventList: Complete\r\n"
+                            b"ListItems: 1\r\n"
+                            b"\r\n"
+                        )
+                    else:
+                        writer.write(complete)
                 await writer.drain()
+        except (ConnectionError, OSError):
+            # client went away mid-reply (e.g. drain cap hit)
+            return
         finally:
             try:
                 writer.close()
@@ -267,3 +314,125 @@ class TestMarkerHelpers:
             {"Message": "ListComplete"}) is True
         assert AMIClient._is_list_complete(
             {"Event": "SomeOtherEvent"}) is False
+
+
+class TestCallEventBurstBacklog:
+    """Regression: a live call's AMI event burst must not break the poll.
+
+    2026-08-20 (3p14-aaa): get_modem_status() drained a fixed 32
+    messages. One 17-second call floods 64+ lifecycle events
+    (Newstate/VarSet/DialBegin/DialEnd/AGI/RTCP/Hangup) into the same
+    AMI stream, so 2-3 consecutive 30-second polls exhausted the cap
+    on the burst and left their own reply unread: the poller marked a
+    healthy dongle "device not present" (dongle_offline alert) and the
+    next call attempt got a spurious 503. Every spurious poll stopped
+    at exactly 32 messages.
+    """
+
+    def test_burst_backlog_before_reply(self):
+        """70 stale events (more than the old 32 cap) precede the reply.
+
+        Pre-fix: the cap stopped at 32, mid-burst — the poll's own
+        reply was never read and the dongle was reported absent.
+        """
+        async def scenario():
+            server = await _make_server(lead_events=70)
+            try:
+                c = AMIClient(port=server.sockets[0].getsockname()[1])
+                await c.connect()
+                try:
+                    status = await c.get_modem_status()
+                finally:
+                    await c.close()
+                assert status["registered"] is True
+                assert status["device"] == "gsm"
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        _run(scenario())
+
+    def test_burst_between_entry_and_complete(self):
+        """Events interleave inside the list, up to the terminator."""
+        async def scenario():
+            server = await _make_server(mid_events=40)
+            try:
+                c = AMIClient(port=server.sockets[0].getsockname()[1])
+                await c.connect()
+                try:
+                    status = await c.get_modem_status()
+                finally:
+                    await c.close()
+                assert status["registered"] is True
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        _run(scenario())
+
+    def test_full_call_burst(self):
+        """The measured shape: 32 pre-burst + 40 mid, ActionID-stamped
+        terminator (the deployed chan_dongle format) — one real call
+        is 64-96 events end to end."""
+        async def scenario():
+            server = await _make_server(
+                lead_events=32, mid_events=40, complete_actionid=True
+            )
+            try:
+                c = AMIClient(port=server.sockets[0].getsockname()[1])
+                await c.connect()
+                try:
+                    status = await c.get_modem_status()
+                finally:
+                    await c.close()
+                assert status["registered"] is True
+                assert status["signal_percent"] == 75
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        _run(scenario())
+
+    def test_stale_terminator_before_ack_is_skipped(self):
+        """A leftover Complete from an interrupted old-code drain sits
+        in the stream before our list-ack. It must be skipped, not
+        mistaken for our terminator (which would report the dongle
+        absent while the real reply follows)."""
+        async def scenario():
+            server = await _make_server(stale_complete=True)
+            try:
+                c = AMIClient(port=server.sockets[0].getsockname()[1])
+                await c.connect()
+                try:
+                    status = await c.get_modem_status()
+                finally:
+                    await c.close()
+                assert status["registered"] is True
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        _run(scenario())
+
+    def test_drain_cap_backstop(self, monkeypatch, caplog):
+        """A stream with no terminator must hit the cap, not hang the
+        poller: bounded drain + WARNING, empty result (the per-read
+        15 s timeout is the other backstop)."""
+        monkeypatch.setattr(ami_client, "AMI_DRAIN_CAP", 5)
+        async def scenario():
+            server = await _make_server(lead_events=10)
+            try:
+                c = AMIClient(port=server.sockets[0].getsockname()[1])
+                await c.connect()
+                try:
+                    status = await c.get_modem_status()
+                finally:
+                    await c.close()
+                assert status == {}
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        with caplog.at_level(logging.WARNING, logger="simbridge.ami"):
+            _run(scenario())
+        assert "drain cap" in caplog.text

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import re
 from typing import Optional
 
@@ -31,6 +32,18 @@ from typing import Optional
 # poller, the watchdog and the reconnector all funnel through it, so
 # one wedged read would stall every AMI operation in the process.
 AMI_READ_TIMEOUT = 15.0
+
+# The DongleShowDevices reply is drained to its own terminator; this
+# cap is the backstop for a run-away stream (a device list is 1-3
+# entries). It must fit a full call's AMI event burst (64+ interleaved
+# Newstate/VarSet/DialBegin/AGI/RTCP messages) with room to spare: the
+# old 32-message cap was exhausted by the burst and left the poll's
+# own reply unread, which the poller misread as "dongle absent" —
+# spurious offline flap + 503 on the next call attempt (2026-08-20,
+# 3p14-aaa: every spurious-offline poll stopped at exactly 32).
+AMI_DRAIN_CAP = 1024
+
+logger = logging.getLogger("simbridge.ami")
 
 
 class AMISendError(Exception):
@@ -222,25 +235,56 @@ class AMIClient:
                     "ActionID": action_id,
                 }
             )
-            # Reply shape: a list-ack message, then one DongleDeviceEntry
-            # per matching device, then a list-complete message. Unrelated
-            # events can interleave — skip anything that is not an entry.
-            # The reply is drained to the terminator: stopping at the
-            # entry would leave the Complete message in the stream, where
-            # the NEXT call would read it first and misreport an empty
-            # device list.
+            # Reply shape: a list-ack, then one DongleDeviceEntry per
+            # matching device, then a list-complete. Unrelated call
+            # events (Newstate/VarSet/DialBegin/AGI/RTCP/...) interleave
+            # freely — one call floods 64+ of them into the stream.
+            #
+            # The drain runs to OUR terminator, not to a fixed message
+            # count: the old 32-cap was exhausted by a call's event
+            # burst and left this reply unread, so the poller marked a
+            # healthy, ringing dongle "not present" — spurious offline
+            # flap + dongle_offline alert + 503 on the next attempt
+            # (2026-08-20, 3p14-aaa: every spurious poll stopped at
+            # exactly 32 messages).
+            #
+            # Attribution: the list-ack (Asterisk core) and the
+            # entry/complete (chan_dongle, manager.c) all carry this
+            # ActionID. A stale leftover from an interrupted drain
+            # (old-code 32-cap hits, or a prior 1024-cap hit) always
+            # PRECEDES our list-ack — the stream is FIFO — so any entry
+            # or complete seen before the ack is not ours and is
+            # skipped; anything seen after it is.
             entry: dict[str, str] = {}
-            for _ in range(32):  # bounded: a device list is short (1-3 entries)
+            acked = False
+            terminated = False
+            for _ in range(AMI_DRAIN_CAP):
                 resp = await self._read_response()
-                if self._is_device_entry(resp):
+                aid = resp.get("ActionID") == action_id
+                if self._is_device_entry(resp) and (aid or acked):
                     if not entry:
                         entry = resp
-                    continue
-                if self._is_list_complete(resp):
-                    break
-        if not entry:
-            return {}
-        return self._normalize_device_entry(entry)
+                elif self._is_list_complete(resp):
+                    if aid or acked:
+                        terminated = True
+                        break
+                    # stale terminator (pre-ack) — skip, keep draining
+                elif resp.get("Response") in ("Success", "Followed") and aid:
+                    acked = True
+            else:
+                logger.warning(
+                    "get_modem_status(%s): drain cap %d hit without "
+                    "list terminator; action_id=%s",
+                    self._dongle, AMI_DRAIN_CAP, action_id,
+                )
+            if not entry:
+                logger.warning(
+                    "get_modem_status(%s): no device entry; action_id=%s; "
+                    "terminated=%s",
+                    self._dongle, action_id, terminated,
+                )
+                return {}
+            return self._normalize_device_entry(entry)
 
     @classmethod
     def _is_device_entry(cls, resp: dict) -> bool:

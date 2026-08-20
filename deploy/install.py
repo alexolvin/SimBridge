@@ -200,6 +200,22 @@ AST_MODULES_LOAD = (
     "res_pjsip_sdp_rtp.so",               # PJSIP SDP RTP/AVP negotiation
     "res_rtp_asterisk.so",                # "asterisk" RTP engine (the
                                           # res_pjsip rtp_engine default)
+    # Bridge technology modules. NO module <depend>s on any of them
+    # (verified in the strings of the installed EPEL .so files: no
+    # embedded dependency references; app_dial also loads and dials
+    # fine with none of them present), so under autoload=no they load
+    # ONLY if listed here. Dial() bridges the answered second leg via
+    # ast_bridge_basic_new() -> find_best_technology(), which needs a
+    # RUNNING bridge tech; with none loaded both legs are hung up at
+    # answer ("Could not create class basic. No technology to support
+    # it") — live 2026-08-20, 3p14-aaa, retest round: the phone rang,
+    # got answered, and dropped immediately.
+    "bridge_builtin_features.so",
+    "bridge_builtin_interval_features.so",
+    "bridge_holding.so",
+    "bridge_simple.so",
+    "bridge_native_rtp.so",
+    "bridge_softmix.so",
     "chan_pjsip.so",
     "chan_dongle.so",                     # third-party (wiringSoft)
     "codec_alaw.so", "codec_ulaw.so", "codec_gsm.so",
