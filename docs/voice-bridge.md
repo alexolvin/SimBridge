@@ -283,6 +283,14 @@ ice_support=no
 auth=tg-bridge-auth
 outbound_auth=tg-bridge-auth
 aors=tg-bridge-aor
+; S04.5: default identify_by is username,ip. The bridge (UAC)
+; authenticates as tg-bridge but its From user is not this AOR name,
+; so it is only identifiable via the Authorization header. Without
+; auth_username the request is not identified to this endpoint and is
+; authed against the artificial endpoint instead: 401 despite correct
+; credentials. Root-caused 2026-08-19 via core set debug 3
+; (res_pjsip_authenticator_digest.c).
+identify_by=username,ip,auth_username
 
 [tg-bridge-auth]
 type=auth
@@ -309,6 +317,17 @@ contact=sip:127.0.0.1:5062
   (outgoing) or inject fake incoming calls.
 - `context=tg-bridge` routes the bridge's INVITEs to the `[tg-bridge]`
   dialplan context (outgoing GSM leg, above).
+- `identify_by=username,ip,auth_username` is **required**, not
+  cosmetic: with the default `username,ip` the bridge's INVITE (From
+  user ≠ AOR name, authenticated as `tg-bridge`) is not identified to
+  this endpoint, so PJSIP falls back to the *artificial* endpoint for
+  auth — correct credentials then yield 401 anyway. Live root cause
+  2026-08-19 (3p14-aaa), found via `core set debug 3` on
+  res_pjsip_authenticator_digest. Note the related NOTICE
+  "No matching endpoint found for ... using_auth_username=0" is
+  **by design** for unauthenticated INVITEs: `using_auth_username` is
+  only set when a global `endpoint_identifier_order` is configured,
+  which SimBridge does not (identification must stay explicit).
 
 **Distributed diff** (generator, when `voice.bridge_host` is not
 loopback and the node has a Tailscale IP): `bind=<this node's Tailscale
@@ -532,6 +551,58 @@ Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node, 100.a.
   harmless (one missed ring) while a missed real number would be a
   dropped call. Pinned by a unit test so a future change is deliberate.
 
+## Operational Findings — 3p14-aaa, 2026-08-19/20
+
+Commissioning findings from the live GSM node. Each is pinned by the
+generator / installer / tests where a code artifact exists.
+
+### SDP/RTP modules are not auto-loaded (reboot hazard)
+
+`res_pjsip_sdp_rtp.so` and `res_rtp_asterisk.so` (the "asterisk" RTP
+engine) are **not a `<depend>` of any module** — verified in the
+18.26.4 source and in the strings of the installed EPEL `.so` files.
+Under `autoload=no` they load only if listed in `modules.conf`. On
+2026-08-19 they were loaded at runtime via the `module load` CLI and
+lived only in process memory: the voice bridge worked until the next
+restart, which would have dropped both modules and broken all PJSIP
+media silently (488 on INVITEs, `No RTP engine was found`). Now
+persisted in `modules.conf` (live) and `AST_MODULES_LOAD` (installer);
+regression test in `tests/test_install_noninteractive.py`.
+**Lesson: a runtime `module load` is not a configuration — anything
+that only exists in process memory is lost at the next (re)start.**
+
+### Asterisk log `[NUM]` is the thread ID
+
+The `[NUM]` in log lines is the **thread** ID, not the main PID — on a
+host that churns ~30 PIDs/s (pid_max 4194304), PJSIP thread-pool TIDs
+differ from the main PID by millions, and reading them as separate
+asterisk instances is a false lead. Verify process identity with
+`ps -eo pid,lstart,cmd`, not with log numbers.
+
+### No-user E2E SIP probe — ALL PASS (2026-08-20)
+
+`scripts/e2e_sip_probe.py`, run from the TG node against the live GSM
+node — a synthetic authenticated SIP client (correct `tg-bridge`
+digest) plus a raw RTP socket; no real Telegram account involved:
+
+- **Phase A** (media, exten 778): 401 challenge → 200 OK → **250 RTP
+  packets received** (5 s of silence, ulaw) → BYE from Asterisk.
+- **Phase B** (nocal, exten 777 — matches `_X.` → the outgoing
+  branch's `outgoing-accepted` AGI finds no registered call → `nocal`
+  → Hangup without Dial): 401 → 200 OK → BYE, zero RTP (by design —
+  the nocal branch answers but plays nothing).
+
+This is a real-device run (Rule 3) for the SIP + media path across the
+tailnet. TS04-2 (a real Telegram voice call, both directions) remains
+open.
+
+Probe bugs found while making it pass (all fixed in the script): the
+RTP counter `data[0] & 0x60 == 0x80` is always False — the correct
+u-law check is `data[0] & 0xC0 == 0x80` (the media path was fine all
+along; `rtp_rx=0` was the probe's own bug); and Phase B read the
+extension after Phase A's reset had overwritten it (now a stable
+`b_exten` copy).
+
 ## MANUAL_VERIFY items (Stage 04)
 
 Live-device evidence (Rule 3) — to be closed in the test & fix pass with
@@ -541,7 +612,9 @@ real modem + real Telegram account:
   to the loopback contract above (POC has no matching API).
 - **TS04-2**: real Telegram voice call end-to-end, both directions
   (incoming accept / reject / timeout→voicemail; outgoing accepted /
-  no-answer / busy / cancelled).
+  no-answer / busy / cancelled). SIP + media leg verified without a
+  user via the E2E probe (see Operational Findings above); the
+  Telegram-account leg remains.
 - **TS04-3**: link-drop run (`tailscale down` mid-call) — clean
   termination, no orphan channels (`core show channels` empty).
 - **TS04-4**: distributed two-node run (GSM node + Telegram node,

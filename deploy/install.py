@@ -59,8 +59,9 @@ import time
 import grp
 import pwd
 import secrets
-import subprocess
 import shutil
+import struct
+import subprocess
 import tempfile
 import textwrap
 from datetime import datetime, timezone
@@ -131,6 +132,9 @@ AST_GLOBALS    = f"{AST_DIR}/asterisk-globals.conf"   # generated
 AST_PJSIP      = f"{AST_DIR}/pjsip.conf"              # generated (S04.2, holds the SIP secret)
 AST_EXTENSIONS = f"{AST_DIR}/extensions.conf"         # from the repo
 AST_PROMPT     = "/var/lib/asterisk/sounds/custom/vm-prompt.ulaw"
+# S04.2 probe target (exten 778 plays silence/5000). EPEL strips the
+# sounds subpackage, so it is synthesized by the installer, not shipped.
+AST_SILENCE_WAV = "/usr/share/asterisk/sounds/en/silence/5000.wav"
 # Drop-in giving the Asterisk process SimBridge's env — the AGI hooks
 # inherit their secrets from it (Rule 5: no secrets in units or dialplan).
 AST_DROPIN     = "/etc/systemd/system/asterisk.service.d/simbridge-env.conf"
@@ -186,6 +190,16 @@ AST_MODULES_LOAD = (
                                           # (built into Asterisk 18; the
                                           # legacy nat_option key is gone)
     "res_pjsip_pubsub.so",                # required by chan_pjsip
+    # SDP/RTP media stack. NO module <depend>s on either (verified in the
+    # 18.26.4 source and in strings of the installed EPEL .so files), so
+    # under autoload=no they are loaded ONLY if listed here — a missing
+    # line means PJSIP media breaks silently (488 on INVITEs, "No RTP
+    # engine was found"). They were loaded at runtime on 3p14-aaa via
+    # `module load` on 2026-08-19 and lived only in process memory until
+    # this list caught up; a restart would have dropped them.
+    "res_pjsip_sdp_rtp.so",               # PJSIP SDP RTP/AVP negotiation
+    "res_rtp_asterisk.so",                # "asterisk" RTP engine (the
+                                          # res_pjsip rtp_engine default)
     "chan_pjsip.so",
     "chan_dongle.so",                     # third-party (wiringSoft)
     "codec_alaw.so", "codec_ulaw.so", "codec_gsm.so",
@@ -1591,6 +1605,29 @@ def _write_ts_guard() -> None:
     ok("Asterisk boot-guard drop-in:", str(p))
 
 
+def _install_silence_wav() -> None:
+    """Synthesize the 5 s silence prompt (S04.2 probe exten 778).
+
+    EPEL ships Asterisk without the sounds subpackage, so on a clean
+    node /usr/share/asterisk/sounds is empty and Playback(silence/5000)
+    would fail. Asterisk 18's format_wav accepts PCM16 mono 8 kHz only
+    (mu-law WAV is rejected), so the file is generated here: 5 s of
+    16-bit silence. Idempotent — byte-stable, written only on change.
+    """
+    dst = Path(AST_SILENCE_WAV)
+    data = b"\x00" * 80000  # 5 s x 8000 Hz x 2 bytes
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+           + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16)
+           + b"data" + struct.pack("<I", len(data)))
+    if dst.exists() and dst.read_bytes() == hdr + data:
+        ok("Silence prompt unchanged.", str(dst))
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(hdr + data)
+    dst.chmod(0o644)
+    ok("Silence prompt:", str(dst))
+
+
 def _install_asterisk_dialplan() -> None:
     """Install dialplan, module load list, generated globals, VM prompt
     and AGI hooks.
@@ -1645,6 +1682,10 @@ def _install_asterisk_dialplan() -> None:
         _chown_asterisk(snd_dst)
     else:
         warn("Prompt missing in repo:", str(snd_src))
+
+    # 2b. Silence prompt — synthesized (EPEL strips the sounds package);
+    #     the S04.2 probe exten 778 plays it.
+    _install_silence_wav()
 
     # 3. Globals + PJSIP — generated from the config _write_config()
     #    just wrote. The PJSIP file (S04.2) carries the bridge SIP

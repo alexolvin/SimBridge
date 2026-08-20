@@ -714,6 +714,43 @@ class TestConfigGeneratorBridge:
 # is design-independent and stays.
 
 
+class TestDialplanBridge:
+    """Structural regression tests for [tg-bridge] in the repo dialplan.
+
+    The dialplan is a checked-in artifact (asterisk/extensions.conf),
+    and dialplan walker order is a live incident, not a style point:
+    with extenpatternmatchnew=0 (default) the walker returns the FIRST
+    matching extension in FILE order (18.26.4 main/pbx.c find_extension
+    old path), so an exact exten after a _X. pattern is unreachable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def load_dialplan(self):
+        path = Path(__file__).resolve().parent.parent / "asterisk" / "extensions.conf"
+        self.conf = path.read_text()
+
+    @property
+    def bridge_block(self):
+        return self.conf.split("[tg-bridge]")[1].split("\n[")[0]
+
+    def test_probe_target_778_precedes_catchall(self):
+        # The S04.2 E2E probe media target must come BEFORE the _X.
+        # pattern, or the catchall shadows it. The mirror-image bug
+        # (catchall shadowing the outgoing GSM leg, both living in
+        # [sms-send]) was a live incident 2026-08-18 (3p14-aaa).
+        assert self.bridge_block.index("exten => 778,1,") \
+            < self.bridge_block.index("exten => _X.,1,")
+
+    def test_probe_target_plays_silence_and_self_terminates(self):
+        seg = self.bridge_block[
+            self.bridge_block.index("exten => 778,1,")
+            : self.bridge_block.index("exten => _X.,1,")]
+        assert "Answer()" in seg
+        assert "Playback(silence/5000)" in seg
+        assert "Hangup()" in seg
+        assert "Dial(" not in seg  # the probe path must never touch the GSM leg
+
+
 # =========================================================================
 # PJSIP config — bridge endpoint (S04.2)
 # =========================================================================
@@ -762,6 +799,18 @@ class TestPjsipConfig:
         # by ast_sip_str_to_dtmf and drops the whole endpoint object
         # (live incident 2026-08-17/18, 3p14-aaa).
         assert "dtmf_mode=rfc4733" in self.pjsip
+
+    def test_identify_by_includes_auth_username(self):
+        # Default identify_by is username,ip. The bridge (UAC) authenticates
+        # as tg-bridge but its From user is not the AOR name, so without
+        # auth_username the request is NOT identified to this endpoint and
+        # is authed against the artificial endpoint instead: 401 despite
+        # correct credentials. Root-caused 2026-08-19 (3p14-aaa) via
+        # `core set debug 3` (res_pjsip_authenticator_digest.c).
+        line = [l for l in self.pjsip.splitlines()
+                if l.startswith("identify_by=")]
+        assert len(line) == 1
+        assert "auth_username" in line[0].split("=", 1)[1]
 
     def test_binds_loopback_in_single_node_mode(self):
         """Single node: the bridge is local, so Asterisk binds 127.0.0.1."""

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import stat
+import struct
 import sys
 import types
 from pathlib import Path
@@ -686,6 +687,24 @@ class TestRenderModulesConf:
         # Originate() is used by the dialplan ([tg-bridge] GSM leg).
         assert "load = app_originate.so" in txt
 
+    def test_sdp_rtp_media_stack_loaded(self):
+        # 2026-08-19 (3p14-aaa): res_pjsip_sdp_rtp.so and
+        # res_rtp_asterisk.so are NOT a <depend> of any module (verified
+        # in the 18.26.4 source and in the strings of the installed EPEL
+        # .so files), so under autoload=no they load ONLY if listed
+        # here. They had been loaded at runtime via `module load` and
+        # lived only in process memory — the next restart would have
+        # broken all PJSIP media silently (488 on INVITEs, "No RTP
+        # engine was found"). Regression test for the load list never
+        # catching up with the runtime state.
+        for m in ("res_pjsip_sdp_rtp.so", "res_rtp_asterisk.so"):
+            assert m in install.AST_MODULES_LOAD
+        txt = install._render_modules_conf(set(install.AST_MODULES_LOAD))
+        i_sdp = txt.index("load = res_pjsip_sdp_rtp.so")
+        i_eng = txt.index("load = res_rtp_asterisk.so")
+        i_chan = txt.index("chan_pjsip.so")
+        assert i_sdp < i_eng < i_chan
+
 
 class TestWriteModulesConf:
     def test_backs_up_and_marks_changed(self, tmp_path, monkeypatch,
@@ -742,6 +761,40 @@ class TestWriteModulesConf:
         install._write_modules_conf()  # must not raise
         assert "chan_dongle.so" not in (ast / "modules.conf").read_text()
         assert install.s.ast_modules_changed is True
+
+
+# ---------------------------------------------------------------------------
+# Silence prompt — the S04.2 E2E probe target (exten 778) plays
+# Playback(silence/5000), but EPEL strips the sounds subpackage, so on a
+# clean node the file is absent and the probe can never ring. The
+# installer synthesizes it (format_wav 18 accepts PCM16 mono 8 kHz only;
+# mu-law WAV is rejected). Byte-stable, idempotent.
+# ---------------------------------------------------------------------------
+
+class TestInstallSilenceWav:
+    def _wav_path(self, monkeypatch, tmp_path):
+        wav = tmp_path / "sounds" / "en" / "silence" / "5000.wav"
+        monkeypatch.setattr(install, "AST_SILENCE_WAV", str(wav))
+        return wav
+
+    def test_creates_pcm16_8k_silence(self, monkeypatch, tmp_path):
+        wav = self._wav_path(monkeypatch, tmp_path)
+        install._install_silence_wav()
+        raw = wav.read_bytes()
+        assert len(raw) == 80044  # 44-byte header + 5 s x 8000 Hz x 2 B
+        assert raw[:4] == b"RIFF"
+        assert raw[8:12] == b"WAVE"
+        assert raw[12:16] == b"fmt "
+        assert struct.unpack("<HHIIHH", raw[20:36]) == (1, 1, 8000, 16000, 2, 16)
+        assert raw[36:40] == b"data"
+        assert raw[44:] == b"\x00" * 80000
+
+    def test_idempotent(self, monkeypatch, tmp_path):
+        wav = self._wav_path(monkeypatch, tmp_path)
+        install._install_silence_wav()
+        first = wav.read_bytes()
+        install._install_silence_wav()
+        assert wav.read_bytes() == first
 
 
 # ---------------------------------------------------------------------------

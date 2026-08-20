@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
-"""E2E SIP probe — proves the PJSIP leg end-to-end without GSM side
-effects (S04.2 verification, Rule 3: real-device evidence).
+"""E2E SIP probe — two-phase verification of the PJSIP leg without GSM
+side effects (S04.2 verification, Rule 3: real-device evidence).
 
 Run this FROM the Telegram node (or any host with tailnet reach to the
-GSM node). It plays the role of the sip-tg-bridge UAC:
+GSM node). It plays the role of the sip-tg-bridge UAC, twice:
 
-  1. Anonymous INVITE           -> 401 Digest challenge (auth enforced)
-  2. Authenticated INVITE       -> 100 Trying -> 200 OK + media SDP
-  3. ACK + ulaw RTP, both ways  -> media path over the tailnet
-  4. Expects Asterisk to BYE on its own: the [tg-bridge] dialplan
-     answers, asks the agent about the call (unknown call -> 404 ->
-     CALL_ID empty) and hangs up at the "nocal" branch — the GSM leg
-     is NEVER dialed. The extension is a dummy (default "777", which
-     the carrier rejects instantly even if nocal were ever skipped).
+Phase A (media, --media-exten, default 778):
+  anonymous INVITE -> 401 Digest challenge -> authenticated INVITE
+  -> 200 OK + media SDP -> ACK -> ulaw RTP both ways -> BYE from
+  Asterisk. Extension 778 plays 5 s of silence and hangs up on its
+  own; the silence playback is what makes Asterisk actually emit RTP,
+  so the rtp_rx criterion proves the RETURN media path over the
+  tailnet (comedia, non-NAT peer). No GSM leg, no agent.
 
-PASS criteria (all must hold):
+Phase B (nocal, --exten, default 777):
+  the same call cycle against the production-shaped pattern
+  extension. The dialplan answers, asks the agent about the call
+  (unknown call -> 404 -> CALL_ID empty) and hangs up at the "nocal"
+  branch — the GSM leg is NEVER dialed. That path writes NO audio
+  frames to the channel, so Asterisk sends zero RTP: rtp_rx is NOT a
+  pass criterion here and the received count is reported
+  informationally. Criteria: 401, 200 OK + SDP, BYE.
+
+PASS criteria (all must hold in the phase that expects them):
   - 401 challenge seen            (inbound SIP auth enforced)
   - 200 OK with media SDP         (transport bound, endpoint live)
-  - incoming RTP packets received (RTP over tailnet, comedia)
+  - incoming RTP packets received (Phase A only: return media path)
   - BYE from Asterisk             (dialplan executed, clean hangup,
                                     no orphan channel, no GSM dial)
+
+Each phase starts a fresh dialog (new Call-ID and a fresh anonymous
+INVITE, so each phase gets its own Digest nonce).
 
 Exit code 0 = all criteria met, 1 = at least one failed.
 
@@ -33,6 +44,17 @@ The advertised source IP (Via/Contact/SDP o=/c=) is taken from
 address the kernel selects for packets toward --gsm-ip. It must NOT
 be 0.0.0.0: for a non-NAT peer Asterisk sends RTP to the SDP c=
 address, so 0.0.0.0 would black-hole the media.
+
+Dialplan note (Asterisk 18.26.4, main/pbx.c): with
+extenpatternmatchnew=0 (the default; no config option, runtime CLI
+only) the extension walker returns the FIRST matching extension in
+FILE order. Hence 778 is defined BEFORE the _X. pattern in the
+[tg-bridge] context — otherwise an INVITE to 778 would match _X.
+(the production nocal path) and never reach the media target. The
+X pattern digit class is [0-9] (case 'X' in _extension_match_core),
+so 11-digit production numbers (79xx...) also match _X. and the
+probe extension is unreachable from real traffic: 778 matches only
+the literal string "778".
 """
 
 from __future__ import annotations
@@ -63,14 +85,14 @@ def detect_local_ip(dest_ip: str, dest_port: int = 5060) -> str:
 
 class Probe:
     def __init__(self, gsm_ip: str, secret: str, exten: str,
-                 timeout: float, local_ip: str = "") -> None:
+                 media_exten: str, timeout: float,
+                 local_ip: str = "") -> None:
         self.gsm_ip = gsm_ip
         self.secret = secret
-        self.exten = exten
+        self.exten = exten            # phase B target (nocal, no media)
+        self.b_exten = exten          # stable copy: _reset_call() overwrites
+        self.media_exten = media_exten  # phase A target (silence playback)
         self.timeout = timeout
-        # Request-URI: host only. Port 5060 / UDP are the SIP defaults (the
-        # packet is still sent to (gsm_ip, 5060) below).
-        self.uri = f"sip:{exten}@{gsm_ip}"
 
         # SIP socket (port 0 -> OS picks)
         self.sip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -91,6 +113,18 @@ class Probe:
         self.rtp.settimeout(0.5)
         self.rtp_port = self.rtp.getsockname()[1]
 
+        self.phase_results: list[tuple[str, dict[str, bool], int]] = []
+        self._phase = "?"
+        self._reset_call(self.exten)
+
+    # ── per-call (per-phase) state ────────────────────────────────────
+
+    def _reset_call(self, exten: str) -> None:
+        """Start a fresh dialog: new Call-ID/From-tag, fresh CSeq,
+        empty buffers. The next anonymous INVITE fetches a fresh
+        Digest nonce from the 401 challenge."""
+        self.exten = exten
+        self.uri = f"sip:{exten}@{self.gsm_ip}"
         self.call_id = f"e2e-{secrets.token_hex(8)}@{self.local_ip}"
         self.from_tag = secrets.token_hex(8)
         self.to_tag = ""
@@ -98,7 +132,6 @@ class Probe:
         self.last_branch = ""
         self.rtp_rx = 0
         self.sip_buf = b""
-        self.results: dict[str, bool] = {}
         self.peer_rtp: tuple[str, int] | None = None
 
     # ── SIP message assembly ──────────────────────────────────────────
@@ -135,7 +168,7 @@ class Probe:
         head = self._headers("INVITE", self.uri,
                              extra + "Content-Type: application/sdp\r\n")
         if auth:
-            print("--- INVITE (authenticated) as sent ---")
+            print(f"--- phase {self._phase} INVITE (authenticated) as sent ---")
             print(head)
         self.sip.sendto((head + f"Content-Length: {len(sdp)}\r\n\r\n"
                          + sdp).encode(), (self.gsm_ip, 5060))
@@ -167,25 +200,37 @@ class Probe:
 
     # ── SIP message receiving ─────────────────────────────────────────
 
-    def _drain_sip(self, deadline: float) -> list[str]:
+    def _extract_sip(self) -> list[str]:
+        """Pull complete SIP messages out of sip_buf.
+        Content-Length is parsed leniently: PJSIP right-justifies the
+        value in a 3-char field (e.g. 'Content-Length:  43')."""
+        out: list[str] = []
+        while b"\r\n\r\n" in self.sip_buf:
+            head, _, rest = self.sip_buf.partition(b"\r\n\r\n")
+            m = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
+            n = int(m.group(1)) if m else 0
+            if len(rest) < n:
+                break
+            body, self.sip_buf = rest[:n], rest[n:]
+            out.append((head + b"\r\n\r\n" + body).decode(
+                errors="replace"))
+        return out
+
+    def _drain_sip(self, deadline: float, want: str = "") -> list[str]:
         """Recv until the socket is quiet (0.5 s) or deadline; return
-        complete SIP messages."""
+        complete SIP messages. If `want` is given, return as soon as a
+        message starting with it has been extracted (early ACK: the
+        media window starts sooner)."""
         out: list[str] = []
         while time.time() < deadline:
             try:
                 data, _ = self.sip.recvfrom(65535)
+                self.sip_buf += data
             except socket.timeout:
                 break
-            self.sip_buf += data
-            while b"\r\n\r\n" in self.sip_buf:
-                head, _, rest = self.sip_buf.partition(b"\r\n\r\n")
-                m = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
-                n = int(m.group(1)) if m else 0
-                if len(rest) < n:
-                    break
-                body, self.sip_buf = rest[:n], rest[n:]
-                out.append((head + b"\r\n\r\n" + body).decode(
-                    errors="replace"))
+            out.extend(self._extract_sip())
+            if want and any(m.startswith(want) for m in out):
+                return out
         return out
 
     @staticmethod
@@ -212,39 +257,42 @@ class Probe:
         return (f'Algorithm=MD5, username="{user}", realm="{realm}", '
                 f'nonce="{nonce}", uri="{uri}", response="{resp}"')
 
-    # ── main flow ─────────────────────────────────────────────────────
+    # ── one full call cycle (one phase) ───────────────────────────────
 
-    def run(self) -> bool:
-        self.results = {"401_auth_challenge": False,
-                        "200_ok_media": False,
-                        "rtp_rx": False,
-                        "bye_from_asterisk": False}
+    def _run_call(self, phase: str, exten: str, expect_media: bool):
+        self._phase = phase
+        self._reset_call(exten)
+        res = {"401_auth_challenge": False,
+               "200_ok_media": False,
+               "rtp_rx": False,
+               "bye_from_asterisk": False}
 
         # 1. anonymous INVITE -> 401
         self._send_invite()
-        msgs = self._drain_sip(time.time() + 5)
+        msgs = self._drain_sip(time.time() + 5, want="SIP/2.0 401")
         m401 = next((m for m in msgs if m.startswith("SIP/2.0 401")), "")
         if not m401:
-            print("--- expected 401 challenge, got:")
+            print(f"--- phase {phase}: expected 401 challenge, got:")
             for m in msgs[:2]:
                 print(m[:400])
-            return self._report()
-        self.results["401_auth_challenge"] = True
+            return res, self.rtp_rx
+        res["401_auth_challenge"] = True
 
-        # 2. authenticated INVITE -> 200 OK + SDP
+        # 2. authenticated INVITE -> 200 OK + SDP (early return -> fast ACK)
         chal = re.search(r"WWW-Authenticate: (.*)", m401).group(1).strip()
         self._send_invite(self._digest("INVITE", self.uri, chal,
                                        "tg-bridge", self.secret))
-        msgs = self._drain_sip(time.time() + self.timeout)
+        msgs = self._drain_sip(time.time() + self.timeout,
+                               want="SIP/2.0 200")
         m200 = next((m for m in msgs
                      if m.startswith("SIP/2.0 200") and "m=audio" in m),
                     "")
         if not m200:
-            print("--- expected 200 OK with media, got:")
+            print(f"--- phase {phase}: expected 200 OK with media, got:")
             for m in msgs[:3]:
                 print(m)
-            return self._report()
-        self.results["200_ok_media"] = True
+            return res, self.rtp_rx
+        res["200_ok_media"] = True
 
         # parse remote media addr:port from the answer SDP
         body = m200.split("\r\n\r\n", 1)[1]
@@ -256,57 +304,112 @@ class Probe:
         self._send_ack()
 
         # 3+4. media phase: stream ulaw silence, collect RTP, await BYE
-        self._media_phase()
-        return self._report()
+        self._media_phase(expect_media, res)
+        rtp_count = self.rtp_rx
+        if not expect_media:
+            # the nocal path writes no audio frames; rtp_rx is not a
+            # criterion, only reported
+            del res["rtp_rx"]
+        return res, rtp_count
 
-    def _media_phase(self) -> None:
+    def _media_phase(self, expect_media: bool, res: dict[str, bool]) -> None:
         assert self.peer_rtp
         deadline = time.time() + self.timeout
         seq, ssrc = 0, secrets.randbelow(2 ** 31)
         silence = b"\xff" * 160  # 20 ms of ulaw silence
         byed = False
+        bye_grace = 0.0  # after BYE: brief drain for in-flight RTP
         last_send = 0.0
-        while time.time() < deadline and not (byed and self.rtp_rx > 0):
-            now = time.time()
-            if now - last_send >= 0.02:  # 50 pps
-                hdr = struct.pack("!BBHII", 0x80, 0, seq & 0xFFFF, 0, ssrc)
-                self.rtp.sendto(hdr + silence, self.peer_rtp)
-                seq += 1
-                last_send = now
-            try:
-                data, _ = self.rtp.recvfrom(1500)
-                if len(data) >= 12 and data[0] & 0x60 == 0x80:
-                    self.rtp_rx += 1
-            except socket.timeout:
-                pass
-            for m in self._drain_sip(deadline):
-                if m.startswith("BYE "):
-                    byed = True
-                    self._send_bye_ok(m)
-        self.results["rtp_rx"] = self.rtp_rx > 0
-        self.results["bye_from_asterisk"] = byed
+        # Short 20 ms socket timeouts -> a true 50 pps send loop with
+        # prompt BYE detection (the old blocking 0.5 s recvfrom degraded
+        # the loop to ~1 pps).
+        self.sip.settimeout(0.02)
+        self.rtp.settimeout(0.02)
+        try:
+            while time.time() < deadline:
+                now = time.time()
+                if now - last_send >= 0.02:
+                    hdr = struct.pack("!BBHII", 0x80, 0, seq & 0xFFFF,
+                                      0, ssrc)
+                    self.rtp.sendto(hdr + silence, self.peer_rtp)
+                    seq += 1
+                    last_send = now
+                try:
+                    data, _ = self.rtp.recvfrom(1500)
+                    # RTP v2 header: top two bits = version (10). The old
+                    # check `data[0] & 0x60 == 0x80` was always False
+                    # (0x60 & 0x80 == 0) and counted nothing.
+                    if len(data) >= 12 and data[0] & 0xC0 == 0x80:
+                        self.rtp_rx += 1
+                except socket.timeout:
+                    pass
+                try:
+                    data, _ = self.sip.recvfrom(65535)
+                    self.sip_buf += data
+                    for m in self._extract_sip():
+                        if m.startswith("BYE "):
+                            byed = True
+                            self._send_bye_ok(m)
+                except socket.timeout:
+                    pass
+                if byed:
+                    if not bye_grace:
+                        bye_grace = time.time() + 0.5
+                    if time.time() >= bye_grace:
+                        break
+        finally:
+            self.sip.settimeout(0.5)
+            self.rtp.settimeout(0.5)
+        res["rtp_rx"] = self.rtp_rx > 0
+        res["bye_from_asterisk"] = byed
+
+    # ── main flow ─────────────────────────────────────────────────────
+
+    def run(self) -> bool:
+        # Phase A: media target — proves the return RTP path
+        res_a, rtp_a = self._run_call("A", self.media_exten,
+                                      expect_media=True)
+        self.phase_results.append(
+            (f"A (media, exten {self.media_exten})", res_a, rtp_a))
+        # let Asterisk release the channel before the next dialog
+        time.sleep(1.0)
+        # Phase B: production shape, nocal teardown — no media expected.
+        # b_exten (not self.exten): phase A's _reset_call overwrote it.
+        res_b, rtp_b = self._run_call("B", self.b_exten, expect_media=False)
+        self.phase_results.append(
+            (f"B (nocal, exten {self.b_exten})", res_b, rtp_b))
+        return self._report()
 
     def _report(self) -> bool:
         print()
         print("=== E2E SIP probe results ===")
         ok = True
-        for name, got in self.results.items():
-            print(f"  {'PASS' if got else 'FAIL'}: {name}")
-            ok = ok and got
-        print(f"  incoming RTP packets: {self.rtp_rx}")
+        for label, res, rtp_count in self.phase_results:
+            print(f"  Phase {label}:")
+            for name, got in res.items():
+                print(f"    {'PASS' if got else 'FAIL'}: {name}")
+                ok = ok and got
+            if "rtp_rx" in res:
+                print(f"    RTP packets received: {rtp_count}")
+            else:
+                print(f"    RTP packets received: {rtp_count} "
+                      f"(not a criterion on the nocal path — it writes "
+                      f"no audio frames)")
         print("=== " + ("ALL PASS" if ok else "FAILURES PRESENT") + " ===")
         return ok
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="E2E SIP probe for the SimBridge PJSIP leg")
+        description="E2E SIP probe for the SimBridge PJSIP leg (two-phase)")
     ap.add_argument("--gsm-ip", required=True,
                     help="GSM node tailnet IP (Asterisk SIP target)")
     ap.add_argument("--secret", required=True,
                     help="SIMBRIDGE_BRIDGE_SECRET (shared SIP credential)")
+    ap.add_argument("--media-exten", default="778",
+                    help="phase A target — silence playback, media path")
     ap.add_argument("--exten", default="777",
-                    help="dummy extension — never dialed (nocal branch)")
+                    help="phase B target — production shape, nocal branch")
     ap.add_argument("--local-ip", default="",
                     help="advertised source IP in Via/Contact/SDP "
                          "(default: $SIMBRIDGE_NODE_TAILSCALE_IP, then "
@@ -314,7 +417,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=20.0,
                     help="media-phase window in seconds")
     a = ap.parse_args()
-    probe = Probe(a.gsm_ip, a.secret, a.exten, a.timeout, a.local_ip)
+    probe = Probe(a.gsm_ip, a.secret, a.exten, a.media_exten, a.timeout,
+                  a.local_ip)
     return 0 if probe.run() else 1
 
 

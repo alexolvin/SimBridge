@@ -110,6 +110,33 @@ Scope: Full repository — `main` branch at HEAD.
 
 **Verification**: `tests/test_s06_wiring.py::TestPjsipBind` — distributed+IP → `bind=<tailscale-ip>` and no `0.0.0.0` in the output; distributed without IP → `SystemExit(1)`; single node → `bind=127.0.0.1`.
 
+### Inbound SIP Auth: Anonymous INVITEs 401 Against the Artificial Endpoint (by design, verified 2026-08-19)
+
+The `tg-bridge` endpoint requires digest auth (see voice-bridge.md,
+PJSIP Endpoint). Two auth behaviors observed on the live node are
+**correct PJSIP 18 behavior, not defects** — documented so a future
+operator does not "fix" them:
+
+- An unauthenticated INVITE logs `No matching endpoint found for
+  <ip>:<port> using_auth_username=0` and is challenged (401) against
+  the **artificial** (anonymous) endpoint. `using_auth_username` is
+  set only when a global `endpoint_identifier_order` is configured;
+  SimBridge deliberately does not configure one — endpoint
+  identification must stay explicit, not IP-based.
+- The bridge itself is identified **via its Authorization header**,
+  not its From user: the generated endpoint carries
+  `identify_by=username,ip,auth_username`. With the default
+  `username,ip` the bridge's authenticated INVITE (From user ≠ AOR
+  name) would be misidentified and 401'd *despite correct
+  credentials* (root-caused 2026-08-19 via `core set debug 3`,
+  res_pjsip_authenticator_digest.c). Regression test:
+  `tests/test_call_control.py::TestPjsipConfig::test_identify_by_includes_auth_username`.
+
+Consequence for monitoring: the 401-storm NOTICE lines from the
+artificial endpoint on the tailnet are the auth working as designed
+(scanned/anonymous traffic being rejected); they are not a credential
+failure.
+
 ### `/health` Endpoints Are Unauthenticated (documented scope decision)
 
 Both nodes' `/health` endpoints accept unauthenticated requests: the response is operational state (component health, counters, session state) — no secrets, no control surface. They bind to the tailnet/loopback only (see bind rules above) and are consumed by the peer's health checker. Documented here so the choice is a decision, not an accident.
