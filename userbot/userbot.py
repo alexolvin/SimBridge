@@ -139,7 +139,9 @@ class Userbot:
             phone = None
             text = None
 
-            if evt.is_reply_to and evt.reply_to_msg_id:
+            # Telethon 1.44: NewMessage proxies unknown attributes to
+            # evt.message; Message has is_reply (no is_reply_to).
+            if evt.is_reply and evt.reply_to_msg_id:
                 # Reply to an incoming SMS — get the number from the message
                 reply_to = await evt.get_reply_message()
                 if reply_to:
