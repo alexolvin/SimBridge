@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from core.config import load_config, ConfigError, DotDict
+from core.config import load_config, ConfigError, DotDict, resolve_userbot_url
 from core.audit import AuditLogger
 from core.acl import ACLManager
 from core.ratelimit import RateLimiter
@@ -302,6 +302,31 @@ paths:
         finally:
             for env in _ALL_SECRET_ENVS:
                 os.environ.pop(env, None)
+
+
+# =========================================================================
+# TS01-4b — userbot URL resolution (two-node topology)
+# =========================================================================
+
+class TestResolveUserbotUrl:
+    """The event-forwarding URL must be agent.userbot_url, NOT the
+    local userbot_http.listen — on a gsm-role node the listen address
+    is dead (regression: 2026-08-21 the voicemail sweep used it and
+    every run was connection-refused while the userbot was up)."""
+
+    def test_prefers_agent_userbot_url(self):
+        assert resolve_userbot_url({
+            "agent": {"userbot_url": "http://10.0.0.2:8088"},
+            "userbot_http": {"listen": "10.0.0.1:8088"},
+        }) == "http://10.0.0.2:8088"
+
+    def test_all_in_one_falls_back_to_local_listen(self):
+        assert resolve_userbot_url({
+            "userbot_http": {"listen": "10.0.0.1:8088"},
+        }) == "http://10.0.0.1:8088"
+
+    def test_missing_keys_default_to_localhost(self):
+        assert resolve_userbot_url({}) == "http://127.0.0.1:8088"
 
 
 # =========================================================================

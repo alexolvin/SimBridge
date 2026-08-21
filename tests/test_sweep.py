@@ -98,8 +98,13 @@ def _age(path: Path, seconds: int) -> None:
     os.utime(path, (past, past))
 
 
-def _write_config(tmp_path: Path, rec_dir: Path, listen: str) -> Path:
-    """A minimal valid simbridge.yaml (same shape as tests/conftest.py)."""
+def _write_config(tmp_path: Path, rec_dir: Path, userbot_url: str) -> Path:
+    """A minimal valid simbridge.yaml (same shape as tests/conftest.py).
+
+    Two-node shape: userbot_http.listen is a DEAD local address; the
+    userbot actually lives at agent.userbot_url (regression 2026-08-21:
+    the sweep used the local listen and got connection refused).
+    """
     prompt = REPO / "sounds" / "vm-prompt.ulaw"
     content = f"""\
 node:
@@ -116,12 +121,12 @@ telegram:
 agent:
   listen: "127.0.0.1:8090"
   token_env: SIMBRIDGE_AGENT_TOKEN
-  userbot_url: http://127.0.0.1:8088
+  userbot_url: {userbot_url}
   allowed_peers:
     - "127.0.0.1"
 
 userbot_http:
-  listen: "{listen}"
+  listen: "127.0.0.1:8088"
   secret_env: SIMBRIDGE_HTTP_SECRET
   allowed_peers:
     - "127.0.0.1"
@@ -194,7 +199,8 @@ class TestSweepRetention:
         old.write_bytes(b"RIFF-fake")
         _age(old, 2000)  # >= sweep_max_retain_seconds (1000)
 
-        r = _run_sweep(monkeypatch, _write_config(tmp_path, rec, capture.listen))
+        r = _run_sweep(monkeypatch,
+                       _write_config(tmp_path, rec, f"http://{capture.listen}"))
         assert r.returncode == 0, r.stderr
         assert not old.exists()
         assert capture.requests == []  # deleted, never forwarded
@@ -208,8 +214,9 @@ class TestSweepRetention:
         mid.write_bytes(b"RIFF-fake")
         _age(mid, 500)  # >= max_age (300), < retain (1000)
 
-        # 127.0.0.1:1 — userbot unreachable, the forward must fail
-        r = _run_sweep(monkeypatch, _write_config(tmp_path, rec, "127.0.0.1:1"))
+        # http://127.0.0.1:1 — userbot unreachable, the forward must fail
+        r = _run_sweep(monkeypatch,
+                       _write_config(tmp_path, rec, "http://127.0.0.1:1"))
         assert r.returncode == 0, r.stderr
         assert mid.exists()
 
@@ -222,13 +229,15 @@ class TestSweepRetention:
         young.write_bytes(b"RIFF-fake")
         _age(young, 100)  # < max_age (300)
 
-        r = _run_sweep(monkeypatch, _write_config(tmp_path, rec, "127.0.0.1:1"))
+        r = _run_sweep(monkeypatch,
+                       _write_config(tmp_path, rec, "http://127.0.0.1:1"))
         assert r.returncode == 0, r.stderr
         assert young.exists()
 
     def test_missing_recordings_dir_is_a_clean_noop(self, tmp_path, monkeypatch):
         r = _run_sweep(monkeypatch,
-                       _write_config(tmp_path, tmp_path / "nope", "127.0.0.1:1"))
+                       _write_config(tmp_path, tmp_path / "nope",
+                                     "http://127.0.0.1:1"))
         assert r.returncode == 0, r.stderr
 
     @pytest.mark.skipif(not HAVE_FFMPEG,
@@ -236,14 +245,20 @@ class TestSweepRetention:
     def test_successful_forward_deletes_file(self, tmp_path, monkeypatch,
                                              capture):
         """12 s of audio, an 8.444 s greeting -> 3.556 s of speech >=
-        3 s -> a normal multipart voice note; the file is consumed."""
+        3 s -> a normal multipart voice note; the file is consumed.
+
+        Doubles as the two-node regression test: userbot_http.listen in
+        the config is a dead local address, so the sweep must resolve
+        the userbot via agent.userbot_url (2026-08-21: it used the
+        local listen and every run was connection-refused)."""
         rec = tmp_path / "recordings"
         rec.mkdir()
         wav = rec / "vm-ok.wav"
         _make_wav(wav, seconds=12.0)
         _age(wav, 500)
 
-        r = _run_sweep(monkeypatch, _write_config(tmp_path, rec, capture.listen))
+        r = _run_sweep(monkeypatch,
+                       _write_config(tmp_path, rec, f"http://{capture.listen}"))
         assert r.returncode == 0, r.stderr
         assert not wav.exists()  # consumed on success
         (req,) = capture.requests

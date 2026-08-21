@@ -372,3 +372,28 @@ def load_config(path: Optional[str] = None) -> DotDict:
 def redact_config(cfg: DotDict) -> dict:
     """Return config dict with secrets replaced by ``<env:NAME>``."""
     return _redact(cfg)
+
+
+def resolve_userbot_url(cfg: dict) -> str:
+    """Base URL of the userbot HTTP API this node POSTs events to.
+
+    Two-node topology: on a gsm-role node the userbot lives on the
+    PEER telegram node — ``agent.userbot_url`` holds that peer's
+    address, while the local ``userbot_http.listen`` is a dead address
+    (live incidents: 2026-08-18 SMS forwards aimed at the node's own
+    IP; 2026-08-21 voicemail sweep refused on the same address while
+    the userbot was up). All-in-one fallback (no ``agent.userbot_url``):
+    the local ``userbot_http.listen`` — the userbot on this node.
+
+    Single resolution mechanism (Rule 1) for consumers with the
+    "legacy fallback" contract: the globals generator (USERBOT_URL)
+    and the voicemail sweep. Consumers with a stricter contract (the
+    agent must know the userbot to run, the health probe must report
+    it) read ``agent.userbot_url`` directly.
+    """
+    agent = cfg.get("agent") or {}
+    url = agent.get("userbot_url") or ""
+    if url:
+        return url
+    listen = (cfg.get("userbot_http") or {}).get("listen") or "127.0.0.1:8088"
+    return f"http://{listen}"

@@ -36,6 +36,7 @@ import yaml
 # run as `python .../scripts/generate_asterisk_config.py` only scripts/
 # is on sys.path, so add the app root explicitly (stdlib-only import).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.config import resolve_userbot_url  # noqa: E402
 from core.voicemail_forward import ffprobe_duration  # noqa: E402
 
 OUTPUT_HEADER = """\
@@ -113,12 +114,11 @@ def generate(config: dict, output_path: str) -> None:
     # node — this node's own userbot_http.listen is a dead local
     # address (live incident 2026-08-18: SMS forwards aimed at the
     # node's own IP).
-    userbot_url = (config.get("agent", {}) or {}).get("userbot_url", "")
-    userbot_listen = config.get("userbot_http", {}).get("listen", "127.0.0.1:8088")
-    if not userbot_url:
+    # Rule 1: one URL resolution for all consumers (core.config).
+    userbot_url = resolve_userbot_url(config)
+    if not (config.get("agent", {}) or {}).get("userbot_url"):
         # Legacy config without agent.userbot_url: assume all-in-one
         # (userbot on this node).
-        userbot_url = f"http://{userbot_listen}"
         print(f"WARNING: agent.userbot_url missing — falling back to the "
               f"local userbot_http.listen ({userbot_url}); on a gsm-role "
               f"node set agent.userbot_url to the peer node's address")

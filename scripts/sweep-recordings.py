@@ -51,7 +51,7 @@ if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
 from core import voicemail_forward as vfm  # noqa: E402
-from core.config import ConfigError, load_config  # noqa: E402
+from core.config import ConfigError, load_config, resolve_userbot_url  # noqa: E402
 
 DEFAULT_MAX_AGE_SECONDS = 300
 # S03.3: bounded retention for un-forwarded recordings (7 days).
@@ -81,9 +81,12 @@ def main() -> int:
     # match the AGI path exactly (0.0 if the prompt is absent/broken).
     prompt_path = cfg.get("asterisk.prompt", "")
     prompt_duration = vfm.ffprobe_duration(prompt_path) if prompt_path else 0.0
-    # Same key the generator uses for USERBOT_URL — on the GSM node
-    # this is the userbot node's address (two-node topology).
-    url = "http://" + cfg["userbot_http.listen"]
+    # Same URL the generator publishes as USERBOT_URL (Rule 1 —
+    # core.config.resolve_userbot_url). On a gsm-role node the userbot
+    # lives on the PEER telegram node; the local userbot_http.listen
+    # is a dead address there (live incident 2026-08-21: every sweep
+    # run refused on the node's own IP while the userbot was up).
+    url = resolve_userbot_url(cfg)
     secret_env = cfg.get("userbot_http.secret_env", "SIMBRIDGE_HTTP_SECRET")
     secret = os.environ.get(secret_env, "")
 
