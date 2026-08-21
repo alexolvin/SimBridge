@@ -102,12 +102,13 @@ def create_http_server(
         phone = sms_event.phone_number
 
         if is_ring:
-            name = contacts.resolve(phone) if contacts else None
-            formatted_text = (
-                f"📞 Входящий звонок: {name} ({phone})"
-                if name
-                else f"📞 Входящий звонок: {phone}"
-            )
+            # No Telegram text on RING: the bridge's native
+            # incoming-call banner on the user's own account already
+            # signals the call, so the duplicate "Входящий звонок"
+            # line was removed at user request (2026-08-21). The
+            # event is still audited (kind=ring,
+            # outcome=suppressed).
+            formatted_text = None
         else:
             # S02.1: the sender number is ALWAYS part of the message
             # (legacy parity — "SMS +7...: text"); the contact name is
@@ -127,11 +128,19 @@ def create_http_server(
         )
 
         # Deliver to the audience. Per-user isolation: one failing
-        # recipient must not break the rest.
+        # recipient must not break the rest. A RING has nothing to
+        # deliver (suppressed above) — the audience is still computed
+        # and audited, but no message is sent.
         audience = sorted(acl.users_with_right("in_call" if is_ring else "in_sms"))
         delivered: list[int] = []
         failed: list[int] = []
-        if client is None:
+        if formatted_text is None:
+            logger.info(
+                "RING from %s: text notification suppressed "
+                "(native TG incoming-call banner already signals the call)",
+                phone,
+            )
+        elif client is None:
             logger.warning(
                 "SMS event accepted but no Telethon client is wired — not delivered"
             )
@@ -150,7 +159,9 @@ def create_http_server(
         if metrics is not None and not is_ring:
             metrics.sms_incoming()
 
-        if delivered and not failed:
+        if formatted_text is None:
+            outcome = "suppressed"
+        elif delivered and not failed:
             outcome = "ok"
         elif delivered:
             outcome = "partial"

@@ -99,7 +99,11 @@ class TestEventsSms:
         assert kw["details"]["kind"] == "sms"
         assert kw["details"]["delivered_to"] == [111]
 
-    def test_ring_goes_to_in_call_audience(self, tmp_path):
+    def test_ring_is_audited_but_not_sent(self, tmp_path):
+        """RING: no Telegram text — the bridge's native incoming-call
+        banner on the user's own account already signals the call, so
+        the duplicate "Входящий звонок" line was removed at user
+        request (2026-08-21). The event stays audited."""
         tg = FakeClient()
         client, audit = _make_env(
             tmp_path, client=tg,
@@ -112,10 +116,15 @@ class TestEventsSms:
             headers={"X-SimBridge-Secret": SECRET},
         )
         assert r.status_code == 200
-        assert tg.sent == [(222, "📞 Входящий звонок: +79261234555")]
+        body = r.json()
+        assert tg.sent == []
+        assert body["formatted_text"] is None
+        assert body["delivered_to"] == []
         etype, kw = audit.calls[0]
         assert etype == EventType.SMS_RECEIVED
+        assert kw["outcome"] == "suppressed"
         assert kw["details"]["kind"] == "ring"
+        assert kw["details"]["audience"] == [222]
 
     def test_per_user_isolation_partial_failure(self, tmp_path):
         """One failing recipient must not break the rest (D2)."""
