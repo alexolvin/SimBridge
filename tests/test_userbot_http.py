@@ -317,6 +317,47 @@ class TestEventsVoicemail:
         assert etype == EventType.VOICEMAIL_EARLY_HANGUP
         assert kw["details"]["has_audio"] is False
 
+    def test_urlencoded_early_hangup_event(self, tmp_path):
+        """The sender's text-only shape (core.voicemail_forward
+        post_form): urlencoded body, no file.
+
+        Regression 2026-08-21: the sender used JSON, which
+        req.form() parses as an EMPTY form — the event was
+        misdelivered as "normal" from "unknown" with no audio."""
+        tg = FakeClient()
+        client, audit = _make_env(tmp_path, client=tg)
+        r = client.post(
+            "/events/voicemail",
+            data={
+                "phone_number": "+79261234555",
+                "voicemail_type": "early_hangup",
+                "correlation_id": "corr-vm-2",
+                "duration": "8.24",
+            },
+            headers={"X-SimBridge-Secret": SECRET},
+        )
+        assert r.status_code == 200
+        assert tg.sent == [(222, "📞 Звонок — +79261234555")]
+        assert tg.files == []
+        etype, kw = audit.calls[0]
+        assert etype == EventType.VOICEMAIL_EARLY_HANGUP
+        assert kw["correlation_id"] == "corr-vm-2"
+
+    def test_json_body_rejected_415(self, tmp_path):
+        """A JSON body would parse to an empty form and be silently
+        misdelivered as "normal" — refuse it loudly instead so the
+        sender keeps the recording for the next retry (2026-08-21)."""
+        tg = FakeClient()
+        client, _ = _make_env(tmp_path, client=tg)
+        r = client.post(
+            "/events/voicemail",
+            json={"phone_number": "+79261234555",
+                  "voicemail_type": "early_hangup"},
+            headers={"X-SimBridge-Secret": SECRET},
+        )
+        assert r.status_code == 415
+        assert tg.sent == []
+
     def test_recording_missing_is_text_only(self, tmp_path):
         tg = FakeClient()
         client, audit = _make_env(tmp_path, client=tg)

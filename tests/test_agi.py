@@ -39,6 +39,7 @@ import sys
 import threading
 import wave
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -352,7 +353,10 @@ class TestTgVoiceAgi:
         assert final.startswith("200 forwarded type=recording_missing"), final
         (req,) = http_server.captured
         assert req["path"] == "/events/voicemail"
-        payload = json.loads(req["body"])
+        assert req["headers"]["Content-Type"] == (
+            "application/x-www-form-urlencoded")
+        payload = {k: v[0] for k, v in
+                   parse_qs(req["body"].decode("utf-8")).items()}
         assert payload["voicemail_type"] == "recording_missing"
         assert payload["correlation_id"] == "test-unique-1"
         assert payload["phone_number"] == "+79000000000"
@@ -377,9 +381,13 @@ class TestTgVoiceAgi:
 
     @pytest.mark.skipif(not HAVE_FFMPEG,
                         reason="ffmpeg/ffprobe not available")
-    def test_early_hangup_is_text_only_json(self, http_server, tmp_path):
+    def test_early_hangup_is_text_only_form(self, http_server, tmp_path):
         """S03.1: 1 s under the threshold is a greeting fragment +
-        silence — a text-only JSON event, never an audio upload."""
+        silence — a text-only form event, never an audio upload.
+
+        Regression 2026-08-21: the event used to be sent as JSON,
+        which the userbot's req.form() parses as an EMPTY form —
+        delivered as "normal" from "unknown" with no audio."""
         wav = tmp_path / "vm-test.wav"
         _make_wav(wav, seconds=1.0)
         final, _ = run_agi(
@@ -392,8 +400,10 @@ class TestTgVoiceAgi:
         assert final.startswith("200 forwarded type=early_hangup"), final
         assert not wav.exists()  # consumed on success
         (req,) = http_server.captured
-        assert req["headers"]["Content-Type"] == "application/json"
-        payload = json.loads(req["body"])
+        assert req["headers"]["Content-Type"] == (
+            "application/x-www-form-urlencoded")
+        payload = {k: v[0] for k, v in
+                   parse_qs(req["body"].decode("utf-8")).items()}
         assert payload["voicemail_type"] == "early_hangup"
         assert payload["phone_number"] == "+79000000000"
         assert payload["correlation_id"] == "test-unique-2"

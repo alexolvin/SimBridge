@@ -132,7 +132,7 @@ class TestForwardRecording:
     def test_missing_file_reports_recording_missing(self, tmp_path, monkeypatch):
         posts: list[tuple] = []
         monkeypatch.setattr(
-            vfm, "post_json",
+            vfm, "post_form",
             lambda url, secret, path, payload: (
                 posts.append((path, payload)) or (True, "HTTP 200")),
         )
@@ -157,19 +157,20 @@ class TestForwardRecording:
             "duration": "0.0",
         }
 
-    def test_zero_audio_reports_early_hangup_json(self, tmp_path, monkeypatch):
+    def test_zero_audio_reports_early_hangup_form(self, tmp_path, monkeypatch):
         wav = tmp_path / "empty.wav"
         wav.write_bytes(b"")
         posts: list[dict] = []
         monkeypatch.setattr(vfm, "ffprobe_duration", lambda p: 0.0)
         monkeypatch.setattr(
-            vfm, "post_json",
+            vfm, "post_form",
             lambda url, secret, path, payload: (
                 posts.append(payload) or (True, "HTTP 200")),
         )
 
         def no_multipart(*a, **k):
-            raise AssertionError("zero-audio recording must be reported as JSON")
+            raise AssertionError(
+                "zero-audio recording must be reported as a text-only form")
 
         monkeypatch.setattr(vfm, "post_multipart", no_multipart)
 
@@ -223,16 +224,16 @@ class TestForwardRecording:
         assert 'name="file"' in body
         assert "RIFF-fake" in body  # the file bytes are in the body
 
-    def test_early_hangup_with_prompt_reports_json_no_audio(self, tmp_path, monkeypatch):
+    def test_early_hangup_with_prompt_reports_form_no_audio(self, tmp_path, monkeypatch):
         """S03.1: speech under the threshold is a greeting fragment +
-        silence — text-only JSON, never an audio upload."""
+        silence — text-only form event, never an audio upload."""
         wav = tmp_path / "vm.wav"
         wav.write_bytes(b"RIFF-fake")
         posts: list[dict] = []
         # 11.0 s total, 8.4445 s greeting -> 2.5555 s speech < 3
         monkeypatch.setattr(vfm, "ffprobe_duration", lambda p: 11.0)
         monkeypatch.setattr(
-            vfm, "post_json",
+            vfm, "post_form",
             lambda url, secret, path, payload: (
                 posts.append(payload) or (True, "HTTP 200")),
         )

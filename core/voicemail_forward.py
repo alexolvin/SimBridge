@@ -12,8 +12,8 @@ Used by both trigger paths:
 Pipeline (preserved from the old tg-voice-forward.sh, plus fixes):
   1. ffprobe the duration
   2. classify: missing file -> "recording_missing"; zero audio
-     (duration 0) -> "early_hangup" reported as JSON (a 0-second voice
-     note is useless in Telegram); speech time (recording duration
+     (duration 0) -> "early_hangup" reported text-only (a 0-second
+     voice note is useless in Telegram); speech time (recording duration
      minus the greeting, S03.1) < early_hangup_max_seconds ->
      "early_hangup" reported as TEXT ONLY — by definition the audio is
      a greeting fragment plus under-threshold silence, there is no
@@ -25,8 +25,11 @@ Pipeline (preserved from the old tg-voice-forward.sh, plus fixes):
      is trimmed from the front (S03.1: MixMonitor starts before
      Playback, so the prompt is captured at the head of the WAV) —
      stated choice: trim, not accept
-  4. multipart POST /events/voicemail to the userbot with the
-     X-SimBridge-Secret header
+  4. POST /events/voicemail to the userbot — multipart form-data
+     (with audio) or urlencoded (text-only events) — with the
+     X-SimBridge-Secret header. The handler parses both with
+     req.form(); a JSON body would parse to an EMPTY form and be
+     silently misdelivered (live incident 2026-08-21).
   5. cleanup is the CALLER's decision (AGI and sweeper both delete
      the recording on success, keep it on failure so the next
      trigger can retry)
@@ -37,11 +40,11 @@ python3. All subprocess calls use argument vectors — no shell.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -168,11 +171,19 @@ def _post(url: str, secret: str, path: str, data: bytes,
         return False, str(e)
 
 
-def post_json(url: str, secret: str, path: str, payload: dict) -> tuple[bool, str]:
+def post_form(url: str, secret: str, path: str, fields: dict) -> tuple[bool, str]:
+    """POST text-only event fields as urlencoded form data.
+
+    The userbot handler parses every voicemail event with
+    ``req.form()`` — one mechanism: multipart/form-data (with audio)
+    or urlencoded (without). A JSON body parses to an EMPTY form
+    there, so every field silently falls back to its default (live
+    incident 2026-08-21: an early_hangup event was delivered as
+    "normal" from "unknown" with no audio)."""
     return _post(
         url, secret, path,
-        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        "application/json",
+        urllib.parse.urlencode(fields).encode("utf-8"),
+        "application/x-www-form-urlencoded",
     )
 
 
@@ -202,12 +213,12 @@ def _report_missing_or_empty(recording_path: str, caller: str,
                              correlation: str, url: str, secret: str,
                              duration: float,
                              vm_type: str) -> tuple[bool, str, str]:
-    """JSON-only voicemail event (no file): missing file, or a recording
-    with zero audio (caller hung up before speaking)."""
+    """Text-only voicemail event (no file, no audio): missing file,
+    or a recording with zero audio (caller hung up before speaking)."""
     log(f"WARNING: {vm_type} for {correlation} "
         f"(file={'present' if os.path.isfile(recording_path) else 'absent'}, "
         f"duration={duration}s)")
-    ok, detail = post_json(url, secret, "/events/voicemail", {
+    ok, detail = post_form(url, secret, "/events/voicemail", {
         "phone_number": caller,
         "voicemail_type": vm_type,
         "correlation_id": correlation,

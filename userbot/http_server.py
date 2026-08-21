@@ -195,7 +195,10 @@ def create_http_server(
     async def handle_voicemail_event(req: Request):
         """Receive voicemail from Asterisk hook (tg-voice-forward.sh).
 
-        Expects multipart form-data:
+        Expects form data (parsed with req.form()):
+        - multipart/form-data: normalized audio (opus/ogg) + fields;
+        - application/x-www-form-urlencoded: fields only (text-only
+          events — early_hangup / recording_missing).
         - file: normalized audio (opus/ogg)
         - phone_number: caller E.164 number
         - voicemail_type: "normal" | "early_hangup" | "recording_missing"
@@ -222,7 +225,18 @@ def create_http_server(
         if allowed_peers and client_host not in allowed_peers:
             raise HTTPException(status_code=403, detail="IP not allowed")
 
-        # Parse multipart form-data
+        # Contract with the sender (core.voicemail_forward): multipart
+        # (with audio) or urlencoded (text-only). Any other content
+        # type (e.g. JSON) would parse to an EMPTY form and be
+        # silently misdelivered as "normal" from "unknown" — live
+        # incident 2026-08-21. Refuse loudly: the sender keeps the
+        # recording (or retries the event) on the next run.
+        content_type = req.headers.get("content-type", "")
+        if not (content_type.startswith("multipart/form-data")
+                or content_type.startswith("application/x-www-form-urlencoded")):
+            raise HTTPException(status_code=415, detail="Unsupported content type")
+
+        # Parse form data (multipart with audio / urlencoded text-only)
         form = await req.form()
         audio_file = form.get("file")
         phone_number = form.get("phone_number", "unknown")
