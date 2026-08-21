@@ -914,9 +914,24 @@ async def call_complete(
             await _notify_userbot_call(cfg, call=call, status=req.status)
             registry.cleanup(call_id)
         else:
-            # cancelled / ended: the TG user hung up while the GSM leg
-            # was dialing (channel death) — close. No notification: the
-            # user ended the call themselves.
+            # cancelled / ended: the TG user hung up (or the GSM leg
+            # died) — close. No notification: the user ended the call
+            # themselves. Defensively hang up any surviving leg via
+            # AMI (no-op if the dialplan already tore it down): the
+            # bridge sends BYE when the TG leg ends, the originating
+            # channel dies and app_dial drops the GSM leg — but if
+            # either step is missed, the GSM channel would stay up
+            # until the remote party hangs up first.
+            for channel_id in call.get_active_channel_ids():
+                try:
+                    await ami.hangup_channel(channel_id, reason="BYE")
+                except Exception as e:
+                    audit.log(
+                        EventType.CALL_HANGUP,
+                        correlation_id=call_id,
+                        outcome="partial_hangup",
+                        details={"error": str(e), "channel": channel_id},
+                    )
             if not registry.hangup(call_id, reason="telegram_hangup"):
                 raise HTTPException(
                     status_code=409,

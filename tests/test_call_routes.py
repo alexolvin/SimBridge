@@ -521,6 +521,28 @@ class TestCallCompleteOutgoing:
         assert capture.captured == []
         assert registry.get(call_id) is None
 
+    def test_cancelled_hangs_up_surviving_legs(self, env, capture):
+        """The TG user hung up while the call was in progress, but the
+        registry never reached BRIDGED (no "answered" POST): the
+        surviving legs must be hung up via AMI, otherwise the GSM
+        channel stays up until the remote party hangs up first."""
+        client, registry, audit, ami, app, _ = env
+        call_id = self._dial(client)
+        # The target answered; the GSM leg is up (Dial connected).
+        registry.get(call_id).gsm_channel_id = "Dongle/gsm-1"
+        r = client.post(
+            f"/v1/call/{call_id}/complete", headers=_auth(),
+            json={"status": "cancelled", "dialstatus": "CANCELLED"},
+        )
+        assert r.status_code == 200
+        # Both tracked legs (GSM + bridge) got an AMI hangup — a no-op
+        # for whichever already died, the actual teardown for the
+        # survivor.
+        assert ami.hangup_channel.await_count == 2
+        assert _audits(audit, EventType.CALL_HANGUP)[0]["outcome"] == "cancelled"
+        assert capture.captured == []
+        assert registry.get(call_id) is None
+
     def test_bridged_ended_hangs_up_legs(self, env, capture):
         client, registry, audit, ami, app, _ = env
         call_id = self._dial(client)
