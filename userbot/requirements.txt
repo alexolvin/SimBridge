@@ -4,3 +4,7 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 httpx>=0.25.0
 pyyaml>=6.0
+# /events/voicemail parses the multipart upload via req.form() —
+# starlette needs python-multipart at runtime. Live incident 2026-08-21:
+# absent from the venv built from this file, every forward was a 500.
+python-multipart>=0.0.7
