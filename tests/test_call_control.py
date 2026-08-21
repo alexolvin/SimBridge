@@ -923,7 +923,7 @@ class TestStage04Dialplan:
     def test_tg_bridge_context_exists_with_outgoing_leg(self):
         ctx = self._context("tg-bridge")
         assert "AGI(notify-agent-agi.py,outgoing-accepted)" in ctx
-        assert "Dial(Dongle/${MODEM_ID}/${EXTEN}," \
+        assert "Dial(Dongle/${MODEM_ID}/+${EXTEN}," \
                "${OUTBOUND_GSM_RING_SECONDS})" in ctx
         # the h-exten closes the call state when the SIP leg dies
         assert "exten => h,1," in ctx

@@ -61,5 +61,5 @@ class TestBridgeSelection:
         Stage 04 reaches it on Dial NOANSWER — only that DIALSTATUS
         (bridge-down / reject / caller-cancel hang up, no voicemail)."""
         assert "named, same-context branch" in self.doc
-        assert 'GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)' in self.doc
+        assert 'GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail,1)' in self.doc
         assert "unchanged fallback target" in self.doc

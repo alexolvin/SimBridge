@@ -434,9 +434,9 @@ python3 scripts/generate_asterisk_config.py /etc/simbridge/simbridge.yaml
   `/v1/call/{id}/accept|reject|hangup`, `/v1/call/check-timeouts`
 - `scripts/notify-agent-agi.py` — AGI-мост dialplan ⇄ agent
   (incoming / outgoing-accepted / complete, DIALSTATUS-карта)
-- Dialplan: входящие — `Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})`
+- Dialplan: входящие — `Dial(PJSIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})`
   + voicemail на NOANSWER; исходящие — контекст `[tg-bridge]` с
-  nocal-гейтом и `Dial(Dongle/${MODEM_ID}/${EXTEN})`
+  nocal-гейтом и `Dial(Dongle/${MODEM_ID}/+${EXTEN})`
 - PJSIP-эндпоинт `tg-bridge` **генерируется** из `simbridge.yaml`
   (`scripts/generate_asterisk_config.py -p`; ручной `pjsip.conf.example`
   убран — один механизм, Rule 1)

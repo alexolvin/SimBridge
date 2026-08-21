@@ -120,12 +120,12 @@ each direction uses the party that already knows its own timeout.
 ```
 GSM caller ──► chan_dongle [incoming-mobile/s]
     │  1. AGI incoming → agent /v1/call/incoming (register, TELEGRAM_RINGING)
-    │  2. Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})
+    │  2. Dial(PJSIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})
     │       └─► PJSIP endpoint → bridge → Telegram call to the user
     │           GSM channel stays UNANSWERED — the GSM caller hears
     │           real carrier ringback, not a local tone
     │  3. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
-    │  4. GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)
+    │  4. GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail,1)
     └─► Hangup()
 ```
 
@@ -161,7 +161,7 @@ Asterisk [tg-bridge] context, EXTEN = target
     │       └─ 200 → SET VARIABLE CALL_ID <id>
     │          404 → CALL_ID stays empty (nocal gate below)
     │  3. GotoIf($["${CALL_ID}" = ""]?nocal)     ← the nocal gate
-    │  4. Dial(Dongle/${MODEM_ID}/${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
+    │  4. Dial(Dongle/${MODEM_ID}/+${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
     │       └─ the TG user hears the target's REAL ringback
     │          (the two-party bridge passes in-band ringback)
     │  5. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
@@ -361,7 +361,8 @@ Asterisk (GSM node) ──► chan_dongle ──► GSM Network (target)
 
 The voicemail branch is a **named, same-context branch** `voicemail`
 inside `[incoming-mobile]`, entered with `GotoIf($["${DIALSTATUS}" =
-"NOANSWER"]?voicemail)` after the Stage 04 `Dial`. It is the single,
+"NOANSWER"]?voicemail,1)` after the Stage 04 `Dial` (exten,priority
+target — a bare word is a label of the calling exten). It is the single,
 **unchanged fallback target** of the Stage 04 state machine (Rule 4:
 the Stage 03 voicemail behavior is preserved byte-for-byte; Stage 04
 only adds the `Dial` in front of it).
@@ -378,10 +379,10 @@ chan_dongle (incoming-mobile/s)
     ├── AGI(tg-blacklist-agi.py)          → BL_BLOCKED → Busy(5)
     ├── AGI(tg-sms-agi.py, ring)          → Telegram in_call audience
     ├── AGI(notify-agent-agi.py,incoming) → agent registers the call
-    ├── Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})
+    ├── Dial(PJSIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})
     │       accept → auto-answer + bridge; reject → BUSY; timeout → NOANSWER
     ├── AGI(notify-agent-agi.py,complete) → agent records the outcome
-    └── GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)
+    └── GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail,1)
             │
             ├── Answer()
             ├── Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)

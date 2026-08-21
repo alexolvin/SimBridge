@@ -389,9 +389,9 @@ class TestVoicemailFallback:
         order = [
             "AGI(tg-sms-agi.py,ring)",
             "AGI(notify-agent-agi.py,incoming,${CALLER})",
-            "Dial(SIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})",
+            "Dial(PJSIP/${BRIDGE_ENDPOINT},${RING_WAIT_SECONDS})",
             "AGI(notify-agent-agi.py,complete,${DIALSTATUS})",
-            'GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail)',
+            'GotoIf($["${DIALSTATUS}" = "NOANSWER"]?voicemail,1)',
             "Answer()",
             "Set(VMFILE=${VM_REC_DIR}/vm-${UNIQUEID}.wav)",
             "MixMonitor(${VMFILE})",
@@ -412,10 +412,11 @@ class TestVoicemailFallback:
         h-exten resolves there)."""
         assert "exten => voicemail,1," in self.section
         # one and only one entry point (dialplan lines, not comments):
-        # either Goto(voicemail,1) or a GotoIf whose target is voicemail
+        # the GotoIf whose target is voicemail,1 (exten,priority — a
+        # bare word is a label of the calling exten and would fail)
         lines = [l for l in self.section.splitlines()
                  if not l.strip().startswith(";")]
-        assert sum(("Goto(voicemail,1)" in l) or ("?voicemail)" in l)
+        assert sum(("Goto(voicemail,1)" in l) or ("?voicemail,1)" in l)
                    for l in lines) == 1
 
     def test_prompt_duration_is_published_as_channel_var(self):
@@ -425,7 +426,9 @@ class TestVoicemailFallback:
 
     def test_blacklisted_caller_gets_busy(self):
         """Blacklisted numbers get Busy(5), not the voicemail path."""
-        assert 'GotoIf($["${BL_BLOCKED}" = "1"]?blacklisted)' in self.section
+        # the voice-path GotoIf targets the `blacklisted` exten
+        # explicitly (exten,1 — a bare word is a label lookup)
+        assert 'GotoIf($["${BL_BLOCKED}" = "1"]?blacklisted,1)' in self.section
         assert "Busy(5)" in self.section
 
 
