@@ -760,6 +760,30 @@ class TestRenderModulesConf:
         i_chan = txt.index("chan_pjsip.so")
         assert i_feat < i_mix < i_chan
 
+    def test_outbound_authenticator_loaded(self):
+        # 2026-08-21 (3p14-aaa): res_pjsip_authenticator_digest.so
+        # registers only the INBOUND authenticator (the bridge
+        # authenticating to Asterisk). Answering a 401 challenge on
+        # Asterisk's OWN outbound INVITEs — which the bridge sends
+        # (Design E, pjsip.conf outbound_auth=) — requires the SEPARATE
+        # res_pjsip_outbound_authenticator_digest.so (verified in the
+        # 18.26.4 source: its load_module calls
+        # ast_sip_register_outbound_authenticator(); the inbound one
+        # only calls ast_sip_register_authenticator). Without it
+        # res_pjsip cannot respond to the challenge ("No SIP outbound
+        # authenticator registered"), Dial(PJSIP/tg-bridge) dies in
+        # ~100 ms and the caller hears "busy" — both user incoming-test
+        # attempts on 2026-08-21 (11:29, 11:48 MSK) failed exactly this
+        # way while Test #1 (inbound to Asterisk) passed.
+        m = "res_pjsip_outbound_authenticator_digest.so"
+        assert m in install.AST_MODULES_LOAD
+        txt = install._render_modules_conf(set(install.AST_MODULES_LOAD))
+        i_res = txt.index("load = res_pjsip.so")
+        i_in = txt.index("load = res_pjsip_authenticator_digest.so")
+        i_out = txt.index(f"load = {m}")
+        # must come after res_pjsip (its hard dependency)
+        assert i_res < i_in < i_out
+
 
 class TestWriteModulesConf:
     def test_backs_up_and_marks_changed(self, tmp_path, monkeypatch,

@@ -186,6 +186,18 @@ AST_MODULES_LOAD = (
     "res_pjsip_endpoint_identifier_ip.so",
     "res_pjsip_endpoint_identifier_user.so",
     "res_pjsip_authenticator_digest.so",  # pjsip.conf auth_type=userpass
+    # INBOUND digest authenticator (the bridge authenticating to us).
+    # The OUTBOUND one — answering a 401 challenge on OUR outbound
+    # INVITEs — is a SEPARATE module upstream (verified in the
+    # 18.26.4 source: load_module calls
+    # ast_sip_register_outbound_authenticator(); the inbound module
+    # above only calls ast_sip_register_authenticator). Without it
+    # res_pjsip cannot respond to the bridge's 401 (Design E: pjsip.conf
+    # sets outbound_auth=) — "No SIP outbound authenticator registered",
+    # Dial(PJSIP/tg-bridge) dies in ~100 ms and the caller hears "busy".
+    # Live 2026-08-21, 3p14-aaa: both user incoming-test attempts
+    # (11:29, 11:48) failed exactly this way.
+    "res_pjsip_outbound_authenticator_digest.so",
     "res_pjsip_nat.so",                   # pjsip comedia NAT traversal
                                           # (built into Asterisk 18; the
                                           # legacy nat_option key is gone)
