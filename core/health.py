@@ -74,6 +74,12 @@ class HealthStatus:
         }
 
 
+# Sentinel: a check method passed this fetches the modem status
+# itself. check_all pre-fetches once and passes the shared result
+# (or the fetch exception) to both checks that need it.
+_FETCH_STATUS = object()
+
+
 class HealthChecker:
     """Run health checks against live components.
 
@@ -87,12 +93,15 @@ class HealthChecker:
         self._ami = ami
         self._cfg = cfg
 
-    async def check_asterisk(self) -> ComponentStatus:
+    async def check_asterisk(self, status: Any = _FETCH_STATUS) -> ComponentStatus:
         """Check if Asterisk AMI is reachable."""
         if self._ami is None:
             return ComponentStatus("asterisk", healthy=False, detail="no AMI client")
         try:
-            status = await self._ami.get_modem_status()
+            if status is _FETCH_STATUS:
+                status = await self._ami.get_modem_status()
+            elif isinstance(status, BaseException):
+                raise status
             return ComponentStatus(
                 "asterisk", healthy=True, detail=f"AMI connected, dongle={status.get('device', 'unknown')}"
             )
@@ -101,12 +110,15 @@ class HealthChecker:
         except OSError as e:
             return ComponentStatus("asterisk", healthy=False, detail=f"AMI error: {e}")
 
-    async def check_modem(self) -> ComponentStatus:
+    async def check_modem(self, status: Any = _FETCH_STATUS) -> ComponentStatus:
         """Check if dongle is registered to a network."""
         if self._ami is None:
             return ComponentStatus("modem", healthy=False, detail="no AMI client")
         try:
-            status = await self._ami.get_modem_status()
+            if status is _FETCH_STATUS:
+                status = await self._ami.get_modem_status()
+            elif isinstance(status, BaseException):
+                raise status
             registered = status.get("registered", False)
             signal = status.get("signal_percent")
             operator = status.get("operator", "unknown")
@@ -228,10 +240,23 @@ class HealthChecker:
         # Synchronous check (always true if we can run this code)
         status.components.append(self.check_agent_process())
 
+        # Fetch the modem status once and share it between the
+        # asterisk and modem checks — both need the same
+        # DongleShowDevices result; two concurrent AMI round trips for
+        # one piece of data was a duplicate mechanism. A fetch failure
+        # is passed through (the exception) so each check reports its
+        # own error message without re-querying.
+        modem_status: Any = _FETCH_STATUS
+        if self._ami is not None:
+            try:
+                modem_status = await self._ami.get_modem_status()
+            except BaseException as exc:  # noqa: BLE001 — pass through to checks
+                modem_status = exc
+
         # Async checks — run concurrently
         async_checks = [
-            self.check_asterisk(),
-            self.check_modem(),
+            self.check_asterisk(modem_status),
+            self.check_modem(modem_status),
             self.check_peer_node(),
             self.check_bridge(),
         ]

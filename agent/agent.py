@@ -22,7 +22,7 @@ from core.blacklist import BlacklistManager
 from core.sms_correlation import SMSCorrelationStore
 from core.call_control import CallRegistry
 from core.acl import ACLManager
-from core.modem import ModemPool, SingleModemProvider
+from core.modem import ModemPool, SingleModemProvider, is_broken
 from core.logging_config import setup_logging, set_correlation
 from core.metrics import MetricsCollector
 from core.health import HealthChecker
@@ -49,6 +49,27 @@ def modem_alert_rule(message: str) -> str:
     without instantiating a watchdog.
     """
     return "modem_recovery" if "recovered" in message else "dongle_offline"
+
+
+def make_modem_check(provider, modem_id: str):
+    """Build the watchdog health check for one modem (S06.2).
+
+    The watchdog recovers a broken device, not a busy one: busy states
+    (CALL_BUSY/SMS_BUSY/BUSY) and INITIALIZING are normal operation — a
+    "reset" (AMI reconnect) mid-call would drop the active call's event
+    stream, and a registering modem has not failed. is_available() must
+    not be used here: it conflates "cannot take new work" with "broken".
+    Before the first poll the state is the constructor default (OFFLINE),
+    not a device report — not a failure either (boot grace).
+
+    Kept as a factory (not an inline closure) so the production wiring
+    is unit-testable without booting the app.
+    """
+    async def modem_check() -> bool:
+        if not provider.has_observed(modem_id):
+            return True
+        return not is_broken(provider.get_info(modem_id))
+    return modem_check
 
 
 @asynccontextmanager
@@ -235,12 +256,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.call_registry = call_registry
 
-    # S06.2: modem watchdog — if the modem stays unavailable for
-    # max_resets consecutive checks, attempt a reset and alert on the
-    # outcome. The poller owns state detection; the watchdog owns
-    # recovery (see agent.py honesty report on the reset mechanism).
-    async def modem_check() -> bool:
-        return modem_provider.is_available(dongle_id)
+    # S06.2: modem watchdog — if the modem stays in a broken state
+    # (OFFLINE/ERROR) for max_resets consecutive checks, attempt a
+    # reset and alert on the outcome. The poller owns state
+    # detection; the watchdog owns recovery (see agent.py honesty
+    # report on the reset mechanism). Check semantics: busy is not
+    # broken, unobserved is not failed (make_modem_check).
+    modem_check = make_modem_check(modem_provider, dongle_id)
 
     async def modem_reset() -> None:
         # The only reset verified to exist in this repo: AMI reconnect.

@@ -366,6 +366,75 @@ class TestModemWatchdog:
             assert reset_count >= 1
         asyncio.get_event_loop().run_until_complete(_run())
 
+    def test_boot_grace_and_busy_do_not_reset(self):
+        """Production wiring (make_modem_check): before the first poll the
+        default OFFLINE state is not a failure (boot grace), and CALL_BUSY
+        during an active call is not a failure — neither may trigger a
+        reset (a "reset" mid-call would drop the active call)."""
+        async def _run():
+            from core.modem import SingleModemProvider
+            from agent.agent import make_modem_check
+            provider = SingleModemProvider(modem_id="gsm", device="gsm")
+            check_count = 0
+            reset_count = 0
+            base_check = make_modem_check(provider, "gsm")
+
+            async def counting_check():
+                nonlocal check_count
+                check_count += 1
+                return await base_check()
+
+            async def reset_fn():
+                nonlocal reset_count
+                reset_count += 1
+
+            wd = ModemWatchdog(
+                check_fn=counting_check, reset_fn=reset_fn,
+                label="gsm", check_interval=0.02, max_resets=2,
+            )
+            await wd.start()
+            await asyncio.sleep(0.15)  # several checks, no observation yet
+            assert check_count >= 3
+            provider.update_state("gsm", registered=True, signal_percent=100)
+            provider.set_call_active("gsm", True)  # active call -> CALL_BUSY
+            await asyncio.sleep(0.15)  # several checks during the "call"
+            wd.stop()
+            assert reset_count == 0
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_observed_offline_does_reset(self):
+        """A real observation (poll answered, device entry gone) is a
+        failure: max_resets consecutive broken checks still trigger the
+        reset."""
+        async def _run():
+            from core.modem import SingleModemProvider
+            from agent.agent import make_modem_check
+            provider = SingleModemProvider(modem_id="gsm", device="gsm")
+            provider.mark_offline("gsm")  # observation: device is gone
+            check_count = 0
+            reset_count = 0
+            base_check = make_modem_check(provider, "gsm")
+
+            async def counting_check():
+                nonlocal check_count
+                check_count += 1
+                return await base_check()
+
+            async def reset_fn():
+                nonlocal reset_count
+                reset_count += 1
+
+            wd = ModemWatchdog(
+                check_fn=counting_check, reset_fn=reset_fn,
+                label="gsm", check_interval=0.02, max_resets=2,
+            )
+            await wd.start()
+            await asyncio.sleep(0.3)
+            wd.stop()
+            assert check_count >= 2
+            assert reset_count >= 1
+        asyncio.get_event_loop().run_until_complete(_run())
+
 
 # =========================================================================
 # TS06-OBS-07 — HealthChecker (no AMI)
@@ -386,4 +455,68 @@ class TestHealthCheckerNoAMI:
             asterisk = [c for c in status.components if c.name == "asterisk"]
             assert len(asterisk) == 1
             assert asterisk[0].healthy is False
+        asyncio.get_event_loop().run_until_complete(_run())
+
+
+# =========================================================================
+# TS06-OBS-07b — HealthChecker: single shared modem-status fetch
+# =========================================================================
+
+class TestHealthCheckerSharedFetch:
+    """check_all must fetch the modem status exactly once and share it
+    between the asterisk and modem checks. Previously each check made its
+    own DongleShowDevices round trip — two concurrent AMI calls for one
+    piece of data (duplicate mechanism)."""
+
+    @staticmethod
+    def _checker(status=None, exc=None, calls=None):
+        class FakeAMI:
+            async def get_modem_status(self):
+                if calls is not None:
+                    calls.append(1)
+                if exc is not None:
+                    raise exc
+                return status
+        return HealthChecker(ami=FakeAMI(), cfg=None), (calls if calls is not None else [])
+
+    def test_check_all_fetches_once(self):
+        async def _run():
+            calls = []
+            checker, _ = self._checker(
+                status={"device": "gsm", "registered": True,
+                        "signal_percent": 80, "operator": "test"},
+                calls=calls,
+            )
+            result = await checker.check_all()
+            assert len(calls) == 1
+            by_name = {c.name: c for c in result.components}
+            assert by_name["asterisk"].healthy is True
+            assert by_name["modem"].healthy is True
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_check_all_fetch_failure_shared(self):
+        async def _run():
+            calls = []
+            checker, _ = self._checker(exc=ConnectionError("ami down"), calls=calls)
+            result = await checker.check_all()
+            # One failed fetch is shared — not retried per check.
+            assert len(calls) == 1
+            by_name = {c.name: c for c in result.components}
+            assert by_name["asterisk"].healthy is False
+            assert "connection failed" in by_name["asterisk"].detail
+            assert by_name["modem"].healthy is False
+            assert "AMI down" in by_name["modem"].detail
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_individual_checks_still_self_fetch(self):
+        async def _run():
+            calls = []
+            checker, _ = self._checker(
+                status={"device": "gsm", "registered": True,
+                        "signal_percent": 80, "operator": "test"},
+                calls=calls,
+            )
+            await checker.check_asterisk()
+            await checker.check_modem()
+            assert len(calls) == 2
         asyncio.get_event_loop().run_until_complete(_run())

@@ -58,6 +58,20 @@ ONLINE_STATES = {
     ModemState.CALL_BUSY,
 }
 
+# States that indicate a broken device worth a recovery attempt.
+# Busy states (CALL_BUSY/SMS_BUSY/BUSY) and INITIALIZING are normal
+# operation, NOT broken: "recovering" mid-call (e.g. an AMI
+# reconnect) would drop the active call's event stream, and a
+# registering modem has not failed yet. is_available() must not be
+# used as a health signal — it conflates "cannot take new work"
+# with "broken".
+BROKEN_STATES = {ModemState.OFFLINE, ModemState.ERROR}
+
+
+def is_broken(info: Optional[ModemInfo]) -> bool:
+    """Whether a modem state warrants a recovery attempt (watchdog)."""
+    return info is not None and info.state in BROKEN_STATES
+
 
 @dataclass
 class ModemInfo:
@@ -166,6 +180,12 @@ class SingleModemProvider(ModemProvider):
         )
         self._sms_active = False
         self._call_active = False
+        # True once the device has produced its first observation
+        # (update_state or mark_offline). Before that, the state is
+        # the constructor default (OFFLINE), not a device report —
+        # consumers like the watchdog must not treat it as a failure
+        # (boot grace).
+        self._observed = False
 
     def get_info(self, modem_id: str) -> Optional[ModemInfo]:
         if modem_id != self._modem_id:
@@ -183,6 +203,18 @@ class SingleModemProvider(ModemProvider):
         info = self.get_info(modem_id)
         return info.state in AVAILABLE_STATES if info else False
 
+    def has_observed(self, modem_id: str) -> bool:
+        """Whether the device has produced at least one observation.
+
+        Before the first poll the state is the constructor default
+        (OFFLINE), not a device report — a watchdog must not count
+        it as a failure (boot grace).
+        """
+        if modem_id != self._modem_id:
+            return False
+        with self._lock:
+            return self._observed
+
     def update_state(
         self,
         modem_id: str,
@@ -194,6 +226,7 @@ class SingleModemProvider(ModemProvider):
         if modem_id != self._modem_id:
             return False
         with self._lock:
+            self._observed = True
             self._info.registered = registered
             if signal_percent is not None:
                 self._info.signal_percent = signal_percent
@@ -225,6 +258,7 @@ class SingleModemProvider(ModemProvider):
         if modem_id != self._modem_id:
             return False
         with self._lock:
+            self._observed = True
             self._info.registered = False
             self._info.signal_percent = None
             self._info.operator = None
