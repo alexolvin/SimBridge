@@ -18,9 +18,11 @@ Pipeline (preserved from the old tg-voice-forward.sh, plus fixes):
      "early_hangup" reported as TEXT ONLY — by definition the audio is
      a greeting fragment plus under-threshold silence, there is no
      caller content in it; else "normal"
-  3. ffmpeg loudnorm (I=-16:LRA=11:TP=-1.5, 48000 Hz mono, libopus 32k
-     — production parity with tg-voice-forward.sh; knowledge item 6:
-     Telegram voice notes are too quiet without normalization),
+  3. ffmpeg loudnorm, two-pass (measure then apply; I=-14:LRA=11:
+     TP=-1.5, 48000 Hz mono, libopus 32k — production parity with
+     tg-voice-forward.sh; knowledge item 6: Telegram voice notes are
+     too quiet without normalization; -14 is the "loud voice note"
+     target, single-pass is the fallback when measurement fails),
      fallback libvorbis/ogg, fallback the original file. The greeting
      is trimmed from the front (S03.1: MixMonitor starts before
      Playback, so the prompt is captured at the head of the WAV) —
@@ -40,7 +42,10 @@ python3. All subprocess calls use argument vectors — no shell.
 
 from __future__ import annotations
 
+import json
+import math
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -53,8 +58,22 @@ HTTP_TIMEOUT = 30.0
 PROBE_TIMEOUT = 15.0
 ENCODE_TIMEOUT = 120.0
 
-# loudnorm recipe (knowledge item 6): normalize speech to -16 LUFS
-LOUDNORM = "loudnorm=I=-16:LRA=11:TP=-1.5"
+# loudnorm recipe (knowledge item 6): normalize speech to a loud,
+# consistent voice-note level. Target -14 LUFS, not the -16 default:
+# -16 was measured correctly on the wire but reported "very quiet" on
+# the phone (2026-08-21); -14 is the documented "louder" streaming
+# target. TP=-1.5 keeps clipping headroom, LRA=11 keeps dynamics.
+LOUDNORM_TARGET_I = "-14"
+LOUDNORM_TARGET_LRA = "11"
+LOUDNORM_TARGET_TP = "-1.5"
+LOUDNORM = (
+    f"loudnorm=I={LOUDNORM_TARGET_I}"
+    f":LRA={LOUDNORM_TARGET_LRA}:TP={LOUDNORM_TARGET_TP}"
+)
+# Integrated loudness (dB) at/below which the content is digital
+# silence / noise floor — the measured values would be unusable, so the
+# two-pass path falls back to single-pass instead of amplifying hiss.
+LOUDNORM_SILENCE_FLOOR = -70.0
 # Audio params: production parity with tg-voice-forward.sh
 # (libopus 32k, 48000 Hz, mono — standard Telegram voice note shape)
 AUDIO_RATE = "48000"
@@ -116,17 +135,18 @@ def classify(duration: float, prompt_duration: float,
 
 
 def _ffmpeg(input_path: str, codec: str, output_path: str,
-            seek_seconds: float = 0.0) -> bool:
+            seek_seconds: float = 0.0, af: str = LOUDNORM) -> bool:
     """ffmpeg loudnorm to *output_path* with *codec* (arg vector, no shell).
 
     ``seek_seconds`` input-seeks before reading — used to trim the
-    greeting from the front of the recording (S03.1).
+    greeting from the front of the recording (S03.1). ``af`` is the
+    filter chain (single- or two-pass loudnorm, see _loudnorm_filter).
     """
     cmd = ["ffmpeg", "-y"]
     if seek_seconds > 0:
         cmd += ["-ss", f"{seek_seconds:.3f}"]
     cmd += ["-i", input_path,
-            "-af", LOUDNORM,
+            "-af", af,
             "-ar", AUDIO_RATE, "-ac", AUDIO_CHANNELS,
             "-c:a", codec, "-b:a", AUDIO_BITRATE, output_path]
     try:
@@ -134,6 +154,82 @@ def _ffmpeg(input_path: str, codec: str, output_path: str,
         return r.returncode == 0 and os.path.isfile(output_path)
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _measure_loudness(path: str, seek_seconds: float = 0.0) -> dict | None:
+    """Two-pass loudnorm, measurement pass: run the filter to null and
+    parse the JSON it prints to stderr.
+
+    Returns ``{"input_i", "input_tp", "input_lra", "offset"}`` as
+    floats, or None when ffmpeg fails or the JSON is missing — the
+    caller then keeps the single-pass recipe.
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-nostats"]
+    if seek_seconds > 0:
+        cmd += ["-ss", f"{seek_seconds:.3f}"]
+    cmd += ["-i", path,
+            "-af", LOUDNORM + ":print_format=json",
+            "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=ENCODE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for block in re.findall(r"\{[^{}]*\}", r.stderr):
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if "input_i" not in data:
+            continue
+        # The JSON key is "target_offset" (the filter's apply-pass
+        # option is named "offset" — the two are easy to mix up).
+        try:
+            return {
+                "input_i": float(data["input_i"]),
+                "input_tp": float(data["input_tp"]),
+                "input_lra": float(data["input_lra"]),
+                "offset": float(data["target_offset"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _loudnorm_filter(measured: dict | None) -> str:
+    """Filter chain for the apply pass: the plain single-pass recipe,
+    or the measured two-pass variant (accurate for dynamic speech).
+
+    Two-pass is used only with finite, usable measurements; ``linear``
+    (constant gain) is clipping-free only when the input true peak is
+    already below the target true peak.
+    """
+    if measured is None:
+        return LOUDNORM
+    values = (measured["input_i"], measured["input_lra"], measured["input_tp"])
+    if (not all(math.isfinite(v) for v in values)
+            or measured["input_i"] <= LOUDNORM_SILENCE_FLOOR):
+        return LOUDNORM
+    linear = measured["input_tp"] < float(LOUDNORM_TARGET_TP)
+    return (f"{LOUDNORM}:"
+            f"measured_I={measured['input_i']:.2f}:"
+            f"measured_LRA={measured['input_lra']:.2f}:"
+            f"measured_TP={measured['input_tp']:.2f}:"
+            f"offset={measured['offset']:.2f}:"
+            f"linear={'true' if linear else 'false'}")
+
+
+def _log_loudness(input_path: str, measured: dict | None,
+                  output_path: str) -> None:
+    """Log measured input and actual output loudness — the evidence
+    line for "is the sent voice note loud enough" (Rule 2)."""
+    out = _measure_loudness(output_path)
+    if measured is not None and out is not None:
+        log(
+            f"Loudness {input_path}: in I={measured['input_i']:.1f} "
+            f"TP={measured['input_tp']:.1f} -> out I={out['input_i']:.1f} "
+            f"TP={out['input_tp']:.1f}"
+        )
 
 
 def normalize_volume(input_path: str, temp_files: list[str],
@@ -148,9 +244,17 @@ def normalize_volume(input_path: str, temp_files: list[str],
     base = input_path[:-4] if input_path.endswith(".wav") else input_path
     opus, ogg = base + ".opus", base + ".ogg"
     temp_files.extend((opus, ogg))
-    if _ffmpeg(input_path, "libopus", opus, seek_seconds=prompt_duration):
+    # Two-pass: measure first (on the same trimmed span), then apply
+    # with the measured values — accurate for dynamic speech, where
+    # single-pass can miss the target by a few dB.
+    measured = _measure_loudness(input_path, seek_seconds=prompt_duration)
+    filt = _loudnorm_filter(measured)
+    if _ffmpeg(input_path, "libopus", opus,
+               seek_seconds=prompt_duration, af=filt):
+        _log_loudness(input_path, measured, opus)
         return opus
-    if _ffmpeg(input_path, "libvorbis", ogg, seek_seconds=prompt_duration):
+    if _ffmpeg(input_path, "libvorbis", ogg,
+               seek_seconds=prompt_duration, af=filt):
         return ogg
     log(f"ERROR: ffmpeg normalization failed for {input_path}, sending raw")
     return input_path
