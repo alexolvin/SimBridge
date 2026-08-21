@@ -1279,7 +1279,7 @@ userbot_http:
 asterisk:
   ari_url: http://127.0.0.1:8088/ari
   dongle: {s.dongle_name}
-  ring_wait_seconds: 15
+  ring_wait_seconds: 10
   max_record_seconds: 90
   early_hangup_max_seconds: 3
   sweep_max_age_seconds: 300
