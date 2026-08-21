@@ -1,23 +1,34 @@
-; SimBridge chan_dongle — example
-; Copy to /etc/asterisk/dongle_custom.conf and adapt.
+; SimBridge chan_dongle — example config
+; Copy to /etc/asterisk/dongle.conf and adapt device paths to your
+; udev symlinks. The Asterisk module reads /etc/asterisk/dongle.conf
+; (verified live: `dongle reload now` re-reads this file).
 ;
-; chan_dongle provides GSM modem support via libdongle.
-; Device paths should use udev symlinks, not /dev/ttyUSB* directly.
+; NOTE: the deployed production module is the wdoekes/asterisk-chan-
+; dongle fork (sqlite smsdb, at_poll_sms, AT+CPMS="SM" init). The
+; schema below matches the live production config (audio=/data=),
+; not the historical type=dongle/device_path schema from the
+; upstream libdongle examples.
 
-[globals]
-dongle_dir=/dev/dongle
-context=incoming-mobile
-dtmf_mode=1
-sms_mode=1
-call_mode=1
+[general]
+; Discovery loop poll interval, seconds
+interval=15
 
 ; ---------------------------------------------------------------------------
-; Modem definition — adjust device_path to match your udev rules
+; Modem definition — adjust audio=/data= to match your udev rules
 ; ---------------------------------------------------------------------------
 [gsm]
-type=dongle
-device_path=/dev/dongle/gsm0
-context=incoming-mobile
-sms_mode=1
-call_mode=1
-dtmf_mode=1
+; udev symlinks: voice (audio) and AT (data) ports of the modem
+audio = /dev/dongle_if1
+data = /dev/dongle_if2
+; Incoming calls land in this dialplan context
+context = incoming-mobile
+group = 1
+; Deliver incoming SMS as raw PDU (base64, channel variable SMS_BASE64)
+smsaspdu = yes
+; Delete each incoming SMS from the SIM right after it is read and
+; handed to the dialplan. The SIM has only 10 slots; without this the
+; storage fills up, the modem starts emitting +SMMEMFULL and the
+; carrier retransmits the stuck message in a 7-10 s loop (recurred
+; 2026-08-13/14/21). Trade-off: if the TG forward fails the SMS is
+; already deleted (maximally simple, per user requirement).
+autodeletesms = yes
