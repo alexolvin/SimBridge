@@ -835,12 +835,34 @@ def phase_gather() -> None:
         s.peer_ip = "127.0.0.1"
 
     info("", "--- ACL ---")
-    s.acl_ids = ask(
-        "Telegram user ID(s) (space-separated, e.g. 123456789; each gets admin access to all ops)",
-        required=True, default=s.acl_ids, key="acl_ids")
+    acl_default = s.acl_ids
+    while True:
+        s.acl_ids = ask(
+            "Telegram user ID(s) (space-separated, e.g. 123456789; each gets admin access to all ops)",
+            required=True, default=acl_default, key="acl_ids")
+        bad = _invalid_acl_tokens(s.acl_ids)
+        if not bad:
+            break
+        if _NONINTERACTIVE:
+            # Re-asking would return the same value — fail loudly so
+            # the orchestrator fixes the answers file (a non-numeric
+            # token would write a broken ACL line the parser rejects).
+            fail(f"acl_ids must be numeric Telegram user IDs; invalid: {', '.join(bad)}.", "")
+            sys.exit(1)
+        warn(f"  Telegram user IDs must be digits only; invalid: {', '.join(bad)}")
+        acl_default = ""
 
     if _NONINTERACTIVE:
         _validate_noninteractive()
+
+def _invalid_acl_tokens(acl_ids: str) -> List[str]:
+    """Non-numeric tokens in a space-separated Telegram user ID list.
+
+    Telegram user IDs are positive integers; a non-numeric token (a
+    username, a phone, a stray dash) would write a broken ACL line the
+    parser rejects, silently locking the user out.
+    """
+    return [t for t in acl_ids.split() if not t.isdigit()]
 
 def _validate_noninteractive() -> None:
     """Fail fast in non-interactive mode when required values are empty.
@@ -1208,7 +1230,12 @@ def _write_config() -> None:
     if s.install_type == "single":
         al, ul, vh = "127.0.0.1:8090", "127.0.0.1:8088", "127.0.0.1"
     else:
-        al = f"{s.own_ip}:8090"
+        # The agent runs on the GSM node. On a pure Telegram node the
+        # userbot reads agent.listen to reach the agent (userbot.py),
+        # so there it must be the PEER node's IP — on gsm/all-in-one
+        # the agent is local and listens on this node's own IP.
+        agent_ip = s.peer_ip if s.node_role == "telegram" else s.own_ip
+        al = f"{agent_ip}:8090"
         ul = f"{s.own_ip}:8088"
         vh = s.peer_ip
     # The agent POSTs delivery notifications to the userbot, which runs on
@@ -2703,8 +2730,15 @@ def _load_existing_config() -> None:
         info("Loaded existing AMI password.")
 
     # ── Network (agent.listen, allowed_peers) ──
+    # agent.listen is this node's own address only when the agent runs
+    # here (gsm/all-in-one). On a telegram-role node it points at the
+    # peer GSM node (the local userbot uses it to reach the agent), so
+    # it must not be mistaken for own_ip — userbot_http.listen (always
+    # this node's own IP) remains the fallback below.
+    node_role = yaml.get("node.role", "")
     agent_listen = yaml.get("agent.listen", "")
-    if agent_listen and ":" in agent_listen and not s.own_ip:
+    if (agent_listen and ":" in agent_listen and not s.own_ip
+            and node_role != "telegram"):
         s.own_ip = agent_listen.rsplit(":", 1)[0]
 
     userbot_listen = yaml.get("userbot_http.listen", "")

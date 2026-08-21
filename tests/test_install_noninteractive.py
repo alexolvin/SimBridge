@@ -424,6 +424,37 @@ class TestLoadExistingRole:
         install._load_existing_config()
         assert install.s.node_role == ""
 
+    def test_gsm_own_ip_from_agent_listen(self, tmp_path, monkeypatch,
+                                          ni_state):
+        # On a gsm node the agent is local — agent.listen is own_ip.
+        cfg = tmp_path / "simbridge.yaml"
+        cfg.write_text(
+            "node:\n  role: gsm\n  id: gsm-1\n"
+            "agent:\n  listen: \"10.0.0.1:8090\"\n"
+            "userbot_http:\n  listen: \"10.0.0.1:8088\"\n")
+        monkeypatch.setattr(install, "CONF_FILE", str(cfg))
+        monkeypatch.setattr(install, "ENV_FILE", str(tmp_path / "env"))
+        monkeypatch.setattr(install, "ACL_FILE", str(tmp_path / "acl.conf"))
+        install._load_existing_config()
+        assert install.s.own_ip == "10.0.0.1"
+
+    def test_telegram_own_ip_not_from_agent_listen(self, tmp_path,
+                                                   monkeypatch, ni_state):
+        # On a telegram node agent.listen points at the PEER gsm node
+        # (the local userbot uses it to reach the agent) — it must not
+        # be mistaken for own_ip. userbot_http.listen (always this
+        # node's own IP) is the fallback.
+        cfg = tmp_path / "simbridge.yaml"
+        cfg.write_text(
+            "node:\n  role: telegram\n  id: tg-1\n"
+            "agent:\n  listen: \"10.0.0.2:8090\"\n"
+            "userbot_http:\n  listen: \"10.0.0.1:8088\"\n")
+        monkeypatch.setattr(install, "CONF_FILE", str(cfg))
+        monkeypatch.setattr(install, "ENV_FILE", str(tmp_path / "env"))
+        monkeypatch.setattr(install, "ACL_FILE", str(tmp_path / "acl.conf"))
+        install._load_existing_config()
+        assert install.s.own_ip == "10.0.0.1"
+
 
 # ---------------------------------------------------------------------------
 # _chown_asterisk — POSIX chown (Path.chown is Windows-only; a live deploy
@@ -1190,3 +1221,102 @@ class TestPhaseStartRestartPolicy:
         install.phase_start()
         assert any("systemctl restart asterisk" in c for c in cmds)
         assert not any("core reload" in c for c in cmds)
+
+
+# ---------------------------------------------------------------------------
+# _invalid_acl_tokens (acl_ids validation)
+# ---------------------------------------------------------------------------
+
+class TestInvalidAclTokens:
+    """ACL entries are Telegram user IDs (positive integers). A
+    non-numeric token (username, phone, stray dash) would write a broken
+    ACL line the parser rejects — silently locking the user out."""
+
+    def test_all_digits_pass(self):
+        assert install._invalid_acl_tokens("123456789") == []
+        assert install._invalid_acl_tokens("123 456 789") == []
+
+    def test_empty_has_no_tokens(self):
+        # Empty input is handled by ask(required=True) elsewhere; the
+        # token check itself sees no tokens to reject.
+        assert install._invalid_acl_tokens("") == []
+        assert install._invalid_acl_tokens("   ") == []
+
+    def test_username_rejected(self):
+        assert install._invalid_acl_tokens("123 @user") == ["@user"]
+
+    def test_phone_rejected(self):
+        assert install._invalid_acl_tokens("+79267523624") == ["+79267523624"]
+
+    def test_hyphenated_rejected(self):
+        assert install._invalid_acl_tokens("123-456") == ["123-456"]
+
+    def test_preserves_order_and_duplicates(self):
+        assert install._invalid_acl_tokens("a b a") == ["a", "b", "a"]
+
+    def test_noninteractive_invalid_acl_exits(self, ni_state):
+        """An unattended install must fail loudly rather than write a
+        broken ACL line — re-asking would return the same value forever."""
+        install.s.install_type = "distributed"
+        install.s.node_role = "gsm"
+        install._ANSWERS = {
+            "node_id": "gsm-1",
+            "modem_model": "Quectel EC20",
+            "sim_phone": "+7926XXXXXXX",
+            "dongle_name": "gsm",
+            "ami_password": "",
+            "agent_token": "",
+            "bridge_secret": "",
+            "http_secret": "",
+            "own_ip": "100.64.0.2",
+            "peer_ip": "100.64.0.3",
+            "acl_ids": "123 @user",
+        }
+        with pytest.raises(SystemExit) as e:
+            install.phase_gather()
+        assert e.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# _write_config — agent.listen must point at the node where the agent
+# runs (the userbot reads it to reach the agent — userbot.py L109)
+# ---------------------------------------------------------------------------
+
+class TestWriteConfigAgentListen:
+    @staticmethod
+    def _patch_paths(tmp_path, monkeypatch):
+        for const, name in (("CONF_FILE", "simbridge.yaml"),
+                            ("ENV_FILE", "env"),
+                            ("ACL_FILE", "acl.conf"),
+                            ("BLACKLIST_FILE", "blacklist.txt")):
+            monkeypatch.setattr(install, const, str(tmp_path / name))
+
+    def _render(self, tmp_path, monkeypatch, role):
+        self._patch_paths(tmp_path, monkeypatch)
+        st = install.s
+        st.install_type = "distributed"
+        st.node_role = role
+        st.node_id = f"{role}-1"
+        st.own_ip = "10.0.0.1"
+        st.peer_ip = "10.0.0.2"
+        st.acl_ids = "123"
+        st.action = "install"
+        install._write_config()
+        return (tmp_path / "simbridge.yaml").read_text()
+
+    def test_gsm_agent_listens_on_own_ip(self, tmp_path, monkeypatch,
+                                         ni_state):
+        text = self._render(tmp_path, monkeypatch, role="gsm")
+        # Agent is local: own IP.
+        assert 'listen: "10.0.0.1:8090"' in text
+        assert 'listen: "10.0.0.1:8088"' in text
+        assert "10.0.0.2:8090" not in text
+
+    def test_telegram_agent_listen_is_peer_ip(self, tmp_path, monkeypatch,
+                                              ni_state):
+        text = self._render(tmp_path, monkeypatch, role="telegram")
+        # Agent runs on the PEER gsm node; the local userbot dials it.
+        assert 'listen: "10.0.0.2:8090"' in text
+        # userbot_http is local: still own IP.
+        assert 'listen: "10.0.0.1:8088"' in text
+        assert "10.0.0.1:8090" not in text
