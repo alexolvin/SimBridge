@@ -326,7 +326,16 @@ class Userbot:
                         },
                         timeout=10.0,
                     )
-            except httpx.HTTPError:
+            except httpx.HTTPError as e:
+                # The user gets a short message; the agent-side cause
+                # (connection refused, timeout, 5xx) goes to the log —
+                # without it the user sees "Сервис звонков недоступен"
+                # with nothing to diagnose (live incident 2026-08-20,
+                # Тест #1).
+                logger.exception(
+                    "outgoing call registration failed (agent_url=%s): %s",
+                    self._agent_url, e,
+                )
                 await evt.reply("Сервис звонков недоступен")
                 return
 
