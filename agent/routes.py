@@ -18,6 +18,7 @@ from core.audit import AuditLogger
 from core.events import EventType
 from core.ratelimit import RateLimiter
 from core.blacklist import BlacklistManager
+from core.phone import parse_destination
 from core.sms_correlation import SMSCorrelationStore, SMSRecord
 from core.errors import SMSErrorType, asterisk_sms_error_to_type
 from core.acl import ACLManager
@@ -171,14 +172,31 @@ async def send_sms(
     cfg = get_cfg(request)
     dongle = cfg.get("asterisk.dongle", "gsm")
 
+    # Strict validation (msg #48): the user-input whitelist is enforced
+    # here so a malformed destination is a 400, not a modem error.
+    # Internal extensions cannot receive SMS.
+    dest = parse_destination(req.to)
+    if dest is None or dest.is_internal:
+        audit.log(
+            EventType.SMS_SEND_REQUESTED,
+            telegram_user_id=req.telegram_user_id,
+            outcome="malformed",
+            correlation_id=correlation_id,
+            details={"to": req.to},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=SMSErrorType.NUMBER_MALFORMED_SMS.message,
+        )
+
     # S02.2: Check if destination is blacklisted
-    if blacklist.contains(req.to):
+    if blacklist.contains(dest.number):
         audit.log(
             EventType.SMS_SEND_REQUESTED,
             telegram_user_id=req.telegram_user_id,
             outcome="blacklisted",
             correlation_id=correlation_id,
-            details={"to": req.to},
+            details={"to": dest.number},
         )
         raise HTTPException(
             status_code=403,
@@ -186,7 +204,7 @@ async def send_sms(
         )
 
     # Rate limit check (keyed by telegram_user_id or destination)
-    limiter_key = f"sms:{req.telegram_user_id or req.to}"
+    limiter_key = f"sms:{req.telegram_user_id or dest.number}"
     if not limiter.allow(limiter_key):
         limit_val = cfg.get("limits.sms_per_hour", 30)
         audit.log(
@@ -194,7 +212,7 @@ async def send_sms(
             telegram_user_id=req.telegram_user_id,
             outcome="rate_limited",
             correlation_id=correlation_id,
-            details={"to": req.to, "limit": limit_val},
+            details={"to": dest.number, "limit": limit_val},
         )
         raise HTTPException(
             status_code=429,
@@ -204,7 +222,7 @@ async def send_sms(
     # S02.3: Create correlation record
     record = sms_store.create(
         telegram_user_id=req.telegram_user_id or 0,
-        phone_number=req.to,
+        phone_number=dest.number,
         text=req.text,
         telegram_message_id=req.telegram_message_id,
         modem_id=dongle,
@@ -216,7 +234,7 @@ async def send_sms(
         telegram_user_id=req.telegram_user_id,
         outcome="submitted",
         correlation_id=correlation_id,
-        details={"to": req.to, "sms_id": record.sms_id},
+        details={"to": dest.number, "sms_id": record.sms_id},
     )
 
     try:
@@ -224,7 +242,7 @@ async def send_sms(
         # back as SMS_REPORT_PAYLOAD on the delivery-report channel, so
         # the report exten correlates by ID instead of by SMS text
         # (inter-carrier reports often carry no usable text at all).
-        await ami.send_sms(req.to, req.text, payload=record.sms_id)
+        await ami.send_sms(dest.number, req.text, payload=record.sms_id)
         sms_store.mark_submitted(record.sms_id)
     except AMISendError as e:
         # Asterisk explicitly refused the send (not registered, SIM
@@ -268,7 +286,7 @@ async def send_sms(
         outcome="ok",
         correlation_id=correlation_id,
         modem_id=dongle,
-        details={"to": req.to, "sms_id": record.sms_id},
+        details={"to": dest.number, "sms_id": record.sms_id},
     )
 
     return SMSResponse(
@@ -676,16 +694,34 @@ async def call_outgoing(
         details={"to": req.phone_number},
     )
 
-    if blacklist.contains(req.phone_number):
+    # Strict validation (msg #48): only '+'+11-15 digits, '8'+11-15
+    # total, or a 3-4 digit internal extension — anything else is a 400.
+    dest = parse_destination(req.phone_number)
+    if dest is None:
+        audit.log(
+            EventType.CALL_REQUESTED,
+            telegram_user_id=req.telegram_user_id,
+            outcome="malformed",
+            details={"to": req.phone_number},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=SMSErrorType.NUMBER_MALFORMED_CALL.message,
+        )
+
+    if blacklist.contains(dest.number):
         raise HTTPException(
             status_code=403,
             detail=SMSErrorType.BLACKLISTED.message,
         )
     try:
         call = registry.create_outgoing(
-            callee_number=req.phone_number,
+            callee_number=dest.number,
             caller_number=f"user:{req.telegram_user_id or 0}",
             telegram_user_id=req.telegram_user_id,
+            # Internal extensions bridge to a PJSIP endpoint and never
+            # touch the GSM modem — no pool selection or reservation.
+            modem_required=not dest.is_internal,
         )
     except ModemBusyError as exc:
         # TS05-4: all-busy/offline must be a clear message, not a hang.
@@ -705,7 +741,7 @@ async def call_outgoing(
         telegram_user_id=req.telegram_user_id,
         outcome="ok",
         correlation_id=call.call_id,
-        details={"to": req.phone_number},
+        details={"to": dest.number},
     )
     return CallResponse(
         call_id=call.call_id,

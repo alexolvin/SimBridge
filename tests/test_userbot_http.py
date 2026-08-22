@@ -493,52 +493,65 @@ class TestEventsCall:
 
 
 # ---------------------------------------------------------------------------
-# Bare-number call request (S04.3) — the userbot-side entry point
+# Number-attempt dispatch (msg #48, 2026-08-22) — the userbot-side
+# entry point for outgoing calls
 # ---------------------------------------------------------------------------
 
-# userbot.userbot imports telethon at module level; the functions under
-# test (BARE_NUMBER_RE / extract_call_request) are pure and do not need
-# it. A stub module satisfies the import without installing telethon.
+# userbot.userbot imports telethon at module level; the function under
+# test (is_number_attempt) is pure and does not need it. A stub module
+# satisfies the import without installing telethon.
 import sys  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
 
 if "telethon" not in sys.modules:
     sys.modules["telethon"] = MagicMock(name="telethon")
 
-from userbot.userbot import extract_call_request  # noqa: E402
+from userbot.userbot import is_number_attempt  # noqa: E402
 
 
-class TestExtractCallRequest:
+class TestIsNumberAttempt:
+    """Dispatch rule (msg #48): a message whose stripped form starts
+    with a digit or '+' is a number ATTEMPT — the strict validator
+    (core.phone.parse_destination) then decides valid vs error. This
+    function only answers "did the user try to type a number?". Text
+    starting with a letter is never an attempt.
+
+    Replaces TestExtractCallRequest: the old bare-number regex
+    SILENCED short numbers (a PIN, an extension) and DIALED 8-10 digit
+    strings as foreign numbers; now every number-looking message gets
+    the validator's verdict.
+    """
+
     @pytest.mark.parametrize("text", [
         "+79261234555",
-        "79261234555",
+        "89261234555",
+        "79261234555",           # 7-prefix: attempt, rejected by the validator
         "+14155552671",
-        "  +79261234555  ",           # surrounding whitespace is stripped
-        "+7 (926) 123-45-55",         # spaces / parens / dashes
+        "  +79261234555  ",      # surrounding whitespace is stripped
+        "+7 (926) 123-45-55",    # formatted: attempt, rejected
         "+7-926-123-45-55",
+        "8989123456",            # 10-digit 8-prefix: attempt, rejected
+        "123",                   # 3 digits: attempt, VALID internal number
+        "1234",
+        "12345678",              # PIN-like: attempt, rejected (no false-positive call)
+        "1234567",               # 7 digits: attempt, rejected
+        "+1234567",
+        "123456789 extra",       # text after the number: attempt, rejected
+        "+79261234555: hi",      # other characters: attempt, rejected
+        "+79261234555@telegram",
+        "12.345.678",
+        "+",                     # bare plus: attempt, rejected
     ])
-    def test_bare_number_is_a_call_request(self, text):
-        assert extract_call_request(text) == text.strip()
-
-    def test_pin_like_code_is_a_false_positive(self):
-        """Documented trade-off (voice-bridge.md): an 8-digit numeric
-        string matches and rings that number. Pinned here so the
-        behavior change, if ever decided, is a conscious edit."""
-        assert extract_call_request("12345678") == "12345678"
+    def test_number_attempt(self, text):
+        assert is_number_attempt(text) is True
 
     @pytest.mark.parametrize("text", [
         None,
         "",
         "   ",
         "привет",
-        "+79261234555: hi",            # explicit-SMS form, not a call
-        "+79261234555: hi there",
-        "1234567",                     # 7 digits — below the 8-digit floor
-        "+1234567",
-        "123456789 extra",             # text after the number
-        "+79261234555@telegram",       # non-charset chars break the match
-        "12.345.678",
+        "Привет 2026",           # starts with a letter — plain text
         "тел: +79261234555",
     ])
-    def test_not_a_bare_number(self, text):
-        assert extract_call_request(text) is None
+    def test_not_a_number_attempt(self, text):
+        assert is_number_attempt(text) is False

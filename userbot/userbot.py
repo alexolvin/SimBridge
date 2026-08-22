@@ -30,7 +30,7 @@ from core.acl import ACLManager
 from core.audit import AuditLogger
 from core.contacts import ContactResolver
 from core.blacklist import BlacklistManager
-from core.phone import normalize_e164
+from core.phone import normalize_e164, parse_destination
 from core.events import EventType
 from core.errors import SMSErrorType
 from core.recovery import BackoffReconnector
@@ -50,26 +50,27 @@ EXPLICIT_NUMBER_RE = re.compile(
     r"^(\+?\d[\d\s\-\(\)]{6,}\d)\s*:\s*(.+)?"
 )
 
-# S04.3: a message that IS a phone number (the entire text) is an
-# outgoing-call request. Mutually exclusive with EXPLICIT_NUMBER_RE:
-# the explicit form contains a colon, which is not in this charset.
-BARE_NUMBER_RE = re.compile(r"^\+?\d[\d\s\-()]{6,}\d$")
+def is_number_attempt(text: Optional[str]) -> bool:
+    """True if *text* looks like the user typed a phone number.
 
+    Dispatch rule (msg #48): a stripped message starting with a digit
+    or '+' is a number ATTEMPT and gets the strict validator's verdict
+    (``core.phone.parse_destination``) — allowed forms dial, anything
+    else gets "Неправильный номер" instead of silence or a wrong dial.
+    Text starting with a letter is never an attempt ("Привет 2026"
+    stays a plain message).
 
-def extract_call_request(text: Optional[str]) -> Optional[str]:
-    """Return the target number if *text* is a bare phone number, else
-    None. Pure function (S04.3): the whole message must be the number.
-
-    Known false positive: an 8+ digit numeric string (a PIN-like code)
-    matches and is treated as a call request — it simply rings that
-    number. Accepted trade-off, documented in voice-bridge.md.
+    Replaces the old BARE_NUMBER_RE/extract_call_request, which only
+    matched 7+ digit strings: short numbers (a PIN, an extension) were
+    silently ignored and 8-10 digit strings were dialed as foreign
+    numbers. Pure function: no Telethon event involved.
     """
     if not text:
-        return None
-    stripped = text.strip()
-    if BARE_NUMBER_RE.match(stripped):
-        return stripped
-    return None
+        return False
+    s = text.strip()
+    if not s:
+        return False
+    return s[0] == "+" or s[0].isdigit()
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +114,14 @@ def is_unknown_command(text: Optional[str]) -> bool:
 
 
 def is_plain_reply_candidate(text: Optional[str]) -> bool:
-    """True if *text* is neither a command nor a bare-number call request.
+    """True if *text* is neither a command nor a number attempt.
 
     Part of the func-filter for the reply-to-SMS handler: a plain reply
     like "Ответ" qualifies, while "/sms …" (owned by the /sms handler)
-    and "+7926…" (owned by the call handler) do not — this is what
+    and "8926…" (owned by the call handler) do not — this is what
     prevents the same message from being dispatched twice.
     """
-    return command_token(text) is None and not extract_call_request(text)
+    return command_token(text) is None and not is_number_attempt(text)
 
 
 class Userbot:
@@ -226,10 +227,15 @@ class Userbot:
             await evt.reply("Пустое сообщение")
             return
 
-        norm = normalize_e164(phone)
-        if not norm:
+        # Strict validation (msg #48): only '+'+11-15 digits, '8'+11-15
+        # total, or 3-4 digit internal. Internal extensions cannot
+        # receive SMS; formatted/short-foreign forms are rejected here
+        # instead of being silently normalized as before.
+        dest = parse_destination(phone)
+        if dest is None or dest.is_internal:
             await evt.reply(SMSErrorType.NUMBER_MALFORMED_SMS.value)
             return
+        norm = dest.number
 
         # S02.2: a blacklisted target is not sent to.
         if self._blacklist.contains(norm):
@@ -387,17 +393,15 @@ class Userbot:
 
         @self._client.on(
             events.NewMessage(
-                func=lambda e: extract_call_request(
-                    e.message.text or ""
-                )
-                is not None
+                func=lambda e: is_number_attempt(e.message.text or "")
             )
         )
         async def handle_bare_number(evt):
-            """S04.3: a message that IS a phone number (e.g.
-            "+79261234555") is an outgoing-call request."""
+            """S04.3: a message that looks like a phone number (e.g.
+            "+79261234555", "89261234555", "123") is an outgoing-call
+            attempt. Strict validation (msg #48) decides: allowed forms
+            dial, everything else gets "Неправильный номер"."""
             sender_id = evt.sender_id if evt.sender_id else 0
-            phone = extract_call_request(evt.message.text or "")
 
             # S04.3: access before any call session (2026-08-22):
             # unknown -> silence, known without out_call -> "Недостаточно
@@ -408,13 +412,16 @@ class Userbot:
                     await evt.reply(SMSErrorType.DENIED.value)
                 return
 
-            norm = normalize_e164(phone)
-            if not norm:
+            dest = parse_destination((evt.message.text or "").strip())
+            if dest is None:
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED_CALL.value)
                 return
+            norm = dest.number
 
-            # S02.2 parity: a blacklisted target is not dialed.
-            if self._blacklist.contains(norm):
+            # S02.2 parity: a blacklisted target is not dialed. The
+            # blacklist holds carrier E.164 numbers — an internal
+            # extension cannot match it.
+            if not dest.is_internal and self._blacklist.contains(norm):
                 await evt.reply(SMSErrorType.BLACKLISTED.value)
                 return
 
@@ -525,11 +532,13 @@ class Userbot:
                 await evt.reply("Usage: /block <phone>")
                 return
 
-            phone = parts[1]
-            norm = normalize_e164(phone)
-            if not norm:
+            # Strict validation (msg #48); internal extensions are not
+            # GSM numbers, so they cannot be blocked.
+            dest = parse_destination(parts[1])
+            if dest is None or dest.is_internal:
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
                 return
+            norm = dest.number
 
             # Call agent API to persist the block. The x-correlation-id
             # header activates the agent's replay protection (S01.3).
@@ -573,11 +582,13 @@ class Userbot:
                 await evt.reply("Usage: /unblock <phone>")
                 return
 
-            phone = parts[1]
-            norm = normalize_e164(phone)
-            if not norm:
+            # Strict validation (msg #48); internal extensions are not
+            # GSM numbers, so they cannot be on the blacklist.
+            dest = parse_destination(parts[1])
+            if dest is None or dest.is_internal:
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
                 return
+            norm = dest.number
 
             # The x-correlation-id header activates the agent's replay
             # protection (S01.3).

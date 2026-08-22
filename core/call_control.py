@@ -412,29 +412,44 @@ class CallRegistry:
         callee_name: Optional[str] = None,
         modem_id: str = "gsm",
         telegram_user_id: Optional[int] = None,
+        modem_required: bool = True,
     ) -> CallMachine:
         """Create a new outgoing call (Telegram -> GSM).
 
         Starts in REQUESTED state. ACL check happens before this
         (in the route handler). Modem is selected via pool (S05.1)
         or reserved directly (backward compat for single-modem).
+
+        modem_required=False (2026-08-22): an internal-network call
+        (3-4 digit extension). Such a call bridges to a PJSIP endpoint
+        and never touches the GSM modem — no pool selection, no
+        reservation, no MODEM_SELECTED audit. The machine still passes
+        through MODEM_RESERVED: the state name is historical and the
+        transition chain (ACL_CHECKED -> MODEM_RESERVED -> ...) is
+        shared with the GSM path.
         """
-        # S05.1: Try pool-based selection first
-        selected_modem_id = modem_id
-        policy_name = "direct"
-        if self._modem_pool:
-            chosen = self._modem_pool.select_for_call(destination=callee_number)
-            if chosen is None:
-                reason = "offline" if self._modem_pool.all_offline() else "busy"
-                raise ModemBusyError(
-                    "No modem available for this call", reason=reason
-                )
-            selected_modem_id = chosen.modem_id
-            policy_name = self._modem_pool.strategy_name
+        if modem_required:
+            # S05.1: Try pool-based selection first
+            selected_modem_id = modem_id
+            policy_name = "direct"
+            if self._modem_pool:
+                chosen = self._modem_pool.select_for_call(destination=callee_number)
+                if chosen is None:
+                    reason = "offline" if self._modem_pool.all_offline() else "busy"
+                    raise ModemBusyError(
+                        "No modem available for this call", reason=reason
+                    )
+                selected_modem_id = chosen.modem_id
+                policy_name = self._modem_pool.strategy_name
+            else:
+                # Backward compat: direct modem reservation
+                if self._modems_reserved > 0:
+                    raise ModemBusyError("Modem is already in use", reason="busy")
         else:
-            # Backward compat: direct modem reservation
-            if self._modems_reserved > 0:
-                raise ModemBusyError("Modem is already in use", reason="busy")
+            # Internal call: the destination is a PJSIP endpoint, not
+            # the GSM modem — the modem is not involved at all.
+            selected_modem_id = ""
+            policy_name = "none"
 
         call = CallMachine(
             call_id=uuid.uuid4().hex,
@@ -452,22 +467,24 @@ class CallRegistry:
         # ACL check happens before this (in the route handler).
         # We transition through ACL_CHECKED to record that the check passed.
         call.transition(CallState.ACL_CHECKED)
-        if not self._modem_pool:
+        if modem_required and not self._modem_pool:
             self._modems_reserved += 1
         call.transition(CallState.MODEM_RESERVED)
         with self._lock:
             self._calls[call.call_id] = call
         # S05.2: record the selection — which policy chose which modem.
-        self._audit.log(
-            EventType.MODEM_SELECTED,
-            correlation_id=call.call_id,
-            modem_id=selected_modem_id,
-            details={
-                "policy": policy_name,
-                "direction": "outgoing",
-                "destination": callee_number,
-            },
-        )
+        # Internal calls have no modem selection to record.
+        if modem_required:
+            self._audit.log(
+                EventType.MODEM_SELECTED,
+                correlation_id=call.call_id,
+                modem_id=selected_modem_id,
+                details={
+                    "policy": policy_name,
+                    "direction": "outgoing",
+                    "destination": callee_number,
+                },
+            )
         logger.info(
             "Outgoing call %s to %s (user %s) on %s",
             call.call_id[:8],
@@ -497,7 +514,9 @@ class CallRegistry:
         """Remove a call after cleanup. Release modem if outgoing."""
         with self._lock:
             call = self._calls.pop(call_id, None)
-            if call and call.direction == "outgoing":
+            # Internal calls (modem_id="") never reserved a modem —
+            # releasing would corrupt the pool/counter state.
+            if call and call.direction == "outgoing" and call.modem_id:
                 # S05.1: Release via pool if available
                 if self._modem_pool:
                     self._modem_pool.release(call.modem_id)

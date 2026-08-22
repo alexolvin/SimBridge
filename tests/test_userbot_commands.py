@@ -1,13 +1,17 @@
 """Unit tests for userbot command handling (2026-08-22 UX batch).
 
-Covers the three user-requested behaviors (message #47):
-  A. case-insensitive command keys — "/SMS ..." == "/sms ...";
+Covers the user-requested behaviors:
+  A. case-insensitive command keys — "/SMS ..." == "/sms ..." (msg #47);
   B. error replies for unknown commands ("/EEE ...") and malformed
      numbers ("неправильный номер для СМС" / "для звонка") — and only
      AFTER the access gate: unknown user -> total silence, known user
-     without the right -> "Недостаточно прав";
+     without the right -> "Недостаточно прав" (msg #47);
   C. a plain reply (no /sms prefix) to a forwarded incoming SMS is
-     sent to that number.
+     sent to that number (msg #47);
+  D. strict destination whitelist (msg #48): a call/SMS destination is
+     accepted only as '+'+11-15 digits, '8'+11-15 digits total, or a
+     3-4 digit internal network number; anything else gets an error
+     reply instead of being silently normalized or dialed.
 
 telethon is not installed in the test environment, so it is stubbed
 with a MagicMock (same pattern as test_s06_wiring.py) and the handler
@@ -22,7 +26,7 @@ import asyncio
 import re
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -415,8 +419,8 @@ class TestMalformedNumbers:
         assert posts == []
 
     def test_bare_number_too_long(self, monkeypatch):
-        # 17 digits with '+': matches BARE_NUMBER_RE (reaches the
-        # handler) but exceeds E.164's 15-digit max
+        # 17 digits with '+': a number attempt (reaches the handler),
+        # but outside the msg #48 whitelist (11-15 digits excl. '+')
         ub, client = make_ub(monkeypatch)
         posts = fake_http(monkeypatch, FakeResp(200, {}))
         evt = FakeEvt("+79991234567123456", MASTER)
@@ -451,6 +455,33 @@ class TestSmsSend:
         assert p["json"]["text"] == "Выход"
         assert p["headers"]["Authorization"] == "Bearer test-token"
         assert p["headers"]["x-correlation-id"] == p["json"]["correlation_id"]
+
+    def test_sms_8_prefix_normalized_to_plus7(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {}))
+        evt = FakeEvt("/sms 89991234567 hi", MASTER)
+        _run(client.fn("handle_sms")(evt))
+        assert evt.replies == ["Отправлено"]
+        assert posts[0]["json"]["to"] == "+79991234567"
+
+    def test_sms_7_prefix_rejected(self, monkeypatch):
+        # the 7-prefix was silently normalized before msg #48
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {}))
+        evt = FakeEvt("/sms 79991234567 hi", MASTER)
+        _run(client.fn("handle_sms")(evt))
+        assert evt.replies == [SMSErrorType.NUMBER_MALFORMED_SMS.value]
+        assert posts == []
+
+    def test_sms_to_internal_extension_rejected(self, monkeypatch):
+        # 3-4 digit numbers are internal network extensions: they can
+        # be dialed, but cannot receive SMS
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {}))
+        evt = FakeEvt("/sms 123 hi", MASTER)
+        _run(client.fn("handle_sms")(evt))
+        assert evt.replies == [SMSErrorType.NUMBER_MALFORMED_SMS.value]
+        assert posts == []
 
     def test_agent_403_maps_to_blacklisted(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -598,6 +629,25 @@ class TestBlockUnblock:
         assert not ub._blacklist.contains("+79991234567")
         assert posts[0]["url"] == "http://127.0.0.1:8090/v1/unblock"
 
+    def test_block_internal_extension_rejected(self, monkeypatch):
+        # an internal extension is not a carrier number — it cannot
+        # be blocked
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {}))
+        evt = FakeEvt("/block 123", MASTER)
+        _run(client.fn("handle_block")(evt))
+        assert evt.replies == [SMSErrorType.NUMBER_MALFORMED.value]
+        assert posts == []
+        assert not ub._blacklist.contains("123")
+
+    def test_unblock_7_prefix_rejected(self, monkeypatch):
+        ub, client = make_ub(monkeypatch, blacklist=("+79991234567",))
+        posts = fake_http(monkeypatch, FakeResp(200, {}))
+        evt = FakeEvt("/unblock 79991234567", MASTER)
+        _run(client.fn("handle_unblock")(evt))
+        assert evt.replies == [SMSErrorType.NUMBER_MALFORMED.value]
+        assert posts == []
+
 
 class TestBroadcast:
     def test_case_insensitive_success(self, monkeypatch):
@@ -639,3 +689,83 @@ class TestBareNumber:
         evt = FakeEvt(None, STRANGER, voice=True)
         _run(client.fn("handle_voice_note")(evt))
         assert evt.replies == []
+
+    # ---- msg #48: strict whitelist for call destinations ----
+
+    def test_plus_form_dials(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value=True)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("+79991234567", MASTER)
+        _run(client.fn("handle_bare_number")(evt))
+        assert posts[0]["json"]["phone_number"] == "+79991234567"
+        assert evt.replies == ["Звоню вам в Telegram…"]
+
+    def test_8_prefix_normalized_then_dialed(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value=True)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("89991234567", MASTER)
+        _run(client.fn("handle_bare_number")(evt))
+        assert posts[0]["json"]["phone_number"] == "+79991234567"
+        assert evt.replies == ["Звоню вам в Telegram…"]
+
+    def test_internal_3_digit_dials_as_is(self, monkeypatch):
+        # a 3-4 digit number is an internal network extension — dialed
+        # verbatim to a PJSIP endpoint of the same name, never the GSM
+        # modem
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value=True)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("123", MASTER)
+        _run(client.fn("handle_bare_number")(evt))
+        assert posts[0]["json"]["phone_number"] == "123"
+        assert evt.replies == ["Звоню вам в Telegram…"]
+
+    def test_internal_4_digit_dials_as_is(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value=True)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("1234", MASTER)
+        _run(client.fn("handle_bare_number")(evt))
+        assert posts[0]["json"]["phone_number"] == "1234"
+        assert evt.replies == ["Звоню вам в Telegram…"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "9881234567",          # 10 digits — was silently dialed before
+            "8989123456",          # 8-prefix but only 10 digits total
+            "79991234567",         # 7-prefix not on the whitelist
+            "12",                  # too short for an internal extension
+            "12345",               # too long for an internal extension
+            "12345678",            # PIN-like 8 digits — was a false-positive call
+            "+7 (926) 123-45-55",  # formatted — must not be normalized
+            "+7-926-123-45-55",
+            "+1234567",            # only 7 digits after '+'
+            "89a12345678",         # letters
+            "123456789 extra",     # text after the number
+        ],
+    )
+    def test_malformed_number_error_no_post(self, monkeypatch, text):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt(text, MASTER)
+        _run(client.fn("handle_bare_number")(evt))
+        assert evt.replies == [SMSErrorType.NUMBER_MALFORMED_CALL.value]
+        assert posts == []
+
+    def test_dispatch_filter(self, monkeypatch):
+        # the NewMessage func decides what reaches the handler:
+        # attempts (first char '+' or a digit) reach it and get either
+        # a call or an error; plain text is not dispatched at all
+        ub, client = make_ub(monkeypatch)
+        f = client.spec("handle_bare_number")["func"]
+        assert f(FakeEvt("+79991234567", MASTER)) is True
+        assert f(FakeEvt("89991234567", MASTER)) is True
+        assert f(FakeEvt("123", MASTER)) is True       # internal extension
+        assert f(FakeEvt("12345678", MASTER)) is True  # PIN: error, not silence
+        assert f(FakeEvt("79991234567", MASTER)) is True
+        assert f(FakeEvt("Привет 2026", MASTER)) is False
+        assert f(FakeEvt("тел: +79991234567", MASTER)) is False
+        assert f(FakeEvt(None, MASTER)) is False

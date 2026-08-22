@@ -255,6 +255,54 @@ class TestCallOutgoing:
         assert "offline" in r.json()["detail"]
         assert len(new_registry.list_all()) == 0  # no session created
 
+    # -- msg #48: strict destination whitelist --
+
+    @pytest.mark.parametrize(
+        "number",
+        [
+            "8989123456",          # 8 prefix, 10 total (min is 11)
+            "79991234567",         # 7 prefix — not on the whitelist
+            "12345",               # 5 digits — neither internal nor external
+            "+7 (926) 123-45-55",  # formatted — must not be normalized
+            "12345678",            # PIN-like 8 digits
+        ],
+    )
+    def test_malformed_number_400_no_session(self, env, number):
+        client, registry, audit, ami, app, _ = env
+        r = client.post(
+            "/v1/call/outgoing", headers=_auth(),
+            json={"phone_number": number,
+                  "telegram_user_id": ACL_USER},
+        )
+        assert r.status_code == 400
+        assert len(registry.list_all()) == 0
+        # audited as malformed (details keep the raw input for tracing)
+        mal = _audits(audit, EventType.CALL_REQUESTED)
+        assert len(mal) == 1
+        assert mal[0]["outcome"] == "malformed"
+        assert mal[0]["details"]["to"] == number
+
+    def test_internal_number_bypasses_modem_reservation(self, env):
+        # while an external call holds the (single) modem, a 3-4 digit
+        # internal extension must still be registered — it bridges to a
+        # PJSIP endpoint and never touches the GSM modem
+        client, registry, audit, ami, app, _ = env
+        r1 = client.post(
+            "/v1/call/outgoing", headers=_auth(),
+            json={"phone_number": "+14155552671",
+                  "telegram_user_id": ACL_USER},
+        )
+        assert r1.status_code == 200
+        r2 = client.post(
+            "/v1/call/outgoing", headers=_auth(),
+            json={"phone_number": "123",
+                  "telegram_user_id": ACL_USER},
+        )
+        assert r2.status_code == 200
+        assert r2.json()["callee_number"] == "123"
+        call2 = registry.get(r2.json()["call_id"])
+        assert call2.modem_id == ""
+
 
 # =========================================================================
 # /v1/call/outgoing/accepted — the nocal gate

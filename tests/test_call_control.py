@@ -323,6 +323,40 @@ class TestCallRegistry:
         call2 = registry.create_outgoing(callee_number="+14155552672")
         assert call2.state == CallState.MODEM_RESERVED
 
+    # -- msg #48: internal extensions never touch the GSM modem --
+
+    def test_internal_call_does_not_reserve_modem(self, registry):
+        call = registry.create_outgoing(
+            callee_number="123", modem_required=False)
+        assert call.state == CallState.MODEM_RESERVED
+        assert call.modem_id == ""
+
+    def test_internal_call_allowed_while_modem_busy(self, registry):
+        # legacy single-modem path: an external call reserves, a second
+        # external call fails — an internal call never touches the modem
+        registry.create_outgoing(callee_number="+14155552671")
+        with pytest.raises(ModemBusyError):
+            registry.create_outgoing(callee_number="+14155552672")
+        call = registry.create_outgoing(
+            callee_number="123", modem_required=False)
+        assert call.state == CallState.MODEM_RESERVED
+
+    def test_internal_cleanup_does_not_release_foreign_modem(self, registry):
+        registry.create_outgoing(callee_number="+14155552671")  # reserved
+        call = registry.create_outgoing(
+            callee_number="123", modem_required=False)
+        registry.transition(call.call_id, CallState.TELEGRAM_CALLING)
+        registry.transition(call.call_id, CallState.USER_ACCEPTED)
+        registry.transition(call.call_id, CallState.GSM_DIALING)
+        registry.transition(call.call_id, CallState.GSM_RINGING)
+        registry.transition(call.call_id, CallState.CONNECTED)
+        registry.transition(call.call_id, CallState.BRIDGED)
+        registry.transition(call.call_id, CallState.HANGUP)
+        registry.cleanup(call.call_id)
+        # the external reservation survived the internal cleanup
+        with pytest.raises(ModemBusyError):
+            registry.create_outgoing(callee_number="+14155552672")
+
     # -- Incoming branch: accept --
 
     def test_incoming_accept_flow(self, registry):

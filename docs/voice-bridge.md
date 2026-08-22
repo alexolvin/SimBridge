@@ -144,9 +144,14 @@ The voicemail branch is therefore entered **only on `NOANSWER`**.
 ```
 TG user sends a bare phone number (e.g. "+79261234555")
     │  userbot handle_bare_number:
-    │    extract_call_request() → ACL out_call → normalize → blacklist
-    │    → agent /v1/call/outgoing (rate-limit, ACL re-check, blacklist,
-    │      atomic modem reservation, TELEGRAM_CALLING)
+    │    is_number_attempt() → ACL out_call → parse_destination (the
+    │      msg #48 strict whitelist: '+' + 11-15 digits, '8' + 11-15
+    │      digits total → normalized to +7, or 3-4 digit internal
+    │      extension; anything else is an error reply, not a call)
+    │    → blacklist (external numbers only)
+    │    → agent /v1/call/outgoing (rate-limit, ACL re-check,
+    │      whitelist re-check, atomic modem reservation — skipped for
+    │      internal extensions — TELEGRAM_CALLING)
     │    → bridge control API (loopback) POST /call — the bridge starts
     │      the Telegram call to the user
     │
@@ -155,13 +160,19 @@ TG user sends a bare phone number (e.g. "+79261234555")
 bridge INVITEs sip:<target>@<GSM node>:5060
     │  (From-user = the tg-bridge endpoint; Request-URI user = target)
     ▼
-Asterisk [tg-bridge] context, EXTEN = target
+Asterisk tg-bridge context, EXTEN = target
     │  1. Answer()          ← the SIP leg (and the TG call) is live
     │  2. AGI outgoing-accepted → agent /v1/call/outgoing/accepted
     │       └─ 200 → SET VARIABLE CALL_ID <id>
     │          404 → CALL_ID stays empty (nocal gate below)
     │  3. GotoIf($["${CALL_ID}" = ""]?nocal)     ← the nocal gate
-    │  4. Dial(Dongle/${MODEM_ID}/+${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
+    │  4a. EXTEN is 3-4 digits (internal): Goto(internal, EXTEN) —
+    │       the internal context dials a PJSIP endpoint of the same
+    │       name (Dial(PJSIP/${EXTEN}), no GSM leg, no modem
+    │       reservation); a missing endpoint fails instantly and the
+    │       user gets a "call failed" notification
+    │  4b. EXTEN is a phone number:
+    │       Dial(Dongle/${MODEM_ID}/+${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
     │       └─ the TG user hears the target's REAL ringback
     │          (the two-party bridge passes in-band ringback)
     │  5. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
@@ -178,10 +189,21 @@ ring a real phone for a call that no longer exists.
 
 **Modem reservation**: `/v1/call/outgoing` takes the reservation
 atomically in the agent (single call per node while the pool is a
-single member); if the bridge cannot start the Telegram call the
-userbot rejects the agent-side call immediately (best-effort), and
-`/v1/call/check-timeouts` is the backstop that reaps any call left in
-`TELEGRAM_CALLING` past `voice.outbound_answer_timeout` (default 30 s).
+single member); internal 3-4 digit extensions skip the reservation
+(`modem_required=False` — they never touch the GSM modem), so an
+internal call is allowed even while the modem is busy; if the bridge
+cannot start the Telegram call the userbot rejects the agent-side call
+immediately (best-effort), and `/v1/call/check-timeouts` is the
+backstop that reaps any call left in `TELEGRAM_CALLING` past
+`voice.outbound_answer_timeout` (default 30 s).
+
+**Destination whitelist** (msg #48): the userbot and the agent both
+validate the destination with `core.phone.parse_destination` before
+anything is dialed: `+` + 11-15 digits (as-is), `8` + 11-15 digits
+total (normalized to `+7...`), or a 3-4 digit internal extension.
+Anything else — 7/9-prefix, formatted strings, letters, PIN-like codes
+— is an **error reply** (no call, no silent normalization). The same
+whitelist guards `/v1/sms` and the `/block` `/unblock` commands.
 
 ### Bridge Control API (loopback contract)
 
@@ -544,13 +566,13 @@ Telegram User ──MTProto+WebRTC──► sip-tg-bridge (Telegram node, 100.a.
 
 ## Known trade-offs
 
-- **8-digit numeric false positive**: `extract_call_request()` treats any
-  8+ digit string as a call request, so a PIN-like code ("12345678")
-  matches and rings that number. Accepted trade-off: the alternative
-  (country-code whitelisting) would be a second, config-dependent
-  classification mechanism for the same input; the false positive is
-  harmless (one missed ring) while a missed real number would be a
-  dropped call. Pinned by a unit test so a future change is deliberate.
+- **8-digit numeric false positive — RESOLVED (msg #48, 2026-08-22)**:
+  the old `extract_call_request()` heuristic (any 8+ digit string is a
+  call) dialed PIN-like codes such as "12345678". The strict
+  destination whitelist (above) replaced it: 8 digits matches none of
+  the three allowed forms, so the user now gets an explicit error
+  reply instead of a false call. Pinned by
+  `tests/test_userbot_commands.py::TestBareNumber::test_malformed_number_error_no_post`.
 
 ## Operational Findings — 3p14-aaa, 2026-08-19/20
 

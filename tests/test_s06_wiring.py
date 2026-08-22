@@ -618,6 +618,18 @@ class TestSmsRouteMetrics:
         assert metrics.get_all()["sms"]["failed"] == 0
         assert metrics.get_all()["sms"]["sent"] == 0
 
+    def test_malformed_400_not_counted(self, sms_env):
+        # msg #48: the whitelist is enforced before the modem — a
+        # malformed destination is a 400, nothing submitted, no metric
+        client, metrics, state = sms_env
+        r = self._post(client,
+                       {"to": "8989123456", "text": "hi",
+                        "telegram_user_id": 7})
+        assert r.status_code == 400
+        assert metrics.get_all()["sms"]["failed"] == 0
+        assert metrics.get_all()["sms"]["sent"] == 0
+        assert state.ami.sent == []
+
     def test_report_delivered_counts_delivered(self, sms_env):
         client, metrics, state = sms_env
         rec = state.sms_store.create(7, "+79261234555", "hello")

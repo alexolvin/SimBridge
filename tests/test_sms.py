@@ -18,7 +18,12 @@ import pytest
 from agent.ami_client import AMIClient, AMISendError
 from core.acl import ACLManager
 from core.events import EventType
-from core.phone import normalize_e164, is_service_number
+from core.phone import (
+    normalize_e164,
+    is_service_number,
+    parse_destination,
+    Destination,
+)
 from core.contacts import (
     CSVContactProvider,
     ServiceNumberProvider,
@@ -85,6 +90,68 @@ class TestPhoneNormalizer:
         (e.g. Tonga/Samoa +676/+685) and must still pass."""
         assert normalize_e164("+67623123") == "+67623123"
         assert normalize_e164("67623123") == "+67623123"
+
+
+class TestParseDestination:
+    """Strict user-input validator (msg #48, 2026-08-22).
+
+    Allowed: '+'+11-15 digits, '8'+11-15 total, 3-4 digit internal.
+    Everything else -> None; the caller surfaces the localized
+    "Неправильный номер" error instead of dialing or going silent.
+    Deliberately stricter than normalize_e164 (system-side leniency).
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "+79261234555",        # 11 digits (min)
+            "+14155552671",        # US NANP, 11 digits
+            "+79261234555555",     # 15 digits (max)
+            "  +79261234555  ",    # surrounding whitespace
+        ],
+    )
+    def test_plus_form_valid(self, raw):
+        dest = parse_destination(raw)
+        assert dest is not None
+        assert dest.number == raw.strip()
+        assert dest.is_internal is False
+
+    def test_ru_8_prefix_normalized_to_plus7(self):
+        assert parse_destination("89261234555") == Destination("+79261234555", False)
+        assert parse_destination("8926123455555") == Destination("+7926123455555", False)
+
+    @pytest.mark.parametrize("raw", ["123", "1234", "8989", "  123  "])
+    def test_internal_valid(self, raw):
+        dest = parse_destination(raw)
+        assert dest is not None
+        assert dest.number == raw.strip()
+        assert dest.is_internal is True
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "79261234555",          # bare 7 prefix — not on the whitelist
+            "+1415555267",          # 10 digits after + (min is 11)
+            "+7926123455555555",    # 16 digits after + (max is 15)
+            "8989123456",           # 8 prefix, 10 total (min is 11)
+            "8926123455555555",     # 8 prefix, 16 total (max is 15)
+            "12345",                # 5 digits — neither internal nor external
+            "12",                   # 2 digits
+            "12345678",             # 8-digit PIN-like — no rule matches
+            "89a12345678",          # letter inside
+            "+7 989 612 71 67",     # spaces
+            "+7-926-123-45-55",     # dashes
+            "+7 (926) 123-45-55",   # parens (normalize_e164 accepted these)
+            "+abc",                 # + with no digits
+            "привет",               # plain text
+            "тел: +79261234555",    # text around the number
+            "",
+            "   ",
+            None,
+        ],
+    )
+    def test_rejected(self, raw):
+        assert parse_destination(raw) is None
 
 
 class TestServiceNumbers:
