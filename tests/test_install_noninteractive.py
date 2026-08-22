@@ -30,8 +30,10 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import install  # noqa: E402
+from core.config import load_config  # noqa: E402
 
 # Module-global installer state fields the tests touch. The fixture
 # snapshots and restores them — install.s is a shared singleton.
@@ -1344,3 +1346,60 @@ class TestWriteConfigAgentListen:
         # userbot_http is local: still own IP.
         assert 'listen: "10.0.0.1:8088"' in text
         assert "10.0.0.1:8090" not in text
+
+
+# ---------------------------------------------------------------------------
+# _write_config — the generated YAML must carry the live-verified
+# defaults and be schema-valid as-is for both roles: the installer's
+# output IS the node's config, so core.config.load_config must accept
+# it without any post-hoc patching (msg #49).
+# ---------------------------------------------------------------------------
+
+class TestWriteConfigDefaults:
+    @staticmethod
+    def _patch_paths(tmp_path, monkeypatch):
+        for const, name in (("CONF_FILE", "simbridge.yaml"),
+                            ("ENV_FILE", "env"),
+                            ("ACL_FILE", "acl.conf"),
+                            ("BLACKLIST_FILE", "blacklist.txt")):
+            monkeypatch.setattr(install, const, str(tmp_path / name))
+
+    def _render(self, tmp_path, monkeypatch, role):
+        self._patch_paths(tmp_path, monkeypatch)
+        st = install.s
+        st.install_type = "distributed"
+        st.node_role = role
+        st.node_id = f"{role}-1"
+        st.dongle_name = "gsm"   # schema: asterisk.dongle is a required str
+        st.own_ip = "10.0.0.1"
+        st.peer_ip = "10.0.0.2"
+        st.acl_ids = "123"
+        st.action = "install"
+        install._write_config()
+        return (tmp_path / "simbridge.yaml").read_text()
+
+    def test_live_verified_defaults(self, tmp_path, monkeypatch, ni_state):
+        text = self._render(tmp_path, monkeypatch, role="gsm")
+        # 18 s was live-tuned on 3p14-aaa (2026-08-21, Test #3 passed);
+        # a fresh install must not regress to a value the user rejected.
+        assert "ring_wait_seconds: 18" in text
+        # Voice section is schema-complete — the generator/userbot
+        # fallbacks (30 / 5063) must not silently cover a missing key.
+        assert "outbound_gsm_ring_seconds: 30" in text
+        assert "bridge_control_port: 5063" in text
+
+    @pytest.mark.parametrize("role", ["gsm", "telegram"])
+    def test_generated_yaml_is_schema_valid(self, tmp_path, monkeypatch,
+                                            ni_state, role):
+        path = tmp_path / "simbridge.yaml"
+        self._render(tmp_path, monkeypatch, role=role)
+        # The generated YAML references secrets by env-var name — provide
+        # all five so load_config can resolve them for either role.
+        monkeypatch.setenv("SIMBRIDGE_AGENT_TOKEN", "tok")
+        monkeypatch.setenv("SIMBRIDGE_AMI_PASSWORD", "test-ami")
+        monkeypatch.setenv("SIMBRIDGE_HTTP_SECRET", "test")
+        monkeypatch.setenv("SIMBRIDGE_TG_API_ID", "12345")
+        monkeypatch.setenv(
+            "SIMBRIDGE_TG_API_HASH", "0123456789abcdef0123456789abcdef")
+        cfg = load_config(str(path))
+        assert cfg["node.role"] == role

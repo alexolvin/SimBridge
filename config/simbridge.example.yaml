@@ -49,7 +49,7 @@ userbot_http:
 asterisk:
   ari_url: http://127.0.0.1:8088/ari
   dongle: gsm                       # chan_dongle device name
-  ring_wait_seconds: 24             # voicemail ringback duration
+  ring_wait_seconds: 18             # ring the Telegram user this long before voicemail (live-verified default)
   max_record_seconds: 90            # max voicemail length
   early_hangup_max_seconds: 3       # shorter recording = caller hung up during the greeting
   sweep_max_age_seconds: 300        # sweep timer: a *.wav older than this is an orphan

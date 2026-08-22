@@ -206,7 +206,8 @@ class TestConfigGenerator:
         try:
             generate(config, output_path)
             result = Path(output_path).read_text()
-            assert "RING_WAIT_SECONDS=24" in result
+            # 18 s — live-verified default (tuned on 3p14-aaa, 2026-08-21)
+            assert "RING_WAIT_SECONDS=18" in result
             assert "MAX_RECORD_SECONDS=90" in result
         finally:
             os.unlink(output_path)

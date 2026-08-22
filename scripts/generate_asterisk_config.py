@@ -20,7 +20,7 @@ Usage:
 Output: /etc/asterisk/asterisk-globals.conf
 
 Timing equivalence: chan_dongle ring cycles are ~5 seconds each.
-    ring_wait_seconds=24 ≈ 5 ring cycles (matches GPT doc spec).
+    ring_wait_seconds=18 — live-verified default (tuned on 3p14-aaa, 2026-08-21).
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def load_yaml(path: str) -> dict:
 def generate(config: dict, output_path: str) -> None:
     a = config.get("asterisk", {})
 
-    ring_wait = int(a.get("ring_wait_seconds", 24))
+    ring_wait = int(a.get("ring_wait_seconds", 18))
     max_record = int(a.get("max_record_seconds", 90))
     early_hangup = int(a.get("early_hangup_max_seconds", 3))
     prompt = a.get("prompt", "/var/lib/asterisk/sounds/custom/vm-prompt")

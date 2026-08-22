@@ -1279,7 +1279,7 @@ userbot_http:
 asterisk:
   ari_url: http://127.0.0.1:8088/ari
   dongle: {s.dongle_name}
-  ring_wait_seconds: 10
+  ring_wait_seconds: 18
   max_record_seconds: 90
   early_hangup_max_seconds: 3
   sweep_max_age_seconds: 300
@@ -1298,6 +1298,8 @@ voice:
   bridge_port: 5062
   srtp: false
   outbound_answer_timeout: 30
+  outbound_gsm_ring_seconds: 30
+  bridge_control_port: 5063
 watchdog:
   modem_check_seconds: 30
 limits:

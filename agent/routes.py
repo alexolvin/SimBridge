@@ -1339,7 +1339,7 @@ async def call_check_timeouts(
       Hanging either leg cascades (Dial's hanguptree / ast_dial_destroy
       tears down the other).
     """
-    ring_wait = cfg.get("asterisk", {}).get("ring_wait_seconds", 24)
+    ring_wait = cfg.get("asterisk", {}).get("ring_wait_seconds", 18)
     max_call = cfg.get("limits", {}).get("max_call_seconds", 1800)
     tg_ring = cfg.get("voice", {}).get("outbound_answer_timeout", 30)
 
