@@ -18,7 +18,7 @@ from core.audit import AuditLogger
 from core.events import EventType
 from core.ratelimit import RateLimiter
 from core.blacklist import BlacklistManager
-from core.sms_correlation import SMSCorrelationStore
+from core.sms_correlation import SMSCorrelationStore, SMSRecord
 from core.errors import SMSErrorType, asterisk_sms_error_to_type
 from core.acl import ACLManager
 from agent.ami_client import AMIClient, AMISendError
@@ -220,7 +220,11 @@ async def send_sms(
     )
 
     try:
-        await ami.send_sms(req.to, req.text)
+        # payload = sms_id: chan_dongle stores it in smsdb and hands it
+        # back as SMS_REPORT_PAYLOAD on the delivery-report channel, so
+        # the report exten correlates by ID instead of by SMS text
+        # (inter-carrier reports often carry no usable text at all).
+        await ami.send_sms(req.to, req.text, payload=record.sms_id)
         sms_store.mark_submitted(record.sms_id)
     except AMISendError as e:
         # Asterisk explicitly refused the send (not registered, SIM
@@ -323,27 +327,53 @@ async def unblock_number(
 @router.post("/sms/{sms_id}/delivered")
 async def report_sms_delivered(
     sms_id: str,
+    request: Request,
     sms_store: SMSCorrelationStore = Depends(get_sms_store),
+    audit: AuditLogger = Depends(get_audit),
+    metrics_collector: "MetricsCollector" = Depends(get_metrics),
 ):
-    """Report that an SMS was delivered (from Asterisk delivery report).
+    """Report that an SMS was delivered (Asterisk delivery report).
 
-    S02.3: Delivery matched by sms_id, not by text search.
+    S02.3: Delivery matched by sms_id, not by text search — the agent
+    sends the id in the DongleSendSMS Payload header and chan_dongle
+    echoes it back on the report channel (SMS_REPORT_PAYLOAD), so no
+    dependence on the carrier's report text (inter-carrier routes
+    often deliver no text report at all). Same post-mark treatment
+    as /v1/sms/report: metrics, audit, userbot announce.
     """
-    found = sms_store.mark_delivered(sms_id)
-    if not found:
+    cfg = get_cfg(request)
+    record = sms_store.get(sms_id)
+    if record is None or not sms_store.mark_delivered(sms_id):
         raise HTTPException(status_code=404, detail="SMS record not found")
+    await _announce_delivery(
+        cfg, record, "delivered", error=None,
+        audit=audit, metrics_collector=metrics_collector,
+    )
     return {"ok": True, "sms_id": sms_id}
 
 
 @router.post("/sms/{sms_id}/failed")
 async def report_sms_failed(
     sms_id: str,
+    request: Request,
     sms_store: SMSCorrelationStore = Depends(get_sms_store),
+    audit: AuditLogger = Depends(get_audit),
+    metrics_collector: "MetricsCollector" = Depends(get_metrics),
 ):
-    """Report that an SMS delivery failed (from Asterisk delivery report)."""
-    found = sms_store.mark_failed(sms_id, error="delivery_failed")
-    if not found:
+    """Report that an SMS delivery failed (Asterisk delivery report).
+
+    Same ID-based correlation and post-mark treatment as /delivered.
+    """
+    cfg = get_cfg(request)
+    record = sms_store.get(sms_id)
+    if record is None or not sms_store.mark_failed(
+        sms_id, error="delivery_failed"
+    ):
         raise HTTPException(status_code=404, detail="SMS record not found")
+    await _announce_delivery(
+        cfg, record, "failed", error="delivery_failed",
+        audit=audit, metrics_collector=metrics_collector,
+    )
     return {"ok": True, "sms_id": sms_id}
 
 
@@ -369,8 +399,12 @@ async def sms_delivery_report(
     on the same dongle; resolved as delivered/failed by keywords, then
     announced to the userbot (best effort).
 
-    **S02.3:** Reports are correlated by content + dongle, because
-    chan_dongle delivery reports carry no reference to the original SMS.
+    **S02.3:** This is the LEGACY content-based path, kept for text
+    reports that arrive as ordinary incoming SMS from a carrier short
+    code (chan_dongle has no channel for those). Reports from
+    chan_dongle's own report channels carry the agent's sms_id in
+    SMS_REPORT_PAYLOAD and go to /sms/{id}/delivered|/failed instead —
+    no content matching involved.
     """
     cfg = get_cfg(request)
     record = sms_store.match_report(req.modem_id, req.text)
@@ -393,33 +427,56 @@ async def sms_delivery_report(
     if any(m in lowered for m in failed_markers):
         sms_store.mark_failed(record.sms_id, error=req.text[:200])
         status = "failed"
-        metrics_collector.sms_failed()
     else:
         sms_store.mark_delivered(record.sms_id)
         status = "delivered"
-        metrics_collector.sms_delivered()
 
+    await _announce_delivery(
+        cfg, record, status,
+        error=req.text[:200] if status == "failed" else None,
+        from_number=req.phone_number,
+        audit=audit, metrics_collector=metrics_collector,
+    )
+
+    return {"ok": True, "matched": True, "sms_id": record.sms_id, "status": status}
+
+
+async def _announce_delivery(
+    cfg,
+    record: SMSRecord,
+    status: str,
+    *,
+    error: Optional[str],
+    from_number: Optional[str] = None,
+    audit: AuditLogger,
+    metrics_collector: "MetricsCollector",
+) -> None:
+    """Post-mark treatment for a resolved delivery outcome — metrics,
+    audit, userbot announce — the single mechanism shared by
+    /v1/sms/report (content match) and the ID-based /delivered|/failed
+    endpoints (Rule 1). Best effort: a delivery outcome must never be
+    lost to a notification failure."""
+    if status == "delivered":
+        metrics_collector.sms_delivered()
+    else:
+        metrics_collector.sms_failed()
+    details: dict = {"sms_id": record.sms_id, "phone": record.phone_number}
+    if from_number is not None:
+        details["from"] = from_number
     audit.log(
         EventType.SMS_DELIVERY_REPORT,
         telegram_user_id=record.telegram_user_id,
         outcome=status,
-        details={
-            "sms_id": record.sms_id,
-            "phone": record.phone_number,
-            "from": req.phone_number,
-        },
+        details=details,
     )
-
     await _notify_userbot_delivery(
         cfg,
         sms_id=record.sms_id,
         phone_number=record.phone_number,
         telegram_user_id=record.telegram_user_id,
         status=status,
-        error=req.text[:200] if status == "failed" else None,
+        error=error,
     )
-
-    return {"ok": True, "matched": True, "sms_id": record.sms_id, "status": status}
 
 
 async def _notify_userbot_delivery(

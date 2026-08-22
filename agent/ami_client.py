@@ -180,7 +180,7 @@ class AMIClient:
     _ENTRY_MARKER = "DongleDeviceEntry"
     _COMPLETE_MARKERS = ("DongleShowDevicesComplete", "ListComplete")
 
-    async def send_sms(self, to: str, text: str) -> dict:
+    async def send_sms(self, to: str, text: str, payload: str | None = None) -> dict:
         """Send SMS via the native DongleSendSMS AMI action.
 
         *to* and *text* are first-class AMI header fields (Number /
@@ -192,26 +192,34 @@ class AMIClient:
         supported multi-line SMS either).
 
         Validity (1440 minutes) and Report (yes) mirror the production
-        dialplan's DongleSendSMS application arguments; the delivery
-        report drives the /v1/sms/report correlation path.
+        dialplan's DongleSendSMS application arguments. With
+        *payload* set, chan_dongle stores it in its smsdb alongside the
+        outgoing message and hands it back in the SMS_REPORT_PAYLOAD
+        channel variable of the delivery-report channel — that is how
+        the report exten knows WHICH message the report belongs to
+        (the report SMS text itself is unreliable: for inter-carrier
+        routes the carrier often does not even send a text report, and
+        content-matching against the SMS body fails for any text the
+        carrier rewrites).
 
         Raises:
             AMISendError: the action returned an explicit Error response.
         """
         flattened = re.sub(r"[\r\n]+", " ", text)
         action_id = f"sms-{id(self)}-{asyncio.get_event_loop().time()}"
+        action = {
+            "Action": "DongleSendSMS",
+            "Device": self._dongle,
+            "Number": to,
+            "Message": flattened,
+            "Validity": "1440",
+            "Report": "yes",
+            "ActionID": action_id,
+        }
+        if payload is not None:
+            action["Payload"] = payload
         async with self._get_lock():
-            await self._send_action(
-                {
-                    "Action": "DongleSendSMS",
-                    "Device": self._dongle,
-                    "Number": to,
-                    "Message": flattened,
-                    "Validity": "1440",
-                    "Report": "yes",
-                    "ActionID": action_id,
-                }
-            )
+            await self._send_action(action)
             resp = await self._read_response()
         if resp.get("Response") == "Error" or resp.get("Action") == "failure":
             raise AMISendError(resp.get("Message", "DongleSendSMS failed"), resp)

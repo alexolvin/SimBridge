@@ -531,10 +531,10 @@ class _FakeAMI:
         self._exc = exc
         self.sent = []
 
-    async def send_sms(self, to, text):
+    async def send_sms(self, to, text, payload=None):
         if self._exc is not None:
             raise self._exc
-        self.sent.append((to, text))
+        self.sent.append((to, text, payload))
 
 
 class _NoBlacklist:
@@ -584,7 +584,7 @@ class TestSmsRouteMetrics:
                            headers={"Authorization": "Bearer s06-token"})
 
     def test_success_counts_sent(self, sms_env):
-        client, metrics, _ = sms_env
+        client, metrics, state = sms_env
         r = self._post(client,
                        {"to": "+79261234555", "text": "hi",
                         "telegram_user_id": 7})
@@ -592,6 +592,11 @@ class TestSmsRouteMetrics:
         assert r.json()["ok"] is True
         assert metrics.get_all()["sms"]["sent"] == 1
         assert metrics.get_all()["sms"]["failed"] == 0
+        # The sms_id travels to chan_dongle as the DongleSendSMS
+        # Payload header — it is what the delivery-report channel
+        # echoes back (SMS_REPORT_PAYLOAD) for ID-based correlation.
+        (to, text, payload) = state.ami.sent[0]
+        assert payload == r.json()["sms_id"]
 
     def test_ami_connection_error_counts_failed(self, sms_env):
         client, metrics, state = sms_env

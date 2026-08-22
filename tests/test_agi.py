@@ -268,6 +268,78 @@ class TestTgSmsAgi:
                        "SIMBRIDGE_AGENT_TOKEN": "test-token"},
         )
         assert final.startswith("200 skipped"), final
+
+    def test_report_id_delivered(self, http_server):
+        """chan_dongle report channel: SMS_TEXT is the sms_id the agent
+        sent as the DongleSendSMS Payload header; SMS_REPORT_SUCCESS=1
+        must hit /v1/sms/{id}/delivered (correlation by ID, not text)."""
+        sms_id = "2a984199016741baa27bfce68344ac8e"
+        final, _ = run_agi(
+            "tg-sms-agi.py", ["report"],
+            variables={"SMS_FROM": "+79267523624",
+                       "SMS_TEXT": sms_id,
+                       "SMS_REPORT_SUCCESS": "1",
+                       "MODEM_ID": "gsm"},
+            extra_env={"AGENT_URL": http_server.url,
+                       "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+        )
+        assert final.startswith("200 resolved=delivered"), final
+        (req,) = http_server.captured
+        assert req["path"] == f"/v1/sms/{sms_id}/delivered"
+        headers = {k.lower(): v for k, v in req["headers"].items()}
+        assert headers["authorization"] == "Bearer test-token"
+
+    def test_report_id_failed(self, http_server):
+        """SMS_REPORT_SUCCESS=0 (carrier failure or modem send error,
+        TYPE "i") must hit /v1/sms/{id}/failed."""
+        sms_id = "2a984199016741baa27bfce68344ac8e"
+        final, _ = run_agi(
+            "tg-sms-agi.py", ["report"],
+            variables={"SMS_FROM": "+79267523624",
+                       "SMS_TEXT": sms_id,
+                       "SMS_REPORT_SUCCESS": "0",
+                       "MODEM_ID": "gsm"},
+            extra_env={"AGENT_URL": http_server.url,
+                       "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+        )
+        assert final.startswith("200 resolved=failed"), final
+        (req,) = http_server.captured
+        assert req["path"] == f"/v1/sms/{sms_id}/failed"
+
+    def test_report_success_with_free_text_still_uses_content_match(
+        self, http_server
+    ):
+        """SMS_REPORT_SUCCESS set but SMS_TEXT not a 32-hex id (the
+        manual CLI fallback case) must fall back to the legacy
+        /v1/sms/report content match."""
+        final, _ = run_agi(
+            "tg-sms-agi.py", ["report"],
+            variables={"SMS_FROM": "carrier",
+                       "SMS_TEXT": "Delivered 2026-08-22 10:00 +79261234555",
+                       "SMS_REPORT_SUCCESS": "1",
+                       "MODEM_ID": "gsm"},
+            extra_env={"AGENT_URL": http_server.url,
+                       "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+        )
+        assert final.startswith("200 forwarded"), final
+        (req,) = http_server.captured
+        assert req["path"] == "/v1/sms/report"
+
+    def test_report_id_agent_down_reports_error_not_crash(self, http_server):
+        """Agent unreachable: the ID path must log and answer 200 —
+        never raise into the dialplan (Rule 4)."""
+        final, _ = run_agi(
+            "tg-sms-agi.py", ["report"],
+            variables={"SMS_FROM": "+79267523624",
+                       "SMS_TEXT": "2a984199016741baa27bfce68344ac8e",
+                       "SMS_REPORT_SUCCESS": "1",
+                       "MODEM_ID": "gsm"},
+            # Port 1 — nothing listens.
+            extra_env={"AGENT_URL": "http://127.0.0.1:1",
+                       "SIMBRIDGE_AGENT_TOKEN": "test-token"},
+        )
+        assert final.startswith("200 error="), final
+        assert http_server.captured == []
         assert http_server.captured == []
 
     def test_ring_event(self, http_server):

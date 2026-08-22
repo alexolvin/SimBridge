@@ -208,3 +208,82 @@ class TestSmsReport:
             json={"phone_number": "c", "text": "x", "modem_id": "gsm"},
         )
         assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /v1/sms/{id}/delivered|/failed — ID-based correlation (2026-08-22)
+# ---------------------------------------------------------------------------
+
+class TestSmsIdEndpoints:
+    """The agent sends the sms_id in the DongleSendSMS Payload header;
+    chan_dongle echoes it back on the report channel
+    (SMS_REPORT_PAYLOAD) and the AGI POSTs here. These endpoints must
+    apply the SAME post-mark treatment as /v1/sms/report — userbot
+    announce, audit, metrics — not just flip the record's status."""
+
+    def test_delivered_notifies_userbot_audits_metrics(self, env, capture):
+        client, store, audit = env
+        rec = store.create(123, "+79261234555", "hello")
+        store.mark_submitted(rec.sms_id)
+
+        r = client.post(f"/v1/sms/{rec.sms_id}/delivered", headers=_auth())
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "sms_id": rec.sms_id}
+        assert store.get(rec.sms_id).delivery_status == "delivered"
+
+        (req,) = capture.captured
+        assert req["path"] == "/events/delivery"
+        headers = {k.lower(): v for k, v in req["headers"].items()}
+        assert headers["x-simbridge-secret"] == "sec"
+        payload = json.loads(req["body"])
+        assert payload["sms_id"] == rec.sms_id
+        assert payload["phone_number"] == "+79261234555"
+        assert payload["telegram_user_id"] == 123
+        assert payload["status"] == "delivered"
+        assert payload["error"] is None
+
+        etype, kw = audit.calls[0]
+        assert etype == EventType.SMS_DELIVERY_REPORT
+        assert kw["outcome"] == "delivered"
+        assert kw["telegram_user_id"] == 123
+
+        metrics = client.app.state.metrics.get_all()["sms"]
+        assert metrics["delivered"] == 1
+        assert metrics["failed"] == 0
+
+    def test_failed_notifies_userbot_audits_metrics(self, env, capture):
+        client, store, audit = env
+        rec = store.create(123, "+79261234555", "hello")
+        store.mark_submitted(rec.sms_id)
+
+        r = client.post(f"/v1/sms/{rec.sms_id}/failed", headers=_auth())
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "sms_id": rec.sms_id}
+        rec2 = store.get(rec.sms_id)
+        assert rec2.delivery_status == "failed"
+        assert rec2.error_message == "delivery_failed"
+
+        (req,) = capture.captured
+        payload = json.loads(req["body"])
+        assert payload["status"] == "failed"
+        assert payload["error"] == "delivery_failed"
+
+        etype, kw = audit.calls[0]
+        assert etype == EventType.SMS_DELIVERY_REPORT
+        assert kw["outcome"] == "failed"
+
+        metrics = client.app.state.metrics.get_all()["sms"]
+        assert metrics["failed"] == 1
+        assert metrics["delivered"] == 0
+
+    def test_unknown_id_404_without_side_effects(self, env, capture):
+        client, store, audit = env
+        r = client.post(
+            "/v1/sms/" + "ab" * 16 + "/delivered", headers=_auth()
+        )
+        assert r.status_code == 404
+        assert capture.captured == []
+        assert audit.calls == []
+        metrics = client.app.state.metrics.get_all()["sms"]
+        assert metrics["delivered"] == 0
+        assert metrics["failed"] == 0

@@ -23,12 +23,20 @@ JSON body:
     ``EnvironmentFile``. Secrets never traverse the dialplan — channel
     variables are visible via AMI/CLI.
 
-Delivery reports (event ``report``) go a different way: the raw
-carrier text is POSTed to the **agent** (not the userbot) at
-``{AGENT_URL}/v1/sms/report`` with ``Authorization: Bearer
-{SIMBRIDGE_AGENT_TOKEN}`` — both from the process environment. The
-agent matches the report against its correlation store and resolves
-the record as delivered/failed.
+Delivery reports (event ``report``) go a different way, to the
+**agent** (not the userbot), with ``Authorization: Bearer
+{SIMBRIDGE_AGENT_TOKEN}`` — both from the process environment:
+
+  - chan_dongle fires a report channel per delivery report whose
+    SMS_TEXT is the sms_id the agent sent in the DongleSendSMS
+    Payload header; with SMS_REPORT_SUCCESS ("1"/"0") the AGI POSTs
+    ``/v1/sms/{sms_id}/delivered`` or ``/failed`` — correlation by ID;
+  - a free-text SMS_TEXT (not a 32-hex id — only reachable via the
+    manual CLI fallback in the dialplan) still goes to
+    ``/v1/sms/report`` and is matched by content against the
+    correlation store. A carrier text report that arrives as an
+    ordinary incoming SMS takes the [sms] exten instead and is
+    forwarded to the userbot as a regular SMS.
 
 Usage in dialplan::
 
@@ -39,9 +47,13 @@ Usage in dialplan::
      same => n,AGI(tg-sms-agi.py,sms)
      same => n,Hangup()
 
+    ; SMS_REPORT_PAYLOAD (the agent's sms_id) first, SMS_BASE64
+    ; (legacy text report) as fallback — see asterisk/extensions.conf
     exten => report,1,Set(SMS_FROM=${CALLERID(num)})
+     same => n,Set(SMS_TEXT=${SMS_REPORT_PAYLOAD})
+     same => n,GotoIf($["${SMS_TEXT}" != ""]?text_set)
      same => n,Set(SMS_TEXT=${BASE64_DECODE(${SMS_BASE64})})
-     same => n,Set(MODEM_ID=${MODEM_ID})
+     same => n(text_set),Set(MODEM_ID=${MODEM_ID})
      same => n,AGI(tg-sms-agi.py,report)
      same => n,Hangup()
 
@@ -68,6 +80,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -167,16 +180,55 @@ def main() -> None:
     modem_id = agi_get_variable("MODEM_ID") or DEFAULT_MODEM_ID
 
     if event == "report":
-        # Delivery report: the raw carrier text goes to the AGENT
-        # (AGENT_URL + bearer token from the process environment),
-        # which matches it against its correlation store.
+        # Delivery report — two shapes reach this exten (the dialplan
+        # sets SMS_TEXT from whichever one fired):
+        #   1. chan_dongle report channel (its own Local channel per
+        #      delivery report): SMS_TEXT = SMS_REPORT_PAYLOAD, which
+        #      the agent set to the sms_id at send time, plus
+        #      SMS_REPORT_SUCCESS "1"/"0". Correlate by ID — reliable,
+        #      no dependence on the carrier's report text (inter-
+        #      carrier routes often deliver no text report at all).
+        #   2. Free text (manual CLI fallback: the exten dialed with
+        #      SMS_BASE64 set) — correlate by content via
+        #      /v1/sms/report.
         text = agi_get_variable("SMS_TEXT")
         if not text:
-            _log("report: empty SMS_TEXT — nothing to correlate, skipping")
+            # No sms_id payload and no text — nothing to correlate.
+            # Still log the carrier's success flag: reports that carry
+            # neither (sends made before the Payload-header feature, or
+            # inter-carrier routes that drop the payload) are otherwise
+            # invisible. Live gap 2026-08-22 03:16 MSK: two delayed
+            # carrier reports for stale +79267523624 sends arrived with
+            # empty payloads and their SUCCESS verdict was lost.
+            success = agi_get_variable("SMS_REPORT_SUCCESS")
+            _log(
+                f"report: empty SMS_TEXT (SMS_REPORT_SUCCESS="
+                f"{success or 'unset'}) — nothing to correlate, skipping"
+            )
             _respond("skipped=empty text")
             return
         url = os.environ.get("AGENT_URL") or DEFAULT_AGENT_URL
         token = os.environ.get(AGENT_TOKEN_ENV, "")
+        success = agi_get_variable("SMS_REPORT_SUCCESS")
+        if success in ("0", "1") and re.fullmatch(r"[0-9a-f]{32}", text):
+            path = (
+                f"/v1/sms/{text}/delivered" if success == "1"
+                else f"/v1/sms/{text}/failed"
+            )
+            ok, detail = post_json(
+                url, {"Authorization": f"Bearer {token}"}, path, {}
+            )
+            if ok:
+                outcome = "delivered" if success == "1" else "failed"
+                _log(f"Delivery report: sms {text} -> {outcome} (from {sender})")
+                _respond(f"resolved={outcome}")
+            else:
+                _log(
+                    f"ERROR: failed to record delivery report for "
+                    f"sms {text}: {detail}"
+                )
+                _respond(f"error={detail}")
+            return
         payload = {"phone_number": sender, "text": text, "modem_id": modem_id}
         ok, detail = post_json(
             url, {"Authorization": f"Bearer {token}"}, "/v1/sms/report", payload
