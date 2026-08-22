@@ -72,6 +72,20 @@ class TestPhoneNormalizer:
         """US number: +14155552671"""
         assert normalize_e164("+14155552671") == "+14155552671"
 
+    def test_too_short_is_malformed(self):
+        """Fewer than 7 digits is never a phone number (2026-08-22):
+        "989" used to normalize to "+989" and get submitted to the
+        modem; the user must see "Неправильный номер ..." instead."""
+        assert normalize_e164("989") is None
+        assert normalize_e164("+989") is None
+        assert normalize_e164("123456") is None
+
+    def test_seven_digit_minimum(self):
+        """7 digits is the shortest real international number
+        (e.g. Tonga/Samoa +676/+685) and must still pass."""
+        assert normalize_e164("+67623123") == "+67623123"
+        assert normalize_e164("67623123") == "+67623123"
+
 
 class TestServiceNumbers:
     """Service number detection."""

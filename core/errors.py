@@ -16,6 +16,12 @@ class SMSErrorType(Enum):
     # Submit-time errors
     NUMBER_MISSING = "Номер не указан"
     NUMBER_MALFORMED = "Некорректный формат номера"
+    # Context-specific malformed-number messages (user-facing, 2026-08-22):
+    # the user should see WHY the number was rejected — an SMS destination
+    # vs a call target. NUMBER_MALFORMED is kept for paths that are neither
+    # (e.g. /block, /unblock) and for the agent-side vocabulary.
+    NUMBER_MALFORMED_SMS = "Неправильный номер для СМС"
+    NUMBER_MALFORMED_CALL = "Неправильный номер для звонка"
     MODEM_UNAVAILABLE = "Модем недоступен"
     NO_GSM_REGISTRATION = "Модем не зарегистрирован в сети"
     SIM_UNAVAILABLE = "SIM-карта недоступна"
@@ -29,6 +35,10 @@ class SMSErrorType(Enum):
 
     # Generic
     UNKNOWN = "Неизвестная ошибка"
+    # UX-layer error (not a modem submit): the message started with "/"
+    # but is not a known command. Surfaced only to users who ARE in the
+    # ACL — unknown users get total silence (see userbot access gating).
+    UNKNOWN_COMMAND = "Неизвестная команда"
 
 
     @property
@@ -37,6 +47,8 @@ class SMSErrorType(Enum):
         return self in {
             SMSErrorType.NUMBER_MISSING,
             SMSErrorType.NUMBER_MALFORMED,
+            SMSErrorType.NUMBER_MALFORMED_SMS,
+            SMSErrorType.NUMBER_MALFORMED_CALL,
             SMSErrorType.MODEM_UNAVAILABLE,
             SMSErrorType.NO_GSM_REGISTRATION,
             SMSErrorType.SIM_UNAVAILABLE,

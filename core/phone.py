@@ -25,10 +25,22 @@ def normalize_e164(raw: str) -> Optional[str]:
 
     Rules:
     - Strip all non-digit characters except leading '+'
+    - Fewer than 7 digits is never a phone number (shortest real
+      international numbers are 7 digits, e.g. Tonga/Samoa +676/+685)
+      — None (malformed). 2026-08-22: without this, "989" normalized
+      to "+989" (formally valid E.164) and was submitted to the modem
+      instead of surfacing "Неправильный номер ...".
     - If the result starts with '8' and is 11 digits (Russia), replace with '+'
     - If the result starts with '7' and is 11 digits (Russia), prefix with '+'
     - If the result starts with '+', validate as E.164
     - Otherwise, None (malformed)
+
+    Known limitation: a TRUNCATED Russian number with an explicit '+'
+    (e.g. "+798961271", 10 digits) still passes the E.164 shape check —
+    distinguishing it from a genuine 10-digit foreign number would need
+    country-code semantics, which this normalizer deliberately does not
+    encode. Such a submission fails at the modem with a visible
+    "Ошибка отправки ..." — never silent.
     """
     if not raw or not raw.strip():
         return None
@@ -40,6 +52,9 @@ def normalize_e164(raw: str) -> Optional[str]:
     digits = re.sub(r"[^\d]", "", stripped)
 
     if not digits:
+        return None
+
+    if len(digits) < 7:
         return None
 
     if has_plus:

@@ -72,6 +72,57 @@ def extract_call_request(text: Optional[str]) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Command classification (2026-08-22)
+#
+# A message starting with "/" is a command attempt; its first token
+# (compared case-insensitively) decides which handler owns it. These are
+# pure functions so the dispatch rules are unit-testable without a
+# Telethon event (telethon is not installed in the test environment).
+# ---------------------------------------------------------------------------
+
+KNOWN_COMMANDS = frozenset({"sms", "broadcast", "block", "unblock", "help"})
+
+
+def command_token(text: Optional[str]) -> Optional[str]:
+    """Lowercase first token if *text* starts with "/", else None.
+
+    "/SMS +7.. hi" -> "sms"; "/EEE x" -> "eee"; "988.." -> None;
+    "/  " -> None (no token). Pure: no Telethon event involved.
+    """
+    if not text:
+        return None
+    stripped = text.lstrip()
+    if not stripped.startswith("/"):
+        return None
+    parts = stripped[1:].split(None, 1)
+    # "/" or "/   " -> parts is [] (no token) — not a command attempt
+    return parts[0].lower() if parts else None
+
+
+def is_unknown_command(text: Optional[str]) -> bool:
+    """True if *text* starts with "/" but is not a known command.
+
+    Func-filter for the unknown-command handler. Mutually exclusive with
+    the five command patterns by construction (they match exactly the
+    KNOWN_COMMANDS tokens), so "/sms …" never reaches the unknown handler
+    and vice versa — no double dispatch.
+    """
+    token = command_token(text)
+    return token is not None and token not in KNOWN_COMMANDS
+
+
+def is_plain_reply_candidate(text: Optional[str]) -> bool:
+    """True if *text* is neither a command nor a bare-number call request.
+
+    Part of the func-filter for the reply-to-SMS handler: a plain reply
+    like "Ответ" qualifies, while "/sms …" (owned by the /sms handler)
+    and "+7926…" (owned by the call handler) do not — this is what
+    prevents the same message from being dispatched twice.
+    """
+    return command_token(text) is None and not extract_call_request(text)
+
+
 class Userbot:
     """Telegram userbot wrapper."""
 
@@ -115,27 +166,144 @@ class Userbot:
         # Register handlers
         self._register_handlers()
 
+    def _access(self, sender_id: int, right: str) -> str:
+        """Access verdict for *sender_id* against *right*.
+
+        Returns:
+          "ok"      — user has the right; proceed;
+          "denied"  — user IS in the ACL but lacks the right: the caller
+                      replies SMSErrorType.DENIED ("Недостаточно прав");
+          "unknown" — user is NOT in the ACL at all: the caller stays
+                      SILENT (no reply).
+
+        The unknown-silence is the 2026-08-22 behavior the user
+        requested: a sender who is not in the access list must get no
+        reaction to any message — the bot must not confirm it is
+        listening. Both non-ok verdicts are audit-logged locally; only
+        "denied" produces a Telegram reply.
+        """
+        rights = self._acl.get_user_rights(sender_id)
+        if not rights:
+            self._audit.log(
+                EventType.USER_DENIED,
+                telegram_user_id=sender_id,
+                outcome="unknown_user",
+                details={"right": right},
+            )
+            return "unknown"
+        if right not in rights:
+            self._audit.log(
+                EventType.USER_DENIED,
+                telegram_user_id=sender_id,
+                outcome="denied",
+                details={"right": right},
+            )
+            return "denied"
+        return "ok"
+
+    def _is_known(self, sender_id: int) -> bool:
+        """True if *sender_id* holds at least one ACL right (is in the list).
+
+        A user line in acl.conf always carries at least one right (the
+        parser skips right-less lines), so a non-empty right set is
+        exactly "the user is in the access list".
+        """
+        return bool(self._acl.get_user_rights(sender_id))
+
+    async def _do_send_sms(self, evt, phone: str, text: str,
+                           sender_id: int) -> None:
+        """Validate and submit one outgoing SMS; reply with the outcome.
+
+        Shared by handle_sms (``/sms <phone> <text>``) and
+        handle_sms_reply (a plain reply to a forwarded incoming SMS) —
+        one submission path, one error vocabulary (Rule 1). The caller
+        must have already passed the out_sms access check.
+        """
+        if not (text or "").strip():
+            # Only reachable via the reply path (a "/sms" reply with no
+            # body) — an empty SMS would waste a submission to a real
+            # phone.
+            await evt.reply("Пустое сообщение")
+            return
+
+        norm = normalize_e164(phone)
+        if not norm:
+            await evt.reply(SMSErrorType.NUMBER_MALFORMED_SMS.value)
+            return
+
+        # S02.2: a blacklisted target is not sent to.
+        if self._blacklist.contains(norm):
+            await evt.reply(SMSErrorType.BLACKLISTED.value)
+            return
+
+        # Call agent API (HTTP) with correlation (S02.3).
+        # The x-correlation-id header activates the agent's replay
+        # protection (S01.3); the same id is sent in the JSON body for
+        # audit tracing.
+        cid = uuid.uuid4().hex
+        import httpx
+
+        try:
+            async with httpx.AsyncClient() as http:
+                resp = await http.post(
+                    f"{self._agent_url}/v1/sms",
+                    json={
+                        "to": norm,
+                        "text": text,
+                        "telegram_user_id": sender_id,
+                        "telegram_message_id": evt.message.id,
+                        "correlation_id": cid,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {self._agent_token}",
+                        "Content-Type": "application/json",
+                        "x-correlation-id": cid,
+                    },
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                await evt.reply("Отправлено")
+        except httpx.HTTPStatusError as e:
+            # S02.4: Map HTTP errors to user-friendly messages.
+            # The agent returns {"detail": "<localized>"} on 4xx/5xx
+            # (e.g. the categorized 502 message) — prefer it over
+            # the raw body.
+            try:
+                detail = e.response.json().get("detail") or ""
+            except (ValueError, AttributeError):
+                detail = e.response.text
+            if e.response.status_code == 403:
+                await evt.reply(SMSErrorType.BLACKLISTED.value)
+            elif e.response.status_code == 429:
+                await evt.reply("Слишком много SMS. Попробуйте позже.")
+            else:
+                await evt.reply(
+                    f"Ошибка отправки: {detail}" if detail
+                    else SMSErrorType.SEND_FAILED.value
+                )
+        except httpx.HTTPError as e:
+            await evt.reply(SMSErrorType.MODEM_UNAVAILABLE.value)
+
     def _register_handlers(self) -> None:
         """Register Telethon event handlers."""
 
-        @self._client.on(events.NewMessage(pattern=r"^/sms\b"))
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/sms\b"))
         async def handle_sms(evt):
-            """Handle /sms <phone> <message> or reply to incoming SMS."""
+            """Handle /sms <phone> <message> (case-insensitive, 2026-08-22)
+            or a /sms-prefixed reply to an incoming SMS."""
             sender_id = evt.sender_id if evt.sender_id else 0
 
-            # ACL check
-            if not self._acl.check(sender_id, "out_sms"):
-                self._audit.log(
-                    EventType.USER_DENIED,
-                    telegram_user_id=sender_id,
-                    outcome="denied",
-                    details={"right": "out_sms", "command": "sms"},
-                )
-                # S02.4: an ACL denial is a denial — not "number missing".
-                await evt.reply(SMSErrorType.DENIED.value)
+            # Access gate FIRST (2026-08-22): unknown sender -> silence,
+            # known sender without out_sms -> "Недостаточно прав". No
+            # parsing or submission happens before this verdict.
+            verdict = self._access(sender_id, "out_sms")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
                 return
 
-            # S02.3: Check if this is a reply to an incoming SMS
+            # S02.3: a /sms-prefixed reply to an incoming SMS carries the
+            # number in the quoted message, not in the text.
             phone = None
             text = None
 
@@ -152,10 +320,11 @@ class Userbot:
                     )
                     if sms_match:
                         phone = sms_match.group(1)
-                        text = evt.message.text.strip()
-                        # Strip the quoted reply part if present
-                        if text.startswith("/sms"):
-                            text = re.sub(r"^/sms\s+", "", text).strip()
+                        raw = (evt.message.text or "").strip()
+                        # Strip the (case-insensitive) command prefix if
+                        # the reply re-quotes it, e.g. "/SMS Ответ".
+                        m = re.match(r"(?i)^/sms\s*", raw)
+                        text = raw[m.end():].strip() if m else raw
 
             if not phone:
                 # Not a reply, parse arguments
@@ -166,86 +335,29 @@ class Userbot:
                 phone = parts[1]
                 text = parts[2]
 
-            # Normalize phone number (S02.1)
-            norm = normalize_e164(phone)
-            if not norm:
-                await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
-                return
+            await self._do_send_sms(evt, phone, text, sender_id)
 
-            # S02.2: Check blacklist
-            if self._blacklist.contains(norm):
-                await evt.reply(SMSErrorType.BLACKLISTED.value)
-                return
-
-            # Call agent API (HTTP) with correlation (S02.3).
-            # The x-correlation-id header activates the agent's replay
-            # protection (S01.3); the same id is sent in the JSON body for
-            # audit tracing.
-            cid = uuid.uuid4().hex
-            import httpx
-
-            try:
-                async with httpx.AsyncClient() as http:
-                    resp = await http.post(
-                        f"{self._agent_url}/v1/sms",
-                        json={
-                            "to": norm,
-                            "text": text,
-                            "telegram_user_id": sender_id,
-                            "telegram_message_id": evt.message.id,
-                            "correlation_id": cid,
-                        },
-                        headers={
-                            "Authorization": f"Bearer {self._agent_token}",
-                            "Content-Type": "application/json",
-                            "x-correlation-id": cid,
-                        },
-                        timeout=30.0,
-                    )
-                    resp.raise_for_status()
-                    await evt.reply("Отправлено")
-            except httpx.HTTPStatusError as e:
-                # S02.4: Map HTTP errors to user-friendly messages.
-                # The agent returns {"detail": "<localized>"} on 4xx/5xx
-                # (e.g. the categorized 502 message) — prefer it over
-                # the raw body.
-                try:
-                    detail = e.response.json().get("detail") or ""
-                except (ValueError, AttributeError):
-                    detail = e.response.text
-                if e.response.status_code == 403:
-                    await evt.reply(SMSErrorType.BLACKLISTED.value)
-                elif e.response.status_code == 429:
-                    await evt.reply("Слишком много SMS. Попробуйте позже.")
-                else:
-                    await evt.reply(
-                        f"Ошибка отправки: {detail}" if detail
-                        else SMSErrorType.SEND_FAILED.value
-                    )
-            except httpx.HTTPError as e:
-                await evt.reply(SMSErrorType.MODEM_UNAVAILABLE.value)
-
-        @self._client.on(events.NewMessage(pattern=r"^/broadcast\b"))
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/broadcast\b"))
         async def handle_broadcast(evt):
-            """Handle /broadcast <message> — send to all out_sms users."""
+            """Handle /broadcast <message> — send to all out_sms users
+            (case-insensitive, 2026-08-22)."""
+            sender_id = evt.sender_id or 0
+
+            # Access gate FIRST (2026-08-22): unknown -> silence,
+            # known without out_sms -> "Недостаточно прав". The usage
+            # hint is only shown to users who passed the gate.
+            verdict = self._access(sender_id, "out_sms")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
             parts = evt.message.text.split(None, 1)
             if len(parts) < 2:
                 await evt.reply("Usage: /broadcast <message>")
                 return
 
             message = parts[1]
-            sender_id = evt.sender_id or 0
-
-            # ACL check
-            if not self._acl.check(sender_id, "out_sms"):
-                self._audit.log(
-                    EventType.USER_DENIED,
-                    telegram_user_id=sender_id,
-                    outcome="denied",
-                    details={"right": "out_sms", "command": "broadcast"},
-                )
-                await evt.reply(SMSErrorType.DENIED.value)
-                return
 
             # D13: send the raw text to every user with out_sms,
             # including the sender. Per-user isolation.
@@ -287,20 +399,18 @@ class Userbot:
             sender_id = evt.sender_id if evt.sender_id else 0
             phone = extract_call_request(evt.message.text or "")
 
-            # S04.3: ACL before any call session.
-            if not self._acl.check(sender_id, "out_call"):
-                self._audit.log(
-                    EventType.USER_DENIED,
-                    telegram_user_id=sender_id,
-                    outcome="denied",
-                    details={"right": "out_call", "command": "call"},
-                )
-                await evt.reply(SMSErrorType.DENIED.value)
+            # S04.3: access before any call session (2026-08-22):
+            # unknown -> silence, known without out_call -> "Недостаточно
+            # прав". No dialing, no agent registration before this.
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
                 return
 
             norm = normalize_e164(phone)
             if not norm:
-                await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
+                await evt.reply(SMSErrorType.NUMBER_MALFORMED_CALL.value)
                 return
 
             # S02.2 parity: a blacklisted target is not dialed.
@@ -389,36 +499,30 @@ class Userbot:
         async def handle_voice_note(evt):
             """Handle incoming voice notes from Telegram."""
             sender_id = evt.sender_id or 0
-            if not self._acl.check(sender_id, "in_call"):
-                self._audit.log(
-                    EventType.USER_DENIED,
-                    telegram_user_id=sender_id,
-                    outcome="denied",
-                    details={"right": "in_call"},
-                )
-                return
+            # 2026-08-22: no reply in either verdict (voice notes have no
+            # user-facing error channel here yet), but _access keeps the
+            # audit accurate (unknown_user vs denied).
+            self._access(sender_id, "in_call")
             # TODO: download voice note, forward to agent for playback
             pass
 
-        @self._client.on(events.NewMessage(pattern=r"^/block\b"))
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/block\b"))
         async def handle_block(evt):
-            """Handle /block <phone> — add to blacklist (S02.2)."""
+            """Handle /block <phone> — add to blacklist (S02.2,
+            case-insensitive 2026-08-22)."""
+            sender_id = evt.sender_id or 0
+
+            # Access gate FIRST (2026-08-22): unknown -> silence,
+            # known without out_sms -> "Недостаточно прав".
+            verdict = self._access(sender_id, "out_sms")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
             parts = evt.message.text.split()
             if len(parts) < 2:
                 await evt.reply("Usage: /block <phone>")
-                return
-
-            sender_id = evt.sender_id or 0
-
-            # ACL: require out_sms (blocking is an admin-level action)
-            if not self._acl.check(sender_id, "out_sms"):
-                self._audit.log(
-                    EventType.USER_DENIED,
-                    telegram_user_id=sender_id,
-                    outcome="denied",
-                    details={"right": "out_sms", "command": "block"},
-                )
-                await evt.reply(SMSErrorType.DENIED.value)
                 return
 
             phone = parts[1]
@@ -450,24 +554,23 @@ class Userbot:
             except httpx.HTTPError as e:
                 await evt.reply(f"Error blocking number: {e}")
 
-        @self._client.on(events.NewMessage(pattern=r"^/unblock\b"))
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/unblock\b"))
         async def handle_unblock(evt):
-            """Handle /unblock <phone> — remove from blacklist (S02.2)."""
+            """Handle /unblock <phone> — remove from blacklist (S02.2,
+            case-insensitive 2026-08-22)."""
+            sender_id = evt.sender_id or 0
+
+            # Access gate FIRST (2026-08-22): unknown -> silence,
+            # known without out_sms -> "Недостаточно прав".
+            verdict = self._access(sender_id, "out_sms")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
             parts = evt.message.text.split()
             if len(parts) < 2:
                 await evt.reply("Usage: /unblock <phone>")
-                return
-
-            sender_id = evt.sender_id or 0
-
-            if not self._acl.check(sender_id, "out_sms"):
-                self._audit.log(
-                    EventType.USER_DENIED,
-                    telegram_user_id=sender_id,
-                    outcome="denied",
-                    details={"right": "out_sms", "command": "unblock"},
-                )
-                await evt.reply(SMSErrorType.DENIED.value)
                 return
 
             phone = parts[1]
@@ -498,10 +601,14 @@ class Userbot:
             except httpx.HTTPError as e:
                 await evt.reply(f"Error unblocking number: {e}")
 
-        @self._client.on(events.NewMessage(pattern=r"^/help\b"))
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/help\b"))
         async def handle_help(evt):
-            """Show available commands."""
+            """Show available commands (known ACL users only)."""
             sender_id = evt.sender_id or 0
+            # 2026-08-22: unknown users get total silence — /help must
+            # not confirm the bot exists or list commands to strangers.
+            if not self._is_known(sender_id):
+                return
             rights = self._acl.get_user_rights(sender_id)
 
             help_text = "SimBridge commands:\n"
@@ -516,6 +623,75 @@ class Userbot:
                 help_text += "  (incoming SMS forwarded automatically)\n"
 
             await evt.reply(help_text)
+
+        @self._client.on(
+            events.NewMessage(
+                func=lambda e: not e.voice
+                and is_unknown_command(e.message.text or "")
+            )
+        )
+        async def handle_unknown_command(evt):
+            """Unknown command (/EEE ...) — "Неизвестная команда" to known
+            users, total silence to unknown ones (2026-08-22).
+
+            func filter, not a pattern: "starts with / but is NOT one of
+            the KNOWN_COMMANDS tokens" cannot be expressed as the pattern
+            of one known command. The filters are mutually exclusive:
+            pattern handlers match only KNOWN_COMMANDS tokens, and
+            handle_sms_reply excludes every "/"-prefixed text — no double
+            dispatch (see is_unknown_command / is_plain_reply_candidate).
+            """
+            sender_id = evt.sender_id or 0
+            if not self._is_known(sender_id):
+                self._audit.log(
+                    EventType.USER_DENIED,
+                    telegram_user_id=sender_id,
+                    outcome="unknown_user",
+                    details={
+                        "reason": "unknown_command",
+                        "text": (evt.message.text or "")[:20],
+                    },
+                )
+                return
+            await evt.reply(
+                f"{SMSErrorType.UNKNOWN_COMMAND.value}. /help — список команд."
+            )
+
+        @self._client.on(
+            events.NewMessage(
+                func=lambda e: (
+                    e.reply_to_msg_id is not None
+                    and not e.voice
+                    and (e.message.text or "").strip()
+                    and is_plain_reply_candidate(e.message.text or "")
+                )
+            )
+        )
+        async def handle_sms_reply(evt):
+            """A plain reply (no /sms prefix) to a forwarded incoming SMS
+            sends the reply text to that number (2026-08-22: user replied
+            "Ответ" to the "Вход" SMS message and nothing was sent).
+
+            Only replies to messages in the exact format we forward
+            incoming SMS in ("SMS +7...") are acted on; a reply to any
+            other message is left silent. The access gate runs before
+            any parsing or reply (see _access).
+            """
+            sender_id = evt.sender_id or 0
+            verdict = self._access(sender_id, "out_sms")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+            reply_to = await evt.get_reply_message()
+            if not reply_to:
+                return
+            sms_match = re.match(r"SMS\s+(\+?\d+)", reply_to.text or "")
+            if not sms_match:
+                return
+            await self._do_send_sms(
+                evt, sms_match.group(1), (evt.message.text or "").strip(), sender_id
+            )
 
     async def resolve_master(self) -> int:
         """Resolve master user ID via get_entity at startup.
