@@ -93,7 +93,13 @@ $MP use <name> [--force] # FULL SWITCH (see below)
 The udev reload is scoped to the two subsystems the rules act on — tty
 (symlinks + the per-port `ID_MM_DEVICE_IGNORE` tags) and usb (the tag on
 the composite device) — a bare `udevadm trigger` would re-fire every
-device on the box.
+device on the box. For a dongle that is **already plugged in**, the
+`usbmisc`/`net` subtree nodes (cdc-wdm, the QMI net interface) are
+re-tagged only at the next enumeration (re-plug/reboot); that gap is
+inert: those nodes carry no vendor port-type tag, so ModemManager's
+STRICT plugin allowlist does not build a modem from them (verified live
+on 3p14-aaa during the 2026-08-25 swap: an MM restart re-enumerated the
+untagged nodes and reported no modems).
 
 ## Swap workflow — replacing the modem physically
 
