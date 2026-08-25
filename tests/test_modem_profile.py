@@ -27,6 +27,7 @@ Covered:
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import types
@@ -534,6 +535,173 @@ class TestProbe:
         with pytest.raises(modem_profile.ProfileError):
             modem_profile.cmd_probe(types.SimpleNamespace(
                 commit="quectel-ec25", audio="", data=""))
+
+    def test_usbcfg_numeric_decodes_voice_via_nmea(self, st, monkeypatch,
+                                                   capsys):
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QCFG="USBCFG"':
+                    return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,0'
+                if cmd == "AT+QPCMV?":
+                    return "+QPCMV: 1,0"
+                if cmd == 'AT+QGPSCFG="outport"':
+                    return '+QGPSCFG: "outport","none"'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        rc = modem_profile.cmd_probe(
+            types.SimpleNamespace(commit="", audio="", data=""))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "nmea=1" in out
+        assert "SERIAL PCM via the NMEA port" in out
+        assert "serial voice supported" in out
+        assert "GNSS output is ON" not in out
+
+    def test_usbcfg_uac_flag_warns_unsupported(self, st, monkeypatch,
+                                               capsys):
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2" and cmd == "AT+CGMM":
+                return "EC25-EU"
+            if dev == "/dev/ttyUSB2" and cmd == 'AT+QCFG="USBCFG"':
+                return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,1'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        modem_profile.cmd_probe(
+            types.SimpleNamespace(commit="", audio="", data=""))
+        out = capsys.readouterr().out
+        assert "uac=1" in out
+        assert "CANNOT use it" in out
+
+    def test_gps_outport_warns_when_nmea_in_use(self, st, monkeypatch,
+                                                capsys):
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QGPSCFG="outport"':
+                    return '+QGPSCFG: "outport","usbnmea"'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        modem_profile.cmd_probe(
+            types.SimpleNamespace(commit="", audio="", data=""))
+        out = capsys.readouterr().out
+        assert "[warn] GNSS output is ON the USB NMEA port" in out
+
+    def test_guess_prefers_nmea_port_for_verified_ec2x_map(self,
+                                                           st, monkeypatch,
+                                                           capsys):
+        # Live EC25-EU layout: the empirical AT port sits at its canonical
+        # slot (iface 02), so the descriptor-doc map is trusted and the
+        # guess must name the NMEA port (iface 01) — never the DM port.
+        (st.root / "stub_tty_devs").write_text(
+            "/dev/ttyUSB0\n/dev/ttyUSB1\n/dev/ttyUSB2\n/dev/ttyUSB3\n")
+        for dev, iface in [("/dev/ttyUSB0", "00"), ("/dev/ttyUSB1", "01"),
+                           ("/dev/ttyUSB2", "02"), ("/dev/ttyUSB3", "03")]:
+            _stub_udev_dev(st, dev, iface, "2c7c", "0125", "EC25-EUX")
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QCFG="USBCFG"':
+                    return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,0'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        rc = modem_profile.cmd_probe(
+            types.SimpleNamespace(commit="", audio="", data=""))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "audio=/dev/ttyUSB1" in out
+        assert "data=/dev/ttyUSB2" in out
+        assert "audio=/dev/ttyUSB0" not in out
+
+    def test_gps_outport_warns_when_unquoted(self, st, monkeypatch, capsys):
+        # Live firmware answers the value without quotes:
+        # '+QGPSCFG: "outport",usbnmea'
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QGPSCFG="outport"':
+                    return '+QGPSCFG: "outport",usbnmea'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        modem_profile.cmd_probe(
+            types.SimpleNamespace(commit="", audio="", data=""))
+        out = capsys.readouterr().out
+        assert "[warn] GNSS output is ON the USB NMEA port" in out
+
+
+class TestAtQuery:
+    """Real pty round-trip — at_query is NOT stubbed here, so the termios
+    path (raw mode, cfsetspeed with B* constants, restore in finally) runs
+    for real. Regression: CPython's termios exposes cfsetspeed only;
+    cfsetispeed/cfsetospeed do not exist and crashed the live probe."""
+
+    @pytest.mark.skipif(not hasattr(os, "ttyname"), reason="needs POSIX pty")
+    def test_roundtrip_on_real_pty(self):
+        import os
+        import pty
+        import threading
+
+        master, slave = pty.openpty()
+        dev = os.ttyname(slave)
+        try:
+            def responder():
+                try:
+                    os.read(master, 256)          # the AT command line
+                    os.write(master, b"+CGMM: EC25-EU\r\nOK\r\n")
+                except OSError:
+                    pass
+
+            threading.Thread(target=responder, daemon=True).start()
+            out = modem_profile.at_query(dev, "AT+CGMM", timeout=5)
+            assert "EC25-EU" in out
+            assert "OK" not in out          # terminal line stripped
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_unopenable_device_returns_empty(self):
+        assert modem_profile.at_query("/nonexistent/ttyX", "AT") == ""
+
+    def test_silent_pty_terminates_within_deadline(self):
+        """Regression (live EC25 diag port): the call must terminate on the
+        timeout even if the tty never delivers data — O_NONBLOCK bounds
+        os.read(), which otherwise slept forever in n_tty_read."""
+        import pty
+        import time
+
+        master, slave = pty.openpty()
+        dev = os.ttyname(slave)
+        try:
+            t0 = time.monotonic()
+            out = modem_profile.at_query(dev, "AT+CGMM", timeout=2)
+            assert out == ""
+            assert time.monotonic() - t0 < 10
+        finally:
+            os.close(master)
+            os.close(slave)
 
 
 # ---------------------------------------------------------------------------

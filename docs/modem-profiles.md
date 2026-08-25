@@ -150,14 +150,32 @@ on-disk profile is the source of truth, not the live files.
 - **Stable symlinks** — udev rules key on USB PID + interface number, which
   survive port reassignment and ttyUSB-index shifts.
 
-## Known modem-specific risk: UAC voice
+## Voice path on Quectel EC2x modems
 
-Some Quectel firmware revisions move voice off the serial audio port onto
-UAC (a virtual USB sound card). The production `chan_dongle` build carries
-voice over the **serial audio port only**. If the module exposes voice via
-UAC only, SMS and call delivery will work but live voice will not.
-`probe` surfaces this directly: the `AT+QCFG="USBCFG"` answer ends with
-`UAC=0/1`. If `UAC=1` and the firmware supports it, switch the module to
-VoiceOverUSB mode; otherwise live voice is not supported by the current
-driver on that modem — the decision is made from probe evidence, not
+Per the Quectel EC2x QCFG manual (§9.2) and the "Voice Over USB and UAC"
+application note, `AT+QCFG="USBCFG"` answers with seven port flags:
+
+```
++QCFG: "usbcfg",<vid>,<pid>,<diag>,<nmea>,<at_port>,<modem>,<rmnet>,<adb>,<uac>
+```
+
+The factory default for the EC25-EU (`0x2C7C:0x0125`) is `1,1,1,1,1,0,0` —
+the NMEA port is exposed and `uac=0`. On this layout there is no separate
+serial *audio* port: the voice PCM stream rides the **NMEA port**
+(`AT+QPCMV=<enable>,0` per the app note; option 0 = USB NMEA port).
+Two conditions:
+
+1. `AT+QPCMV` must be supported by the firmware (the chan_dongle build
+   queries it at connect time and re-arms it on every dial/answer — the
+   setting is not preserved across module reboots, so per-call arming is
+   exactly what is needed);
+2. the NMEA port must be free of GNSS output: if
+   `AT+QGPSCFG="outport"` reports `"usbnmea"`, issue
+   `AT+QGPSCFG="outport","none"` once (this one IS preserved).
+
+If instead `uac=1` in the USBCFG answer, voice is a virtual USB sound card
+(UAC) and the production `chan_dongle` build — serial PCM only — cannot use
+it: SMS and call delivery would work, live voice would not. `probe` decodes
+the USBCFG flags, prints the voice path, and warns when the NMEA port is
+still carrying GNSS output — the decision is made from probe evidence, not
 assumption (Rule 2).

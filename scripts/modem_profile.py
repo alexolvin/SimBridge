@@ -551,6 +551,12 @@ def _capture_from_live() -> dict:
     }
 
 
+# termios speed slots hold speed INDICES (termios.B115200 == 15 on Linux),
+# not baud-rate numbers — mapping from the rate to the constant name.
+_AT_SPEEDS = {9600: "B9600", 19200: "B19200", 38400: "B38400",
+              57600: "B57600", 115200: "B115200"}
+
+
 def at_query(dev: str, at_cmd: str, baud: int = 115200,
              timeout: float = 2.5) -> str:
     """Send one AT command to *dev* (raw termios, stdlib only).
@@ -558,6 +564,7 @@ def at_query(dev: str, at_cmd: str, baud: int = 115200,
     Returns the response body with echo and the final OK/ERROR line
     stripped; "" on any failure (unopenable port, no answer).
     """
+    import fcntl
     import termios
     import tty
 
@@ -565,12 +572,30 @@ def at_query(dev: str, at_cmd: str, baud: int = 115200,
         fd = os.open(dev, os.O_RDWR | os.O_NOCTTY)
     except OSError:
         return ""
-    attrs = None
+    orig = None
     try:
-        attrs = termios.tcgetattr(fd)
-        attrs[4] = attrs[5] = baud
+        orig = termios.tcgetattr(fd)   # kept for restore in finally
         tty.setraw(fd)
+        attrs = termios.tcgetattr(fd)  # raw-mode attrs, current speed
+        # tcgetattr list layout: [iflag, oflag, cflag, lflag, ispeed,
+        # ospeed, cc] — the speed slots hold speed INDICES (termios.B115200
+        # == 15 on Linux), not baud-rate numbers. This RHEL Python build's
+        # termios exposes no cfsetspeed/cfsetispeed, so set the slots
+        # directly.
+        speed = getattr(termios, _AT_SPEEDS.get(baud, "B115200"))
+        attrs[4] = speed
+        attrs[5] = speed
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        # select() is the ONLY arbiter: a blocking os.read() on a serial
+        # tty can sleep forever after select() reports the fd ready with
+        # nothing pending (observed live on the EC25 diag port, kernel
+        # stuck in n_tty_read). O_NONBLOCK turns that into EAGAIN.
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except termios.error:
+            pass
         os.write(fd, (at_cmd + "\r").encode())
         chunks = []
         deadline = time.time() + timeout
@@ -580,6 +605,8 @@ def at_query(dev: str, at_cmd: str, baud: int = 115200,
                 continue
             try:
                 chunk = os.read(fd, 1024)
+            except BlockingIOError:
+                continue           # select race: no data yet, keep polling
             except OSError:
                 break
             if not chunk:
@@ -593,9 +620,9 @@ def at_query(dev: str, at_cmd: str, baud: int = 115200,
                 and ln != at_cmd.replace("\r", "")]
         return "\n".join(body)
     finally:
-        if attrs is not None:
+        if orig is not None:
             try:
-                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+                termios.tcsetattr(fd, termios.TCSANOW, orig)
             except (termios.error, OSError):
                 pass
         os.close(fd)
@@ -742,16 +769,74 @@ def cmd_capture(args) -> int:
     return 0
 
 
+# Canonical EC2x (0x2C7C) USB interface numbering, per the Quectel
+# "USB Interface Descriptor" doc (Table 2). cmd_probe trusts this map only
+# when the empirical AT port (AT+CGMM) sits at its canonical slot.
+_EC2X_IFACE_ROLES = {"00": "dm", "01": "nmea", "02": "at", "03": "modem"}
+
+
+def interpret_usbcfg(usbcfg: str) -> None:
+    """Decode an AT+QCFG="USBCFG" answer and state the voice path.
+
+    EC2x numeric format (Quectel QCFG manual 9.2, 0x2C7C PIDs):
+      +QCFG: "usbcfg",<vid>,<pid>,<diag>,<nmea>,<at_port>,<modem>,
+             <rmnet>,<adb>,<uac>
+    — seven 0/1 port flags after vid/pid. Older firmwares answer a named
+    mode string instead (EC20-style "QMI,ECM,...,AUD,...,UAC=0"); a
+    keyword fallback covers that.
+
+    Voice options per the Quectel EC2x "Voice Over USB and UAC" app note:
+      - serial PCM via the NMEA port (AT+QPCMV option 0) — what this
+        chan_dongle build drives; needs nmea=1 and the NMEA port free
+        of GNSS output;
+      - UAC USB sound card (uac=1) — NOT usable by this build.
+    """
+    parts = [f.strip() for f in
+             usbcfg.split('"')[-1].strip().strip(',').split(',')]
+    if (len(parts) == 9
+            and all(re.fullmatch(r"0x[0-9A-Fa-f]+", f) for f in parts[:2])
+            and all(re.fullmatch(r"[01]", f) for f in parts[2:])):
+        diag, nmea, at_p, modem, net, adb, uac = (int(f) for f in parts[2:])
+        print(f"  ports          : diag={diag} nmea={nmea} at={at_p} "
+              f"modem={modem} net={net} adb={adb} uac={uac}")
+        if uac:
+            print("  voice          : UAC (USB sound card) — the current "
+                  "chan_dongle build CANNOT use it (serial PCM only)")
+        elif nmea:
+            print("  voice          : SERIAL PCM via the NMEA port "
+                  "(AT+QPCMV option 0) — usable by this chan_dongle "
+                  "build; the NMEA port must be free of GNSS output")
+        else:
+            print("  voice          : NO voice port exposed (nmea=0, uac=0) "
+                  '— change the mode (AT+QCFG="USBCFG",...) and re-probe')
+        return
+    # legacy named mode string (EC20-style)
+    serial_audio = "Audio" in usbcfg or "AUD" in usbcfg
+    uac = "UAC=1" in usbcfg or (
+        re.findall(r'"([^"]*)"', usbcfg)
+        and "UAC" in re.findall(r'"([^"]*)"', usbcfg)[-1])
+    if serial_audio:
+        print("  voice          : SERIAL audio port present — "
+              "chan_dongle can use it")
+    elif uac:
+        print("  voice          : UAC (USB sound card) only — the current "
+              "chan_dongle build CANNOT use it for voice")
+    else:
+        print("  voice          : no voice port in this USBCFG mode — "
+              "change mode and re-probe")
+
+
 def cmd_probe(args) -> int:
     devs = _probe_devices()
     if not devs:
         raise ProfileError("no ttyUSB/ttyACM devices found — "
                            "is the modem plugged in?")
-    # Warn if Asterisk may be holding the data port (probe would interleave
-    # with chan_dongle's own AT traffic).
+    # Warn if Asterisk is actually CONNECTED to a dongle (State Free/Busy) —
+    # then probe would interleave with chan_dongle's own AT traffic. A
+    # channel that is "Not connec"/"OFFLINE" holds no port.
     r = run("asterisk -rx 'dongle show devices' 2>&1", timeout=15)
-    if r.returncode == 0 and "OFFLINE" not in (r.stdout or ""):
-        print("[warn] a dongle appears active in Asterisk — for a clean "
+    if r.returncode == 0 and re.search(r"\b(Free|Busy)\b", r.stdout or ""):
+        print("[warn] a dongle is CONNECTED in Asterisk — for a clean "
               "probe stop it first: systemctl stop asterisk")
 
     print("Discovered ports:")
@@ -770,27 +855,56 @@ def cmd_probe(args) -> int:
     print(f"AT port        : {at_dev or 'NOT FOUND'}"
           + (f"  (AT+CGMM -> {cgmm})" if cgmm else ""))
 
-    usbcfg = ""
     if at_dev:
         usbcfg = at_query(at_dev, 'AT+QCFG="USBCFG"')
         if usbcfg:
-            usbcfg_disp = usbcfg
+            print(f"USBCFG         : {usbcfg}")
+            interpret_usbcfg(usbcfg)
         else:
-            usbcfg_disp = ("no answer (not a Quectel module or unsupported)")
-        print(f"USBCFG         : {usbcfg_disp}")
-        if usbcfg:
-            fields = [f.strip().strip('"')
-                      for f in usbcfg.split(",")[1:]]
-            print("  (last USBCFG parameter = UAC: 0/1 — if the module exposes "
-                  "voice only via UAC, chan_dongle cannot use it for voice)")
+            print("USBCFG         : no answer (not a Quectel module or "
+                  "unsupported)")
 
-    # Guess: data = AT port; audio = first other tty with an interface number.
+        # Serial voice (Voice over USB): per the Quectel EC2x app note the
+        # PCM stream rides the NMEA port (AT+QPCMV option 0), so QPCMV must
+        # be supported and the NMEA port must be free of GNSS output.
+        qpcmv = at_query(at_dev, "AT+QPCMV?")
+        if qpcmv:
+            print(f"QPCMV          : {qpcmv}  — serial voice supported "
+                  "(chan_dongle arms it per call)")
+        else:
+            print("QPCMV          : no answer — serial voice NOT available "
+                  "on this firmware")
+        gps_out = at_query(at_dev, 'AT+QGPSCFG="outport"')
+        if gps_out:
+            print(f"GPS outport    : {gps_out}")
+            # Firmware answers the value with or without quotes
+            # (live EC25: '+QGPSCFG: "outport",usbnmea') — match both.
+            if re.search(r"\busbnmea\b", gps_out):
+                print("  [warn] GNSS output is ON the USB NMEA port — before "
+                      "serial voice set AT+QGPSCFG=\"outport\",\"none\"")
+
+    # Guess: data = AT port (empirical, via AT+CGMM). Audio = the voice
+    # port: for EC2x (0x2C7C) the Quectel USB interface descriptor doc
+    # fixes the numbering (0=DM, 1=NMEA, 2=AT, 3=Modem) and serial voice
+    # PCM rides the NMEA port — when the empirical AT port sits at its
+    # canonical slot the map is trusted and audio = the NMEA port.
+    # Everything else falls back to the first non-AT port that is not the
+    # EC2x DM/diag slot (still UNVERIFIED — confirm before use).
     data_guess = at_dev or ""
     audio_guess = ""
-    for d in devs:
-        if d["dev"] != at_dev and re.fullmatch(r"\d{2}", d["iface"]):
-            audio_guess = d["dev"]
-            break
+    at_entry = next((d for d in devs if d["dev"] == at_dev), None)
+    if (at_entry is not None and at_entry["vid"].lower() == "2c7c"
+            and _EC2X_IFACE_ROLES.get(at_entry["iface"]) == "at"):
+        audio_guess = next((d["dev"] for d in devs
+                            if _EC2X_IFACE_ROLES.get(d["iface"]) == "nmea"),
+                           "")
+    if not audio_guess:
+        for d in devs:
+            if (d["dev"] != at_dev and re.fullmatch(r"\d{2}", d["iface"])
+                    and not (d["vid"].lower() == "2c7c"
+                             and _EC2X_IFACE_ROLES.get(d["iface"]) == "dm")):
+                audio_guess = d["dev"]
+                break
     print(f"Guess          : data={data_guess or '?'}  "
           f"audio={audio_guess or '?'}   (UNVERIFIED — confirm before use)")
 
