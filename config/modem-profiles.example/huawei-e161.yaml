@@ -1,0 +1,17 @@
+# SimBridge modem profile — reference example (the current production modem).
+# Real profiles live in /etc/simbridge/modem-profiles/ (not in git).
+# This copy was captured from node 3p14-aaa: `modem_profile.py capture huawei-e161`.
+# sim_phone is redacted in this git copy (Rule 5 — real value in /etc).
+name: huawei-e161
+modem_model: "Huawei Technologies Co., Ltd. E161/E169/E620/E800 HSDPA Modem"
+vid_pid: "12d1:1001"
+dongle_name: gsm
+audio_device: /dev/dongle_if1
+data_device: /dev/dongle_if2
+sim_phone: "+7XXXXXXXXXXX"
+udev:
+  - {iface: "00", symlink: dongle_if0}
+  - {iface: "01", symlink: dongle_if1}
+  - {iface: "02", symlink: dongle_if2}
+verified: true
+notes: "captured from live state; working profile for the current modem"

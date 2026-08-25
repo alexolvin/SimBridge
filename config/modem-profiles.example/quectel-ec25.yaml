@@ -1,0 +1,30 @@
+# SimBridge modem profile — reference example (UNVERIFIED template).
+# Real profiles live in /etc/simbridge/modem-profiles/ (not in git).
+#
+# BEFORE using: complete this profile on the target node:
+#   1. plug in the Quectel EC25-EU (with the SIM moved into it)
+#   2. sudo python3 /opt/simbridge/scripts/modem_profile.py probe
+#      (finds the AT port, shows USBCFG; warns about the UAC-voice risk)
+#   3. sudo python3 /opt/simbridge/scripts/modem_profile.py \
+#          probe --commit quectel-ec25 [--data /dev/ttyUSBx --audio /dev/ttyUSBy]
+#      (rewrites vid_pid, port mapping, udev section from the live findings)
+#   4. run a live SMS/call E2E test, set verified: true
+#   5. sudo python3 /opt/simbridge/scripts/modem_profile.py use quectel-ec25
+#
+# Port mapping below is a best-effort guess (VoiceOverUSB mode per the
+# asterisk-chan-quectel prior art). The mapping depends on the module's
+# USBCFG firmware setting and on what else is on the USB bus — the probe
+# rewrites it from live udev metadata; do not rely on this guess.
+name: quectel-ec25
+modem_model: "Quectel EC25-EU"
+vid_pid: "2c7c:0125"
+dongle_name: gsm
+audio_device: /dev/dongle_if1
+data_device: /dev/dongle_if2
+sim_phone: "+7XXXXXXXXXXX"   # redacted in this git copy (Rule 5)
+udev:
+  - {iface: "00", symlink: dongle_if0}
+  - {iface: "01", symlink: dongle_if1}
+  - {iface: "02", symlink: dongle_if2}
+verified: false
+notes: "UNVERIFIED template — complete with probe --commit and a live E2E test"

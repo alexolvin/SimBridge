@@ -59,6 +59,7 @@ import time
 import grp
 import pwd
 import secrets
+import shlex
 import shutil
 import struct
 import subprocess
@@ -1785,6 +1786,17 @@ def _install_asterisk_dialplan() -> None:
         fail("Command:", gen.replace(s.bridge_secret, "<redacted>")
              if s.bridge_secret else gen)
 
+    # 3b. Modem profile — dongle.conf and the dongle udev rule are
+    #     rendered ONLY by scripts/modem_profile.py (Rule 1). Fresh
+    #     installs (incl. remove-then-reinstall, where /etc/simbridge
+    #     was wiped) create the profile here; it starts unverified and
+    #     a live E2E SMS/call flips verified: true (Rule 2/3). Updates
+    #     never re-render — the existing dongle.conf is preserved
+    #     (Rule 4). Phase 8 verifies the dongle registers; a different
+    #     port layout is completed with `modem_profile.py probe`.
+    if s.action != "update":
+        _init_modem_profile()
+
     # 4. AGI hooks — exec bit + symlink into Asterisk's AGI bin dir
     agi_dir = _agi_bin_dir()
     Path(agi_dir).mkdir(parents=True, exist_ok=True)
@@ -1831,6 +1843,46 @@ def _install_asterisk_dialplan() -> None:
     #     without the guard a cold boot can start Asterisk before the
     #     IP exists and the transport is lost (no SIP until restart).
     _write_ts_guard()
+
+def _modem_profile_name() -> str:
+    """Derive the modem-profile name from the chan_dongle channel name.
+
+    Profile names must match [a-z0-9][a-z0-9-]* (modem_profile.py
+    enforces it); the channel name itself stays as asked, only the
+    profile file name is normalized.
+    """
+    base = re.sub(r"[^a-z0-9-]", "-", (s.dongle_name or "").lower())
+    base = re.sub(r"-{2,}", "-", base).strip("-")
+    return base or "modem"
+
+def _init_modem_profile() -> None:
+    """Fresh install: create the modem profile and render dongle.conf +
+    the dongle udev rule via scripts/modem_profile.py.
+
+    The profile manager is the single mechanism that renders those two
+    files (Rule 1) — this installer does not hand-write them. The
+    profile starts `verified: false`; phase 8 proves the dongle
+    registers and a live E2E SMS/call flips verified: true (Rule 2/3).
+    audio/data use the standard dongle_if1/dongle_if2 udev convention;
+    a modem with a different port layout is completed later with
+    `modem_profile.py probe` (docs/modem-profiles.md).
+    """
+    pname = _modem_profile_name()
+    if pname != s.dongle_name:
+        warn(f"Profile name '{pname}' derived from channel '{s.dongle_name}'.")
+    m = re.search(r"\b([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\b", s.modem_model or "")
+    vid_pid = f"{m.group(1).lower()}:{m.group(2).lower()}" if m else ""
+    cmd = (f"{VENV_DIR}/bin/python {INSTALL_DIR}/scripts/modem_profile.py "
+           f"init {shlex.quote(pname)} "
+           f"--modem-model {shlex.quote(s.modem_model or '')} "
+           f"--vid-pid {shlex.quote(vid_pid)} "
+           f"--dongle-name {shlex.quote(s.dongle_name or '')} "
+           f"--sim-phone {shlex.quote(s.sim_phone or '')}")
+    if run_ok(cmd):
+        ok("Modem profile:", f"{pname} — dongle.conf + udev rule rendered")
+    else:
+        warn("Modem profile init failed — dongle.conf / udev rule may need")
+        warn("manual setup. Run later from a shell:", cmd)
 
 def _install_systemd() -> None:
     heading("Installing systemd Units")
