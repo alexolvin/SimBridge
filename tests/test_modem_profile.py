@@ -13,7 +13,8 @@ Covered:
 - validate_profile / render_profile round-trip + invalid-profile rejects
 - render_dongle_conf (audio/data + app-level constants)
 - render_udev_rules (PID + interface-number keying; refuse when missing;
-  device-level ID_MM_DEVICE_IGNORE so ModemManager never probes the dongle)
+  ID_MM_DEVICE_IGNORE on the USB device AND every port of its subtree —
+  ModemManager isolation, see the EBUSY notes in the script)
 - patch_yaml_field (surgical — every other line byte-identical)
 - backup()
 - apply_artifacts (render + backups, idempotency, legacy 99-dongle.rules
@@ -24,6 +25,7 @@ Covered:
   writes an unverified profile with dongle_if<iface-as-int> symlinks)
 - capture (_capture_from_live from stubbed udev state)
 - list (active marker, empty dir)
+- status (MATCH/MISMATCH marking, ModemManager adoption warning)
 """
 
 from __future__ import annotations
@@ -124,6 +126,15 @@ def _fake_run_output(cmd: str, root: Path):
     if "is-active simbridge-agent" in cmd:
         return types.SimpleNamespace(returncode=0, stdout="active\n",
                                      stderr="")
+    if cmd.startswith("systemctl is-active ModemManager"):
+        f = root / "stub_mm_active"
+        out = f.read_text().strip() if f.exists() else ""
+        return types.SimpleNamespace(returncode=0, stdout=out + "\n",
+                                     stderr="")
+    if cmd.startswith("mmcli -L"):
+        f = root / "stub_mmcli"
+        out = f.read_text() if f.exists() else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
     if cmd.startswith("ls -1 /dev/ttyUSB*") or cmd.startswith(
             "ls -1 /dev/ttyACM*"):
         f = root / "stub_tty_devs"
@@ -250,15 +261,25 @@ class TestRenderUdevRules:
             in text
         assert 'OWNER="asterisk", GROUP="dialout", MODE="0660"' in text
 
-    def test_mm_ignore_rule_on_usb_device(self, st):
-        # Device-level tag: ModemManager must not probe the dongle
-        # (chan_dongle owns the AT port; MM's probing holds it — EBUSY).
+    def test_mm_ignore_rules_on_device_and_subtree(self, st):
+        # Tag on the USB composite (ATTR = own attributes) AND on every
+        # device in its subtree (ATTRS = ancestor attributes) — on
+        # RHEL9's MM 1.20.2 the composite's properties were not visible
+        # to the filter, the ports' own properties were (EBUSY incident).
         text = modem_profile.render_udev_rules(_hprofile())
-        usb_rules = [l for l in text.splitlines()
-                     if l.startswith('SUBSYSTEM=="usb"')]
-        assert usb_rules == [
-            'SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", '
-            'ATTR{idProduct}=="1001", ENV{ID_MM_DEVICE_IGNORE}="1"']
+        lines = text.splitlines()
+        assert 'SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", ' \
+            'ATTR{idProduct}=="1001", ENV{ID_MM_DEVICE_IGNORE}="1"' in lines
+        assert 'ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="1001", ' \
+            'ENV{ID_MM_DEVICE_IGNORE}="1"' in lines
+        assert len([l for l in lines if "ID_MM_DEVICE_IGNORE" in l]) == 2
+
+    def test_no_mm_rules_without_vid(self, st):
+        # pid alone (malformed vid_pid ":1001") still renders the tty
+        # symlink rules, but no MM ignore rules can be keyed.
+        text = modem_profile.render_udev_rules(_hprofile(vid_pid=":1001"))
+        assert "ID_MM_DEVICE_IGNORE" not in text
+        assert text.count('SUBSYSTEM=="tty"') == 3
 
     def test_refuse_without_vid_pid(self, st):
         with pytest.raises(modem_profile.ProfileError):
@@ -937,3 +958,42 @@ class TestStatus:
         rc = modem_profile.cmd_status(types.SimpleNamespace())
         assert rc == 0
         assert "MISMATCH" in capsys.readouterr().out
+
+    def test_mm_adoption_warning(self, st, capsys):
+        # MM active AND managing a modem → point at the one-time restart.
+        modem_profile.write_profile(_hprofile())
+        modem_profile.write_active("huawei-e161")
+        (st.root / "stub_lsusb").write_text(
+            "Bus 003 Device 002: ID 12d1:1001 Huawei E161\n")
+        (st.root / "stub_dongle_show").write_text("gsm: Not connec\n")
+        (st.root / "stub_mm_active").write_text("active")
+        (st.root / "stub_mmcli").write_text(
+            "/org/freedesktop/ModemManager1/Modem0 "
+            "(quectel /sys/devices/pci0000:00/usb3/3-1)\n")
+        rc = modem_profile.cmd_status(types.SimpleNamespace())
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "/org/freedesktop/ModemManager1/Modem0" in out
+        assert "systemctl restart ModemManager" in out
+
+    def test_mm_active_no_modems(self, st, capsys):
+        modem_profile.write_profile(_hprofile())
+        modem_profile.write_active("huawei-e161")
+        (st.root / "stub_lsusb").write_text(
+            "Bus 003 Device 002: ID 12d1:1001 Huawei E161\n")
+        (st.root / "stub_mm_active").write_text("active")
+        rc = modem_profile.cmd_status(types.SimpleNamespace())
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no managed modems" in out
+        assert "restart ModemManager" not in out
+
+    def test_mm_inactive_silent(self, st, capsys):
+        modem_profile.write_profile(_hprofile())
+        modem_profile.write_active("huawei-e161")
+        (st.root / "stub_lsusb").write_text(
+            "Bus 003 Device 002: ID 12d1:1001 Huawei E161\n")
+        (st.root / "stub_mm_active").write_text("inactive")
+        rc = modem_profile.cmd_status(types.SimpleNamespace())
+        assert rc == 0
+        assert "ModemManager" not in capsys.readouterr().out

@@ -5,7 +5,7 @@ in exactly four artifacts on the node:
 
 | # | Artifact | What is modem-specific |
 |---|----------|------------------------|
-| 1 | `/etc/udev/rules.d/92-dongle.rules` | USB PID + interface-number → `dongle_ifN` symlinks, `asterisk:dialout` ownership, device-level `ID_MM_DEVICE_IGNORE` (keeps ModemManager off the dongle) |
+| 1 | `/etc/udev/rules.d/92-dongle.rules` | USB PID + interface-number → `dongle_ifN` symlinks, `asterisk:dialout` ownership, `ID_MM_DEVICE_IGNORE` on the USB device and all its ports (keeps ModemManager off the dongle) |
 | 2 | `/etc/asterisk/dongle.conf` | channel name, `audio =`, `data =` devices |
 | 3 | `/etc/simbridge/simbridge.yaml` | `asterisk.dongle`, `sim.modem_model` (two keys) |
 | 4 | `/etc/asterisk/asterisk-globals.conf` | `MODEM_ID` (generated from #3 by the existing `generate_asterisk_config.py`) |
@@ -91,9 +91,9 @@ $MP use <name> [--force] # FULL SWITCH (see below)
    and prints the exact rollback command and the backups it made.
 
 The udev reload is scoped to the two subsystems the rules act on — tty
-(symlinks) and usb (the `ID_MM_DEVICE_IGNORE` tag on the physical device;
-ModemManager needs that change event to drop a device it has already
-adopted) — a bare `udevadm trigger` would re-fire every device on the box.
+(symlinks + the per-port `ID_MM_DEVICE_IGNORE` tags) and usb (the tag on
+the composite device) — a bare `udevadm trigger` would re-fire every
+device on the box.
 
 ## Swap workflow — replacing the modem physically
 
@@ -114,6 +114,10 @@ $MP probe --commit <new-profile> --data /dev/ttyUSB2 --audio /dev/ttyUSB0
 
 # 4. Switch. Unverified, so --force is required (an explicit acknowledgment).
 $MP use <new-profile> --force
+#    If the channel ends up 'Not connec' with EBUSY in the Asterisk log,
+#    `status` will show ModemManager managing the dongle — a one-time
+#    `systemctl restart ModemManager` releases it (see the ModemManager
+#    isolation guarantee below).
 
 # 5. Live end-to-end check (SMS/call) — per policy only on explicit command.
 #    On success, set `verified: true` in the profile.
@@ -150,13 +154,21 @@ on-disk profile is the source of truth, not the live files.
   never read or written by this tool (Rule 5).
 - **Stable symlinks** — udev rules key on USB PID + interface number, which
   survive port reassignment and ttyUSB-index shifts.
-- **ModemManager isolation** — the rendered rules tag the USB device with
-  `ID_MM_DEVICE_IGNORE`. ModemManager's port probing holds the AT port
-  open, which makes chan_dongle fail with `Device or resource busy`
-  (observed live: MM 1.20's vendor rules mark the EC25's AT port, and the
-  tag is honored even under the strict filter policy — MM's
-  `mm_filter_port()` checks it before the plugin allowlists). The dongle
-  is managed by chan_dongle only.
+- **ModemManager isolation** — the rendered rules tag the USB composite
+  device AND every device in its subtree (tty, QMI/usbmisc, net) with
+  `ID_MM_DEVICE_IGNORE`. Both rules are required: on RHEL9 (MM 1.20.2)
+  the filter's physdev lookup did not surface the composite's udev
+  properties, while the ports' own properties were honored — a
+  composite-only tag was not enough (observed live: MM created the EC25
+  modem six seconds after plug-in and held the AT port open, chan_dongle
+  got `Device or resource busy`). MM's `mm_filter_port()` checks the tag
+  before the plugin allowlists under all filter policies, strict
+  included. The tag blocks FRESH enumeration only: if ModemManager
+  adopted the dongle before the rule existed (plugged in earlier), a udev
+  change event will not make it drop the device — run `systemctl restart
+  ModemManager` once (on startup MM re-enumerates from the current udev
+  DB and filters the dongle out). `status` warns when MM is active with
+  managed modems. The dongle is managed by chan_dongle only.
 
 ## Voice path on Quectel EC2x modems
 

@@ -311,19 +311,33 @@ UDEV_RULE_TEMPLATE = (
     'OWNER="asterisk", GROUP="dialout", MODE="0660"'
 )
 
-# Device-level tag telling ModemManager to leave this modem alone.
-# chan_dongle owns the AT/audio ports; when MM probes the dongle it holds
-# the AT port open and chan_dongle then fails to open it (EBUSY) —
-# observed live with the EC25, whose vendor rules
-# (77-mm-quectel-port-types.rules) mark the AT port with high confidence,
-# so even the strict filter policy (the MM default) probes it.
-# ID_MM_DEVICE_IGNORE is honored under all filter policies, strict
+# Tag telling ModemManager to leave this modem alone. chan_dongle owns the
+# AT/audio ports; when MM probes the dongle it holds the AT port open and
+# chan_dongle then fails to open it (EBUSY) — observed live with the EC25,
+# whose vendor rules (77-mm-quectel-port-types.rules) mark the AT port with
+# high confidence, so even the strict filter policy (the MM default) probes
+# it. ID_MM_DEVICE_IGNORE is honored under all filter policies, strict
 # included (mm-filter.c: mm_filter_port() checks it before the plugin
-# allowlists). Keyed by vid:pid on the USB device itself — MM resolves
-# the tag from the physical device for every port.
-UDEV_MM_IGNORE_TEMPLATE = (
+# allowlists, under MM_FILTER_RULE_EXPLICIT_BLOCKLIST).
+#
+# The tag must be present on the PORTS themselves, not only on the USB
+# composite device. On RHEL9 (MM 1.20.2) the filter's physdev lookup
+# (kernel_device_get_global_property → first devtype "usb_device" ancestor)
+# did not surface the composite's udev properties even though the tag was
+# in the udev DB at the fresh plug-in event — the modem was created
+# anyway, and MM kept the AT port open. What IS reliably visible to the
+# filter is the port's own property list (the vendor rules'
+# ID_MM_PORT_TYPE_* tags on the tty devices are what MM acted on).
+# udev ATTR{} matches a device's own attributes, ATTRS{} its ancestors'
+# (udev(7)) — so two rules are needed to cover both the composite and
+# every device in its subtree (tty, usbmisc/QMI, net ports alike):
+UDEV_MM_IGNORE_SELF_TEMPLATE = (
     'SUBSYSTEM=="usb", ATTR{{idVendor}}=="{vid}", '
     'ATTR{{idProduct}}=="{pid}", ENV{{ID_MM_DEVICE_IGNORE}}="1"'
+)
+UDEV_MM_IGNORE_SUBTREE_TEMPLATE = (
+    'ATTRS{{idVendor}}=="{vid}", '
+    'ATTRS{{idProduct}}=="{pid}", ENV{{ID_MM_DEVICE_IGNORE}}="1"'
 )
 
 
@@ -333,8 +347,10 @@ def render_udev_rules(p: dict) -> str:
     The per-port symlink rules are keyed by ID_MODEL_ID (the USB PID —
     stable across ports and firmware updates of the same model) plus
     ID_USB_INTERFACE_NUM (the interface number — stable; the ttyUSB
-    index is NOT). The device-level rule tags the USB device with
-    ID_MM_DEVICE_IGNORE so ModemManager never probes the dongle.
+    index is NOT). Two ID_MM_DEVICE_IGNORE rules keep ModemManager off
+    the dongle: one on the USB composite device (ATTR = own attributes),
+    one on every device in its subtree (ATTRS = ancestor attributes) —
+    see UDEV_MM_IGNORE_*_TEMPLATE for why both are needed.
     """
     parts = (p.get("vid_pid") or "").split(":")
     vid = parts[0] if len(parts) == 2 else ""
@@ -351,7 +367,8 @@ def render_udev_rules(p: dict) -> str:
         "# Do NOT edit manually.",
     ]
     if vid:
-        lines.append(UDEV_MM_IGNORE_TEMPLATE.format(vid=vid, pid=pid))
+        lines.append(UDEV_MM_IGNORE_SELF_TEMPLATE.format(vid=vid, pid=pid))
+        lines.append(UDEV_MM_IGNORE_SUBTREE_TEMPLATE.format(vid=vid, pid=pid))
     for e in p["udev"]:
         lines.append(UDEV_RULE_TEMPLATE.format(pid=pid, iface=e["iface"],
                                                symlink=e["symlink"]))
@@ -747,6 +764,25 @@ def cmd_status(_args) -> int:
         print(f"  {line}")
     r = run("systemctl is-active simbridge-agent 2>&1")
     print(f"simbridge-agent: {r.stdout.strip()}")
+
+    # ModemManager must not manage the dongle (chan_dongle owns the
+    # ports). The rendered ID_MM_DEVICE_IGNORE tags block FRESH
+    # enumeration; if MM adopted the dongle before the rule existed
+    # (e.g. it was plugged in earlier), a udev change event will NOT
+    # make it drop the device — a one-time service restart will.
+    mm = run("systemctl is-active ModemManager 2>&1")
+    if mm.stdout.strip() == "active":
+        r = run("mmcli -L 2>/dev/null")
+        modems = [l for l in r.stdout.splitlines() if l.startswith("/")]
+        if modems:
+            print("ModemManager   : ACTIVE — managing modems:")
+            for l in modems:
+                print(f"  {l}")
+            print("  (the dongle must not be among them; if the channel "
+                  "is stuck 'Not connec' with EBUSY in the Asterisk "
+                  "log, run: systemctl restart ModemManager)")
+        else:
+            print("ModemManager   : active, no managed modems")
     return 0
 
 
