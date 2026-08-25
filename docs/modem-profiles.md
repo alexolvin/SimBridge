@@ -5,7 +5,7 @@ in exactly four artifacts on the node:
 
 | # | Artifact | What is modem-specific |
 |---|----------|------------------------|
-| 1 | `/etc/udev/rules.d/92-dongle.rules` | USB PID + interface-number → `dongle_ifN` symlinks, `asterisk:dialout` ownership |
+| 1 | `/etc/udev/rules.d/92-dongle.rules` | USB PID + interface-number → `dongle_ifN` symlinks, `asterisk:dialout` ownership, device-level `ID_MM_DEVICE_IGNORE` (keeps ModemManager off the dongle) |
 | 2 | `/etc/asterisk/dongle.conf` | channel name, `audio =`, `data =` devices |
 | 3 | `/etc/simbridge/simbridge.yaml` | `asterisk.dongle`, `sim.modem_model` (two keys) |
 | 4 | `/etc/asterisk/asterisk-globals.conf` | `MODEM_ID` (generated from #3 by the existing `generate_asterisk_config.py`) |
@@ -90,9 +90,10 @@ $MP use <name> [--force] # FULL SWITCH (see below)
    `active` (4 × 3 s retry while Asterisk comes up). On failure it exits 1
    and prints the exact rollback command and the backups it made.
 
-The udev reload is scoped to the tty subsystem
-(`udevadm trigger --subsystem-match=tty`) — a bare `udevadm trigger` would
-re-fire every device on the box.
+The udev reload is scoped to the two subsystems the rules act on — tty
+(symlinks) and usb (the `ID_MM_DEVICE_IGNORE` tag on the physical device;
+ModemManager needs that change event to drop a device it has already
+adopted) — a bare `udevadm trigger` would re-fire every device on the box.
 
 ## Swap workflow — replacing the modem physically
 
@@ -149,6 +150,13 @@ on-disk profile is the source of truth, not the live files.
   never read or written by this tool (Rule 5).
 - **Stable symlinks** — udev rules key on USB PID + interface number, which
   survive port reassignment and ttyUSB-index shifts.
+- **ModemManager isolation** — the rendered rules tag the USB device with
+  `ID_MM_DEVICE_IGNORE`. ModemManager's port probing holds the AT port
+  open, which makes chan_dongle fail with `Device or resource busy`
+  (observed live: MM 1.20's vendor rules mark the EC25's AT port, and the
+  tag is honored even under the strict filter policy — MM's
+  `mm_filter_port()` checks it before the plugin allowlists). The dongle
+  is managed by chan_dongle only.
 
 ## Voice path on Quectel EC2x modems
 

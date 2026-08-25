@@ -12,7 +12,8 @@ systemd, or serial ports.
 Covered:
 - validate_profile / render_profile round-trip + invalid-profile rejects
 - render_dongle_conf (audio/data + app-level constants)
-- render_udev_rules (PID + interface-number keying; refuse when missing)
+- render_udev_rules (PID + interface-number keying; refuse when missing;
+  device-level ID_MM_DEVICE_IGNORE so ModemManager never probes the dongle)
 - patch_yaml_field (surgical — every other line byte-identical)
 - backup()
 - apply_artifacts (render + backups, idempotency, legacy 99-dongle.rules
@@ -241,12 +242,23 @@ class TestRenderDongleConf:
 class TestRenderUdevRules:
     def test_three_rules_keyed_by_pid_and_iface(self, st):
         text = modem_profile.render_udev_rules(_hprofile())
-        rules = [l for l in text.splitlines() if l.startswith("SUBSYSTEM")]
-        assert len(rules) == 3
-        assert all('ENV{ID_MODEL_ID}=="1001"' in r for r in rules)
+        tty_rules = [l for l in text.splitlines()
+                     if l.startswith('SUBSYSTEM=="tty"')]
+        assert len(tty_rules) == 3
+        assert all('ENV{ID_MODEL_ID}=="1001"' in r for r in tty_rules)
         assert 'ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="dongle_if1"' \
             in text
         assert 'OWNER="asterisk", GROUP="dialout", MODE="0660"' in text
+
+    def test_mm_ignore_rule_on_usb_device(self, st):
+        # Device-level tag: ModemManager must not probe the dongle
+        # (chan_dongle owns the AT port; MM's probing holds it — EBUSY).
+        text = modem_profile.render_udev_rules(_hprofile())
+        usb_rules = [l for l in text.splitlines()
+                     if l.startswith('SUBSYSTEM=="usb"')]
+        assert usb_rules == [
+            'SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", '
+            'ATTR{idProduct}=="1001", ENV{ID_MM_DEVICE_IGNORE}="1"']
 
     def test_refuse_without_vid_pid(self, st):
         with pytest.raises(modem_profile.ProfileError):
@@ -331,9 +343,10 @@ class TestApplyArtifacts:
         assert any("dongle.conf.bak-" in b for b in res["backups"])
         assert any("simbridge.yaml.bak-" in b for b in res["backups"])
         assert any("active_modem.bak-" in b for b in res["backups"])
-        # udev was reloaded (tty-scoped trigger)
-        assert any("udevadm trigger --subsystem-match=tty" in c
-                   for c in st.calls)
+        # udev was reloaded (tty + usb-scoped trigger: the usb change
+        # event carries the ID_MM_DEVICE_IGNORE tag to ModemManager)
+        assert any("udevadm trigger --subsystem-match=tty "
+                   "--subsystem-match=usb" in c for c in st.calls)
 
     def test_idempotent_second_call_no_write_no_reload(self, st):
         p = _hprofile()

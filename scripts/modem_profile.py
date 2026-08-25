@@ -311,15 +311,33 @@ UDEV_RULE_TEMPLATE = (
     'OWNER="asterisk", GROUP="dialout", MODE="0660"'
 )
 
+# Device-level tag telling ModemManager to leave this modem alone.
+# chan_dongle owns the AT/audio ports; when MM probes the dongle it holds
+# the AT port open and chan_dongle then fails to open it (EBUSY) —
+# observed live with the EC25, whose vendor rules
+# (77-mm-quectel-port-types.rules) mark the AT port with high confidence,
+# so even the strict filter policy (the MM default) probes it.
+# ID_MM_DEVICE_IGNORE is honored under all filter policies, strict
+# included (mm-filter.c: mm_filter_port() checks it before the plugin
+# allowlists). Keyed by vid:pid on the USB device itself — MM resolves
+# the tag from the physical device for every port.
+UDEV_MM_IGNORE_TEMPLATE = (
+    'SUBSYSTEM=="usb", ATTR{{idVendor}}=="{vid}", '
+    'ATTR{{idProduct}}=="{pid}", ENV{{ID_MM_DEVICE_IGNORE}}="1"'
+)
+
 
 def render_udev_rules(p: dict) -> str:
     """Render /etc/udev/rules.d/92-dongle.rules for profile *p*.
 
-    Rules are keyed by ID_MODEL_ID (the USB PID — stable across ports and
-    firmware updates of the same model) plus ID_USB_INTERFACE_NUM (the
-    interface number — stable; the ttyUSB index is NOT).
+    The per-port symlink rules are keyed by ID_MODEL_ID (the USB PID —
+    stable across ports and firmware updates of the same model) plus
+    ID_USB_INTERFACE_NUM (the interface number — stable; the ttyUSB
+    index is NOT). The device-level rule tags the USB device with
+    ID_MM_DEVICE_IGNORE so ModemManager never probes the dongle.
     """
     parts = (p.get("vid_pid") or "").split(":")
+    vid = parts[0] if len(parts) == 2 else ""
     pid = parts[1] if len(parts) == 2 else ""
     if not pid:
         raise ProfileError(f"profile {p['name']}: no vid_pid — "
@@ -332,6 +350,8 @@ def render_udev_rules(p: dict) -> str:
         f"({p.get('vid_pid', '')})",
         "# Do NOT edit manually.",
     ]
+    if vid:
+        lines.append(UDEV_MM_IGNORE_TEMPLATE.format(vid=vid, pid=pid))
     for e in p["udev"]:
         lines.append(UDEV_RULE_TEMPLATE.format(pid=pid, iface=e["iface"],
                                                symlink=e["symlink"]))
@@ -381,11 +401,15 @@ def apply_artifacts(p: dict, backup_old: bool = True) -> dict:
                 or ps["udev_rule"].read_text() != udev_text:
             _write_atomic(ps["udev_rule"], udev_text, 0o644)
             udev_written = str(ps["udev_rule"])
-            # --subsystem-match=tty: re-evaluate only tty devices (the sole
-            # subsystem these rules act on) — a bare `udevadm trigger`
-            # re-fires every device on the box, too wide for a live node.
+            # Scoped trigger: only the two subsystems these rules act on —
+            # tty (symlink rules) and usb (the ID_MM_DEVICE_IGNORE rule on
+            # the physical device; ModemManager needs that change event to
+            # drop a device it has already adopted). A bare `udevadm
+            # trigger` re-fires every device on the box, too wide for a
+            # live node.
             r = run("udevadm control --reload-rules && "
-                    "udevadm trigger --subsystem-match=tty")
+                    "udevadm trigger --subsystem-match=tty "
+                    "--subsystem-match=usb")
             if r.returncode != 0:
                 print("  [warn] udevadm reload/trigger: "
                       f"{(r.stdout or r.stderr).strip()[:200]}")
