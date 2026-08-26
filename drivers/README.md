@@ -34,7 +34,13 @@ make          # needs: gcc, make, asterisk-devel (18.x)
 
 sudo cp /usr/lib64/asterisk/modules/chan_dongle.so \
         /usr/lib64/asterisk/modules/chan_dongle.so.bak-$(date +%Y%m%d-%H%M%S)
-sudo cp chan_dongle.so /usr/lib64/asterisk/modules/
+# Replace via temp name + atomic rename (new inode). Never cp over the
+# live path in place: the running asterisk has the old file mmap'd and
+# an in-place overwrite corrupts its pages (it crashed the old process
+# on 2026-08-26 06:21 during a deploy).
+sudo cp chan_dongle.so /usr/lib64/asterisk/modules/chan_dongle.so.new
+sudo mv /usr/lib64/asterisk/modules/chan_dongle.so.new \
+        /usr/lib64/asterisk/modules/chan_dongle.so
 sudo systemctl restart asterisk
 ```
 
@@ -53,6 +59,8 @@ AT port, i.e. patch 0001 is in).
 
 ```sh
 sudo cp /usr/lib64/asterisk/modules/chan_dongle.so.bak-<timestamp> \
+        /usr/lib64/asterisk/modules/chan_dongle.so.new
+sudo mv /usr/lib64/asterisk/modules/chan_dongle.so.new \
         /usr/lib64/asterisk/modules/chan_dongle.so
 sudo systemctl restart asterisk
 ```
@@ -62,6 +70,8 @@ sudo systemctl restart asterisk
 - Voice path on EC25-EU (serial PCM via `AT+QPCMV`) is not yet confirmed
   end-to-end with audio. The URC routing + crash fixes are independent of
   it; a live instrumented call is pending.
-- `AT+QURCCFG` NVRAM persistence across a module reboot (`AT+CFUN=0/1`)
-  is unverified — no longer functionally critical, since the driver re-issues
-  the setting on every device init (asterisk restart / USB re-scan).
+- `AT+QURCCFG` NVRAM persistence across a module reboot: **verified
+  2026-08-26** — `"urcport","usbat"` survived a full `AT+CFUN=0/1` cold
+  reset (read back after re-registration). The driver still re-issues the
+  setting on every device init (asterisk restart / USB re-scan) as
+  insurance for a fresh module or NVRAM wipe.
