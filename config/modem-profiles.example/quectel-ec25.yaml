@@ -4,23 +4,30 @@
 # BEFORE using: complete this profile on the target node:
 #   1. plug in the Quectel EC25-EU (with the SIM moved into it)
 #   2. sudo python3 /opt/simbridge/scripts/modem_profile.py probe
-#      (finds the AT port, shows USBCFG; warns about the UAC-voice risk)
+#      (finds the AT port, decodes USBCFG; when uac=1 it locates the
+#      UAC sound card in /proc/asound/cards)
 #   3. sudo python3 /opt/simbridge/scripts/modem_profile.py \
-#          probe --commit quectel-ec25 [--data /dev/ttyUSBx --audio /dev/ttyUSBy]
+#          probe --commit quectel-ec25 [--data /dev/ttyUSBx \
+#                                       --audio /dev/ttyUSBy | --alsadev hw:CARD=...,DEV=0]
 #      (rewrites vid_pid, port mapping, udev section from the live findings)
 #   4. run a live SMS/call E2E test, set verified: true
 #   5. sudo python3 /opt/simbridge/scripts/modem_profile.py use quectel-ec25
 #
-# Port mapping below is a best-effort guess (VoiceOverUSB mode per the
-# asterisk-chan-quectel prior art). The mapping depends on the module's
-# USBCFG firmware setting and on what else is on the USB bus — the probe
-# rewrites it from live udev metadata; do not rely on this guess.
+# Voice path: the EC25-EU runs in UAC mode (USBCFG uac=1, persisted in
+# module NVRAM), so voice rides a virtual USB sound card — alsadev, NOT
+# a serial audio tty (audio_device is empty by design; the two are
+# mutually exclusive). The card NAME is not stable across USB
+# re-enumerations — probe --commit detects it live; do not copy a card
+# name from one node to another.
+# UAC also requires: the asterisk user in the 'audio' group, and the
+# chan_dongle build with patch 0003 (see drivers/README.md).
 name: quectel-ec25
 modem_model: "Quectel EC25-EU"
 vid_pid: "2c7c:0125"
 dongle_name: gsm
-audio_device: /dev/dongle_if1
+audio_device:
 data_device: /dev/dongle_if2
+alsadev: "hw:CARD=EC25EUX,DEV=0"   # example value — probe --commit re-detects
 sim_phone: "+7XXXXXXXXXXX"   # redacted in this git copy (Rule 5)
 udev:
   - {iface: "00", symlink: dongle_if0}

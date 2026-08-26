@@ -140,6 +140,14 @@ def _fake_run_output(cmd: str, root: Path):
         f = root / "stub_tty_devs"
         out = f.read_text() if f.exists() else ""
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+    if cmd.startswith("cat /proc/asound/cards"):
+        f = root / "stub_asound_cards"
+        out = f.read_text() if f.exists() else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+    if cmd.startswith("test -e /proc/asound/card"):
+        ok = (root / "stub_uac_pcm").exists()
+        return types.SimpleNamespace(returncode=0 if ok else 1,
+                                     stdout="", stderr="")
     # generator invocation and everything else: success, silent
     return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -220,6 +228,32 @@ class TestProfileSchema:
     def test_valid_profile_no_errors(self, st):
         assert modem_profile.validate_profile(_hprofile()) == []
 
+    def test_uac_profile_valid(self, st):
+        p = _hprofile(audio_device="", alsadev="hw:CARD=EC25EUX,DEV=0")
+        assert modem_profile.validate_profile(p) == []
+
+    def test_uac_roundtrip(self, st):
+        p = _hprofile(audio_device="", alsadev="hw:CARD=EC25EUX,DEV=0")
+        modem_profile.write_profile(p)
+        loaded = modem_profile.load_profile(
+            st.root / "profiles" / "huawei-e161.yaml")
+        assert loaded == p
+
+    def test_rejects_audio_and_alsadev_together(self, st):
+        p = _hprofile(alsadev="hw:CARD=EC25EUX,DEV=0")
+        errs = modem_profile.validate_profile(p)
+        assert any("mutually exclusive" in e for e in errs), errs
+
+    def test_rejects_alsadev_with_whitespace(self, st):
+        p = _hprofile(audio_device="", alsadev="hw:CARD= EC25EUX")
+        errs = modem_profile.validate_profile(p)
+        assert any("whitespace" in e for e in errs), errs
+
+    def test_rejects_no_voice_path(self, st):
+        p = _hprofile(audio_device="")
+        errs = modem_profile.validate_profile(p)
+        assert any("audio_device" in e for e in errs), errs
+
 
 # ---------------------------------------------------------------------------
 # Renderers
@@ -248,6 +282,13 @@ class TestRenderDongleConf:
         assert "[modem2]" in text
         assert "audio = /dev/ttyUSB1" in text
         assert "data = /dev/ttyUSB2" in text
+
+    def test_uac_profile_omits_audio_and_renders_alsadev(self, st):
+        p = _hprofile(audio_device="", alsadev="hw:CARD=EC25EUX,DEV=0")
+        text = modem_profile.render_dongle_conf(p)
+        assert "alsadev = hw:CARD=EC25EUX,DEV=0" in text
+        assert "audio =" not in text
+        assert "data = /dev/dongle_if2" in text
 
 
 class TestRenderUdevRules:
@@ -597,10 +638,17 @@ class TestProbe:
         assert "serial voice supported" in out
         assert "GNSS output is ON" not in out
 
-    def test_usbcfg_uac_flag_warns_unsupported(self, st, monkeypatch,
-                                               capsys):
+    def test_usbcfg_uac_flag_reports_supported_and_card(self, st, monkeypatch,
+                                                        capsys):
         _stub_quectel(st)
         (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+        (st.root / "stub_asound_cards").write_text(
+            " 0 [NVidia         ]: HDA-Intel - HDA NVidia\n"
+            "                      HDA NVidia at 0xfc080000 irq 136\n"
+            " 3 [EC25EUX        ]: USB-Audio - EC25-EUX\n"
+            "                      Quectel EC25-EUX at usb-0000:06:00.3-1,"
+            " high speed\n")
+        (st.root / "stub_uac_pcm").write_text("")
 
         def fake_at(dev, cmd, **_kw):
             if dev == "/dev/ttyUSB2" and cmd == "AT+CGMM":
@@ -614,7 +662,103 @@ class TestProbe:
             types.SimpleNamespace(commit="", audio="", data=""))
         out = capsys.readouterr().out
         assert "uac=1" in out
-        assert "CANNOT use it" in out
+        assert "UAC (USB sound card)" in out
+        assert "patch 0003" in out
+        assert "hw:CARD=EC25EUX,DEV=0" in out
+
+    def test_usbcfg_uac_card_not_found_reported(self, st, monkeypatch,
+                                                capsys):
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+        # no stub_asound_cards / stub_uac_pcm -> no ALSA card visible
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2" and cmd == "AT+CGMM":
+                return "EC25-EU"
+            if dev == "/dev/ttyUSB2" and cmd == 'AT+QCFG="USBCFG"':
+                return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,1'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        modem_profile.cmd_probe(
+            types.SimpleNamespace(commit="", audio="", data=""))
+        out = capsys.readouterr().out
+        assert "UAC card       : NOT FOUND" in out
+
+    def test_commit_uac_uses_alsadev(self, st, monkeypatch):
+        # USBCFG uac=1 + a discoverable ALSA card: the committed profile
+        # carries alsadev and an empty audio_device (patch 0003).
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+        (st.root / "stub_asound_cards").write_text(
+            " 3 [EC25EUX        ]: USB-Audio - EC25-EUX\n"
+            "                      Quectel EC25-EUX at usb-0000:06:00.3-1,"
+            " high speed\n")
+        (st.root / "stub_uac_pcm").write_text("")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QCFG="USBCFG"':
+                    return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,1'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        rc = modem_profile.cmd_probe(types.SimpleNamespace(
+            commit="quectel-ec25", audio="", data="/dev/ttyUSB2",
+            alsadev=""))
+        assert rc == 0
+        p = modem_profile.load_profile(
+            st.root / "profiles" / "quectel-ec25.yaml")
+        assert p["alsadev"] == "hw:CARD=EC25EUX,DEV=0"
+        assert p["audio_device"] == ""
+        assert p["data_device"] == "/dev/dongle_if3"
+        text = modem_profile.render_dongle_conf(p)
+        assert "alsadev = hw:CARD=EC25EUX,DEV=0" in text
+        assert "audio =" not in text
+
+    def test_commit_uac_explicit_alsadev_wins(self, st, monkeypatch):
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QCFG="USBCFG"':
+                    return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,1'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        rc = modem_profile.cmd_probe(types.SimpleNamespace(
+            commit="quectel-ec25", audio="", data="/dev/ttyUSB2",
+            alsadev="hw:CARD=OTHER,DEV=0"))
+        assert rc == 0
+        p = modem_profile.load_profile(
+            st.root / "profiles" / "quectel-ec25.yaml")
+        assert p["alsadev"] == "hw:CARD=OTHER,DEV=0"
+        assert p["audio_device"] == ""
+
+    def test_commit_uac_no_card_found_fails(self, st, monkeypatch):
+        # uac=1 but no ALSA card visible and no --alsadev -> refuse to
+        # commit a profile with no usable voice path
+        _stub_quectel(st)
+        (st.root / "stub_dongle_show").write_text("gsm: OFFLINE\n")
+
+        def fake_at(dev, cmd, **_kw):
+            if dev == "/dev/ttyUSB2":
+                if cmd == "AT+CGMM":
+                    return "EC25-EU"
+                if cmd == 'AT+QCFG="USBCFG"':
+                    return '+QCFG: "usbcfg",0x2C7C,0x0125,1,1,1,1,1,0,1'
+            return ""
+
+        monkeypatch.setattr(modem_profile, "at_query", fake_at)
+        with pytest.raises(modem_profile.ProfileError):
+            modem_profile.cmd_probe(types.SimpleNamespace(
+                commit="quectel-ec25", audio="", data="/dev/ttyUSB2",
+                alsadev=""))
 
     def test_gps_outport_warns_when_nmea_in_use(self, st, monkeypatch,
                                                 capsys):
@@ -865,6 +1009,22 @@ class TestCapture:
         _write_live_yaml(st)
         with pytest.raises(modem_profile.ProfileError):
             modem_profile._capture_from_live()
+
+    def test_capture_uac_conf(self, st_capture):
+        st = st_capture
+        self._live_state(st)
+        # live dongle.conf in the UAC shape: alsadev instead of audio
+        (st.root / "dongle.conf").write_text(
+            "[general]\ninterval=15\n\n[gsm]\n"
+            "alsadev = hw:CARD=EC25EUX,DEV=0\n"
+            "data = /dev/dongle_if2\n"
+            "context = incoming-mobile\ngroup = 1\n"
+            "smsaspdu = yes\nautodeletesms = yes\n")
+        p = modem_profile._capture_from_live()
+        assert p["alsadev"] == "hw:CARD=EC25EUX,DEV=0"
+        assert p["audio_device"] == ""
+        assert p["data_device"] == "/dev/dongle_if2"
+        assert modem_profile.validate_profile(p) == []
 
 
 # ---------------------------------------------------------------------------
