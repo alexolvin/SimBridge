@@ -101,7 +101,11 @@ class TestDialplanStructure:
         h_body = m.group(0)
         assert "StopMixMonitor()" in h_body
         assert "AGI(tg-voice-agi.py)" in h_body
-        assert "STAT(e,${VMFILE})" in h_body
+        # No STAT() guard: not a registered Asterisk 18 function (it
+        # logged ERROR pbx_functions.c:608 on every voicemail hangup)
+        # and redundant -- the empty-VMFILE GotoIf above plus the
+        # AGI own missing-file handling cover the same case.
+        assert "STAT(" not in h_body
 
     def test_recordings_dir_from_globals(self):
         """Recording path comes from VM_REC_DIR (config), not a /tmp literal."""

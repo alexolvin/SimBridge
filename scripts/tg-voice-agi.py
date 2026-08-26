@@ -41,7 +41,6 @@ Usage in dialplan::
     exten => h,1,NoOp(Hangup handler)
      same => n,StopMixMonitor()
      same => n,GotoIf($["${VMFILE}" = ""]?end)
-     same => n,GotoIf($[${STAT(e,${VMFILE})} = 0]?end)
      same => n,AGI(tg-voice-agi.py)
      same => n(end),Hangup()
 
@@ -184,8 +183,8 @@ def main() -> None:
         return
 
     if ok:
-        # Consumed: delete so the STAT check and the sweep timer
-        # do not resend the same recording.
+        # Consumed: delete so the sweep timer does not resend the
+        # same recording.
         vfm.cleanup_recording(vmfile)
         _log(f"Forwarded voicemail from {caller}: type={vm_type} ({detail})")
         _respond(f"forwarded type={vm_type}")
