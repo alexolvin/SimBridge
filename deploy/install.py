@@ -146,6 +146,12 @@ AST_DROPIN     = "/etc/systemd/system/asterisk.service.d/simbridge-env.conf"
 # each concern stays idempotent on its own (the main EPEL unit has no
 # ExecStartPre; drop-in Exec* lines append, not replace).
 AST_TS_DROPIN  = "/etc/systemd/system/asterisk.service.d/10-wait-tailnet.conf"
+# Crash-restart drop-in: the EPEL vendor unit ships Restart=always
+# commented out. After a channel-module SEGV (2026-08-26 04:58 MSK,
+# chan_dongle NULL-deref on an unsolicited NO CARRIER) the PBX stayed
+# dead until a manual restart; requirement: the telephony stack
+# self-recovers after any crash. Separate file, same convention.
+AST_RESTART_DROPIN = "/etc/systemd/system/asterisk.service.d/20-restart.conf"
 # Asterisk's AGI application dir is a compile-time constant — detect it
 AGI_BIN_DIRS   = ("/usr/lib64/asterisk/agi-bin", "/usr/lib/asterisk/agi-bin")
 # AGI hook scripts linked into the AGI dir (called by extensions.conf)
@@ -920,12 +926,13 @@ def phase_remove() -> None:
         p = Path(f"/etc/systemd/system/{u}")
         if p.exists():
             p.unlink(); info("Removed:", f" {u}")
-    # Our asterisk env drop-in (package files like extensions.conf stay)
-    dropin = Path(AST_DROPIN)
-    if dropin.exists():
-        dropin.unlink()
-        info("Removed:", AST_DROPIN)
-        run_ok(f"rmdir {dropin.parent} 2>/dev/null")
+    # Our asterisk drop-ins (package files like extensions.conf stay)
+    for d in (AST_DROPIN, AST_TS_DROPIN, AST_RESTART_DROPIN):
+        dropin = Path(d)
+        if dropin.exists():
+            dropin.unlink()
+            info("Removed:", d)
+    run_ok(f"rmdir {Path(AST_DROPIN).parent} 2>/dev/null")
     run_ok("systemctl daemon-reload")
     for d in (CONF_DIR, DATA_DIR, LOG_DIR, INSTALL_DIR, VENV_DIR):
         if Path(d).exists():
@@ -1663,6 +1670,39 @@ def _write_ts_guard() -> None:
     ok("Asterisk boot-guard drop-in:", str(p))
 
 
+def _write_asterisk_restart_dropin() -> None:
+    """Write the Asterisk crash-restart drop-in (crash resilience).
+
+    The EPEL vendor unit ships "Restart=always" commented out. After a
+    channel-module SEGV (2026-08-26 04:58 MSK, chan_dongle NULL-deref
+    on an unsolicited NO CARRIER) the PBX stayed dead until a manual
+    restart; requirement: the telephony stack self-recovers after any
+    crash without manual intervention. Unlike ExecStartPre, Restart=
+    is re-read by systemd on daemon-reload alone — no asterisk restart
+    is needed for it to apply, so ast_env_changed is not set.
+    """
+    txt = ("# Auto-recover asterisk after crashes (channel-module SEGV)\n"
+           "# and after power loss / reboot, without manual intervention.\n"
+           "# The vendor unit ships Restart=always commented out;\n"
+           "# enable it here.\n"
+           "[Service]\n"
+           "Restart=always\n"
+           "RestartSec=5\n")
+    p = Path(AST_RESTART_DROPIN)
+    if p.exists() and p.read_text() == txt:
+        ok("Asterisk restart drop-in unchanged.")
+        return
+    if p.exists():
+        bak = (f"{p}.bak-"
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+        Path(bak).write_text(p.read_text())
+        warn("Existing restart drop-in backed up:", bak)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(txt)
+    run_ok("systemctl daemon-reload")
+    ok("Asterisk restart drop-in:", str(p))
+
+
 def _install_silence_wav() -> None:
     """Synthesize the 5 s silence prompt (S04.2 probe exten 778).
 
@@ -1843,6 +1883,11 @@ def _install_asterisk_dialplan() -> None:
     #     without the guard a cold boot can start Asterisk before the
     #     IP exists and the transport is lost (no SIP until restart).
     _write_ts_guard()
+
+    # 5c. Crash restart — the vendor unit ships Restart=always commented
+    #     out; without it a channel-module SEGV leaves the PBX dead
+    #     until a manual restart (incident 2026-08-26, 3p14-aaa).
+    _write_asterisk_restart_dropin()
 
 def _modem_profile_name() -> str:
     """Derive the modem-profile name from the chan_dongle channel name.

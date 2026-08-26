@@ -1172,6 +1172,44 @@ class TestWriteTsGuard:
         assert "missing" in capsys.readouterr().err
 
 
+class TestWriteAsteriskRestartDropin:
+    """Asterisk crash-restart drop-in (Restart=always — the vendor
+    unit ships it commented out; after a channel-module SEGV the PBX
+    must come back by itself, not wait for a manual restart —
+    incident 2026-08-26 04:58 MSK, 3p14-aaa)."""
+
+    def _patch(self, tmp_path, monkeypatch):
+        dropin = tmp_path / "20-restart.conf"
+        monkeypatch.setattr(install, "AST_RESTART_DROPIN", str(dropin))
+        reloads = []
+        monkeypatch.setattr(install, "run_ok",
+                            lambda cmd: reloads.append(cmd))
+        return dropin, reloads
+
+    def test_writes_dropin_and_daemon_reload(
+            self, tmp_path, monkeypatch, ni_state):
+        dropin, reloads = self._patch(tmp_path, monkeypatch)
+        install._write_asterisk_restart_dropin()
+        txt = dropin.read_text()
+        assert "[Service]" in txt
+        assert "Restart=always" in txt
+        assert "RestartSec=5" in txt
+        assert "systemctl daemon-reload" in reloads
+        # Restart= applies on daemon-reload alone — no asterisk restart
+        assert not install.s.ast_env_changed
+
+    def test_idempotent_no_reload_no_backup(
+            self, tmp_path, monkeypatch, ni_state):
+        dropin, reloads = self._patch(tmp_path, monkeypatch)
+        install._write_asterisk_restart_dropin()
+        first = dropin.read_text()
+        reloads.clear()
+        install._write_asterisk_restart_dropin()
+        assert dropin.read_text() == first
+        assert reloads == []
+        assert not list(dropin.parent.glob("20-restart.conf.bak-*"))
+
+
 class TestPhaseStartRestartPolicy:
     """modules.conf (like the unit EnvironmentFile) is only read at
     process start — a load-list change must restart Asterisk, not
