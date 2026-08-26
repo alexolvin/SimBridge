@@ -1,0 +1,748 @@
+From 86ba704856b035f13ff3f486553b611337ee0993 Mon Sep 17 00:00:00 2001
+From: Alex Olvin <>
+Date: Wed, 26 Aug 2026 20:07:00 +0300
+Subject: [PATCH] feat: UAC voice transport (ALSA) for Quectel EC25
+
+- new 'alsadev' device setting enables UAC mode (ALSA capture/playback
+  instead of the serial audio tty); data tty stays required
+- alsa_card_init()/soundcard_init(): open 8 kHz s16 mono capture and
+  playback streams, the capture poll fd feeds the channel select loop
+- channel read/write: accumulate ALSA partial reads into 20 ms frames;
+  write frames directly to the playback stream with EPIPE recovery
+- activate/disactivate call: start/drop the ALSA streams per call
+- dial/answer: arm AT+QPCMV=1,2 (USB audio) before ATD/ATA and skip the
+  post-dial AT+QPCMV=1,0 in UAC mode
+- monitor: skip the tty status check for the ALSA capture fd
+- link against libasound
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ Makefile.in   |   2 +-
+ at_command.c  |  51 ++++++++++----
+ chan_dongle.c | 187 +++++++++++++++++++++++++++++++++++++++++++++++---
+ chan_dongle.h |   7 +-
+ channel.c     | 167 +++++++++++++++++++++++++++++++++++++++++---
+ cpvt.h        |   1 +
+ dc_config.c   |  43 ++++++++----
+ dc_config.h   |   1 +
+ 8 files changed, 414 insertions(+), 45 deletions(-)
+
+diff --git a/Makefile.in b/Makefile.in
+index 5f5aeef..55beb69 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -44,7 +44,7 @@ CFLAGS  = @CFLAGS@ -I$(srcdir) -std=gnu99 -DAST_MODULE_SELF_SYM=__internal_chan_
+ 	@CPPFLAGS@ @DEFS@ @AC_CFLAGS@
+ LDFLAGS = @LDFLAGS@ 
+ SOLINK  = @SOLINK@
+-LIBS    = @LIBS@
++LIBS    = @LIBS@ -lasound
+ DISTNAME= @PACKAGE_TARNAME@-@PACKAGE_VERSION@.r@PACKAGE_REVISION@
+ 
+ srcdir = @srcdir@
+diff --git a/at_command.c b/at_command.c
+index b938406..b7015f7 100644
+--- a/at_command.c
++++ b/at_command.c
+@@ -35,6 +35,7 @@ static const char cmd_chld2[]    = "AT+CHLD=2\r";
+ static const char cmd_clcc[]     = "AT+CLCC\r";
+ static const char cmd_ddsetex2[] = "AT^DDSETEX=2\r";
+ static const char cmd_qpcmv10[]  = "AT+QPCMV=1,0\r";
++static const char cmd_qpcmv12[]  = "AT+QPCMV=1,2\r";
+ 
+ /*!
+  * \brief Format and fill generic command
+@@ -520,6 +521,13 @@ EXPORT_DEF int at_enqueue_dial(struct cpvt *cpvt, const char *number, int clir)
+ 		cmdsno++;
+ 	}
+ 
++	if (pvt->has_voice_quectel && pvt->uac)
++	{
++		/* UAC: arm USB audio transport before dial */
++		ATQ_CMD_INIT_ST(cmds[cmdsno], CMD_AT_DDSETEX, cmd_qpcmv12);
++		cmdsno++;
++	}
++
+ 	err = at_fill_generic_cmd(&cmds[cmdsno], "ATD%s;\r", number);
+ 	if(err)
+ 	{
+@@ -535,12 +543,17 @@ EXPORT_DEF int at_enqueue_dial(struct cpvt *cpvt, const char *number, int clir)
+ 	ATQ_CMD_INIT_ST(cmds[cmdsno], CMD_AT_CLCC, cmd_clcc);
+ 	cmdsno++;
+ 
+-	if (pvt->has_voice_quectel) {
+-		ATQ_CMD_INIT_ST(cmds[cmdsno], CMD_AT_DDSETEX, cmd_qpcmv10);
+-	} else {
+-		ATQ_CMD_INIT_ST(cmds[cmdsno], CMD_AT_DDSETEX, cmd_ddsetex2);
++	if (!pvt->uac)
++	{
++		/* UAC: voice transport is armed by AT+QPCMV=1,2 before ATD,
++		 * the post-dial voice setup command is not needed */
++		if (pvt->has_voice_quectel) {
++			ATQ_CMD_INIT_ST(cmds[cmdsno], CMD_AT_DDSETEX, cmd_qpcmv10);
++		} else {
++			ATQ_CMD_INIT_ST(cmds[cmdsno], CMD_AT_DDSETEX, cmd_ddsetex2);
++		}
++		cmdsno++;
+ 	}
+-	cmdsno++;
+ 
+ 	if (at_queue_insert(cpvt, cmds, cmdsno, 1) != 0) {
+ 		chan_dongle_err = E_QUEUE;
+@@ -562,12 +575,23 @@ EXPORT_DEF int at_enqueue_answer(struct cpvt *cpvt)
+ 	at_queue_cmd_t cmds[2];
+ 	unsigned count = 2; /* AT_A + setup-voice */
+ 	const char * cmd1;
++	unsigned answer_idx = 0;
+ 
+-	ATQ_CMD_INIT_DYN(cmds[0], CMD_AT_A);
+-	if (pvt->has_voice_quectel) {
+-		ATQ_CMD_INIT_ST(cmds[1], CMD_AT_DDSETEX, cmd_qpcmv10);
+-	} else {
+-		ATQ_CMD_INIT_ST(cmds[1], CMD_AT_DDSETEX, cmd_ddsetex2);
++	if (pvt->has_voice_quectel && pvt->uac)
++	{
++		/* UAC: arm USB audio transport before answer */
++		ATQ_CMD_INIT_ST(cmds[0], CMD_AT_DDSETEX, cmd_qpcmv12);
++		ATQ_CMD_INIT_DYN(cmds[1], CMD_AT_A);
++		answer_idx = 1;
++	}
++	else
++	{
++		ATQ_CMD_INIT_DYN(cmds[0], CMD_AT_A);
++		if (pvt->has_voice_quectel) {
++			ATQ_CMD_INIT_ST(cmds[1], CMD_AT_DDSETEX, cmd_qpcmv10);
++		} else {
++			ATQ_CMD_INIT_ST(cmds[1], CMD_AT_DDSETEX, cmd_ddsetex2);
++		}
+ 	}
+ 
+ 	if(cpvt->state == CALL_STATE_INCOMING)
+@@ -577,10 +601,11 @@ EXPORT_DEF int at_enqueue_answer(struct cpvt *cpvt)
+ 	}
+ 	else if(cpvt->state == CALL_STATE_WAITING)
+ 	{
+-		cmds[0].cmd = CMD_AT_CHLD_2x;
++		cmds[answer_idx].cmd = CMD_AT_CHLD_2x;
+ 		cmd1 = "AT+CHLD=2%d\r";
+ /* no need CMD_AT_DDSETEX in this case? */
+-		count--;
++		if (!pvt->uac)
++			count--;
+ 	}
+ 	else
+ 	{
+@@ -588,7 +613,7 @@ EXPORT_DEF int at_enqueue_answer(struct cpvt *cpvt)
+ 		return -1;
+ 	}
+ 
+-	if (at_fill_generic_cmd(&cmds[0], cmd1, cpvt->call_idx) != 0) {
++	if (at_fill_generic_cmd(&cmds[answer_idx], cmd1, cpvt->call_idx) != 0) {
+ 		chan_dongle_err = E_UNKNOWN;
+ 		return -1;
+ 	}
+diff --git a/chan_dongle.c b/chan_dongle.c
+index 06886d8..237f4f7 100644
+--- a/chan_dongle.c
++++ b/chan_dongle.c
+@@ -49,6 +49,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Rev: " PACKAGE_REVISION " $")
+ #include <termios.h>			/* struct termios tcgetattr() tcsetattr()  */
+ #include <pthread.h>			/* pthread_t pthread_kill() pthread_join() */
+ #include <fcntl.h>			/* O_RDWR O_NOCTTY */
++#include <poll.h>			/* struct pollfd (UAC capture poll fd) */
+ #include <signal.h>			/* SIGURG */
+ 
+ #include "ast_compat.h"			/* asterisk compatibility fixes */
+@@ -287,7 +288,15 @@ static void disconnect_dongle (struct pvt* pvt)
+ 	at_queue_flush(pvt);
+ 	pvt->last_dialed_cpvt = NULL;
+ 
+-	closetty (pvt->audio_fd, &pvt->alock);
++	if (pvt->uac) {
++		if (pvt->icard)
++			snd_pcm_close(pvt->icard);
++		if (pvt->ocard)
++			snd_pcm_close(pvt->ocard);
++		pvt->icard = pvt->ocard = NULL;
++	} else {
++		closetty (pvt->audio_fd, &pvt->alock);
++	}
+ 	closetty (pvt->data_fd, &pvt->dlock);
+ 
+ 	pvt->data_fd = -1;
+@@ -494,7 +503,7 @@ static void* do_monitor_phone (void* data)
+ 
+ 		handle_expired_reports(pvt);
+ 
+-		if (port_status (pvt->data_fd) || port_status (pvt->audio_fd))
++		if (port_status (pvt->data_fd) || (!pvt->uac && port_status (pvt->audio_fd)))
+ 		{
+ 			ast_log (LOG_ERROR, "[%s] Lost connection to Dongle\n", dev);
+ 			goto e_cleanup;
+@@ -662,6 +671,142 @@ static int pvt_discovery(struct pvt * pvt)
+ 	return ! resolved;
+ }
+ 
++/*!
++ * \brief Open and configure one ALSA PCM stream for UAC voice
++ *
++ * Voice on the EC25 UAC card is 8 kHz 16-bit mono (Asterisk slin).
++ *
++ * \param dev -- ALSA device string from dongle.conf (e.g. "hw:CARD=EC25EUX,DEV=0")
++ * \param stream -- SND_PCM_STREAM_CAPTURE or SND_PCM_STREAM_PLAYBACK
++ * \param pvt -- device (for logging)
++ * \return snd_pcm_t* on success, NULL on failure
++ */
++static snd_pcm_t * alsa_card_init(const char * dev, snd_pcm_stream_t stream, struct pvt * pvt)
++{
++	snd_pcm_t * handle = NULL;
++	snd_pcm_hw_params_t * hw;
++	snd_pcm_sw_params_t * sw;
++	unsigned int rate = 8000;
++	snd_pcm_uframes_t period = FRAME_SIZE;		/* 320 samples = 40 ms */
++	snd_pcm_uframes_t buffer = FRAME_SIZE * 25;	/* 8000 samples = 1 s */
++	int period_align = 0;
++	const char * dir = (stream == SND_PCM_STREAM_CAPTURE) ? "capture" : "playback";
++	int err;
++
++	if (!dev || !dev[0])
++	{
++		ast_log (LOG_ERROR, "[%s] UAC mode enabled but alsadev is empty\n", PVT_ID(pvt));
++		return NULL;
++	}
++
++	err = snd_pcm_open(&handle, dev, stream, SND_PCM_NONBLOCK);
++	if (err < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] snd_pcm_open(%s, %s) failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		return NULL;
++	}
++
++	snd_pcm_hw_params_alloca(&hw);
++	if ((err = snd_pcm_hw_params_any(handle, hw)) < 0 ||
++	    (err = snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
++	    (err = snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
++	    (err = snd_pcm_hw_params_set_channels(handle, hw, 1)) < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] ALSA %s %s params failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		goto fail;
++	}
++
++	if ((err = snd_pcm_hw_params_set_rate_near(handle, hw, &rate, 0)) < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] ALSA %s %s rate failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		goto fail;
++	}
++	if (rate != 8000)
++		ast_log (LOG_WARNING, "[%s] ALSA %s: 8000 Hz not supported, using %u Hz\n", PVT_ID(pvt), dev, rate);
++
++	if ((err = snd_pcm_hw_params_set_period_size_near(handle, hw, &period, &period_align)) < 0 ||
++	    (err = snd_pcm_hw_params_set_buffer_size_near(handle, hw, &buffer)) < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] ALSA %s %s period/buffer failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		goto fail;
++	}
++	if (period != FRAME_SIZE)
++		ast_log (LOG_WARNING, "[%s] ALSA %s: period %lu samples, expected %d\n", PVT_ID(pvt), dev, (unsigned long) period, FRAME_SIZE);
++
++	if ((err = snd_pcm_hw_params(handle, hw)) < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] ALSA %s %s hw_params failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		goto fail;
++	}
++
++	snd_pcm_sw_params_alloca(&sw);
++	if ((err = snd_pcm_sw_params_current(handle, sw)) < 0 ||
++	    (err = snd_pcm_sw_params_set_start_threshold(handle, sw, (stream == SND_PCM_STREAM_CAPTURE) ? 1 : FRAME_SIZE)) < 0 ||
++	    (err = snd_pcm_sw_params_set_stop_threshold(handle, sw, buffer)) < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] ALSA %s %s sw_params failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		goto fail;
++	}
++
++	if ((err = snd_pcm_sw_params(handle, sw)) < 0)
++	{
++		ast_log (LOG_ERROR, "[%s] ALSA %s %s sw_params apply failed: %s\n", PVT_ID(pvt), dev, dir, snd_strerror(err));
++		goto fail;
++	}
++
++	return handle;
++
++fail:
++	snd_pcm_close(handle);
++	return NULL;
++}
++
++/*!
++ * \brief Open the UAC ALSA capture and playback streams
++ * \param pvt -- device
++ * \return capture poll fd for channel select(), or -1 on failure
++ */
++static int soundcard_init(struct pvt * pvt)
++{
++	const char * dev = CONF_UNIQ(pvt, alsadev);
++	struct pollfd pfd;
++	int err;
++
++	pvt->icard = alsa_card_init(dev, SND_PCM_STREAM_CAPTURE, pvt);
++	if (!pvt->icard)
++		return -1;
++
++	pvt->ocard = alsa_card_init(dev, SND_PCM_STREAM_PLAYBACK, pvt);
++	if (!pvt->ocard)
++	{
++		snd_pcm_close(pvt->icard);
++		pvt->icard = NULL;
++		return -1;
++	}
++
++	/* prepare playback so snd_pcm_writei deterministically auto-starts
++	 * from PREPARED (no immediate underrun from an empty buffer) */
++	if (snd_pcm_prepare(pvt->ocard) < 0)
++		ast_log (LOG_WARNING, "[%s] ALSA playback prepare failed\n", PVT_ID(pvt));
++
++	/* prepare and drain capture */
++	if (snd_pcm_prepare(pvt->icard) < 0 || snd_pcm_drop(pvt->icard) < 0)
++		ast_log (LOG_WARNING, "[%s] ALSA capture prepare/drop failed\n", PVT_ID(pvt));
++
++	err = snd_pcm_poll_descriptors(pvt->icard, &pfd, 1);
++	if (err < 1)
++	{
++		ast_log (LOG_ERROR, "[%s] snd_pcm_poll_descriptors failed\n", PVT_ID(pvt));
++		snd_pcm_close(pvt->icard);
++		snd_pcm_close(pvt->ocard);
++		pvt->icard = pvt->ocard = NULL;
++		return -1;
++	}
++
++	ast_verb (3, "[%s] UAC voice card %s opened (capture fd %d)\n", PVT_ID(pvt), dev, pfd.fd);
++	return pfd.fd;
++}
++
+ #/* */
+ static void pvt_start(struct pvt * pvt)
+ {
+@@ -687,13 +832,33 @@ static void pvt_start(struct pvt * pvt)
+ 		return;
+ 	}
+ 
++	/* UAC voice transport is selected by the alsadev setting */
++	pvt->uac = CONF_UNIQ(pvt, alsadev)[0] != 0;
++
+ 	// TODO: delay until device activate voice call or at pvt_on_create_1st_channel()
+-	pvt->audio_fd = opentty(PVT_STATE(pvt, audio_tty), &pvt->alock);
+-	if (pvt->audio_fd < 0) {
+-		goto cleanup_datafd;
++	if (pvt->uac) {
++		pvt->audio_fd = soundcard_init(pvt);
++		if (pvt->audio_fd < 0) {
++			goto cleanup_datafd;
++		}
++	} else {
++		pvt->audio_fd = opentty(PVT_STATE(pvt, audio_tty), &pvt->alock);
++		if (pvt->audio_fd < 0) {
++			goto cleanup_datafd;
++		}
+ 	}
+ 
+ 	if (!start_monitor(pvt)) {
++		if (pvt->uac) {
++			/* no tty to close in UAC mode; release the ALSA handles */
++			if (pvt->icard)
++				snd_pcm_close(pvt->icard);
++			if (pvt->ocard)
++				snd_pcm_close(pvt->ocard);
++			pvt->icard = pvt->ocard = NULL;
++			pvt->audio_fd = -1;
++			goto cleanup_datafd;
++		}
+ 		goto cleanup_audiofd;
+ 	}
+ 
+@@ -704,8 +869,10 @@ static void pvt_start(struct pvt * pvt)
+ 	 * read(). */
+ 	flags = fcntl(pvt->data_fd, F_GETFL);
+ 	fcntl(pvt->data_fd, F_SETFL, flags | O_NONBLOCK);
+-	flags = fcntl(pvt->audio_fd, F_GETFL);
+-	fcntl(pvt->audio_fd, F_SETFL, flags | O_NONBLOCK);
++	if (!pvt->uac) {
++		flags = fcntl(pvt->audio_fd, F_GETFL);
++		fcntl(pvt->audio_fd, F_SETFL, flags | O_NONBLOCK);
++	}
+ 
+ 	pvt->connected = 1;
+ 	pvt->current_state = DEV_STATE_STARTED;
+@@ -852,7 +1019,8 @@ EXPORT_DEF void pvt_on_create_1st_channel(struct pvt* pvt)
+ 	mixb_init (&pvt->a_write_mixb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
+ //	rb_init (&pvt->a_write_rb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
+ 
+-	if(!pvt->a_timer)
++	/* UAC writes directly to the ALSA stream, no mix timer needed */
++	if(!pvt->uac && !pvt->a_timer)
+ 		pvt->a_timer = ast_timer_open ();
+ 
+ /* FIXME: do on each channel switch */
+@@ -1493,6 +1661,8 @@ static struct pvt * pvt_create(const pvt_config_t * settings)
+ 		pvt->monitor_thread		= AST_PTHREADT_NULL;
+ 		pvt->audio_fd			= -1;
+ 		pvt->data_fd			= -1;
++		pvt->icard				= NULL;
++		pvt->ocard				= NULL;
+ 		pvt->timeout			= DATA_READ_TIMEOUT;
+ 		pvt->gsm_reg_status		= -1;
+ 		pvt->incoming_sms_index		= -1U;
+@@ -1560,6 +1730,7 @@ static int pvt_reconfigure(struct pvt * pvt, const pvt_config_t * settings, rest
+ 		/* check what config changes require restaring */
+ 		else if(strcmp(UCONFIG(settings, audio_tty), CONF_UNIQ(pvt, audio_tty))
+ 			|| strcmp(UCONFIG(settings, data_tty), CONF_UNIQ(pvt, data_tty))
++			|| strcmp(UCONFIG(settings, alsadev), CONF_UNIQ(pvt, alsadev))
+ 			|| strcmp(UCONFIG(settings, imei), CONF_UNIQ(pvt, imei))
+ 			|| strcmp(UCONFIG(settings, imsi), CONF_UNIQ(pvt, imsi))
+ 			|| SCONFIG(settings, u2diag) != CONF_SHARED(pvt, u2diag)
+diff --git a/chan_dongle.h b/chan_dongle.h
+index d9338a2..768b695 100644
+--- a/chan_dongle.h
++++ b/chan_dongle.h
+@@ -14,6 +14,8 @@
+ 
+ #include "ast_config.h"
+ 
++#include <alsa/asoundlib.h>		/* snd_pcm_t (UAC voice) */
++
+ #include <asterisk/lock.h>
+ #include <asterisk/linkedlists.h>
+ 
+@@ -120,8 +122,10 @@ typedef struct pvt
+ 
+ 	pthread_t		monitor_thread;			/*!< monitor (at commands reader) thread handle */
+ 
+-	int			audio_fd;			/*!< audio descriptor */
++	int			audio_fd;			/*!< audio descriptor; in UAC mode the ALSA capture poll fd */
+ 	int			data_fd;			/*!< data descriptor */
++	snd_pcm_t		*icard;			/*!< ALSA capture handle (UAC voice) */
++	snd_pcm_t		*ocard;			/*!< ALSA playback handle (UAC voice) */
+ 	char			* alock;			/*!< name of lockfile for audio */
+ 	char			* dlock;			/*!< name of lockfile for data */
+ 
+@@ -181,6 +185,7 @@ typedef struct pvt
+ 	unsigned int		has_sms:1;			/*!< device has SMS support */
+ 	unsigned int		has_voice:1;			/*!< device has voice call support */
+ 	unsigned int		has_voice_quectel:1;		/*!< device has Quectel voice call support */
++	unsigned int		uac:1;				/*!< UAC voice transport enabled (alsadev set) */
+ 	unsigned int		has_call_waiting:1;		/*!< call waiting enabled on device */
+ 
+ 	unsigned int		group_last_used:1;		/*!< mark the last used device */
+diff --git a/channel.c b/channel.c
+index 3cb2815..4dd621e 100644
+--- a/channel.c
++++ b/channel.c
+@@ -10,6 +10,7 @@
+ */
+ #include "ast_config.h"
+ 
++#include <unistd.h>				/* usleep() */
+ #include <asterisk/dsp.h>			/* ast_dsp_digitreset() */
+ #include <asterisk/pbx.h>			/* pbx_builtin_setvar_helper() */
+ #include <asterisk/module.h>			/* ast_module_ref() ast_module_info = shit */
+@@ -304,7 +305,20 @@ static void disactivate_call(struct cpvt* cpvt)
+ {
+ 	if(cpvt->channel && CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
+ 	{
+-		mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
++		if (cpvt->pvt->uac)
++		{
++			/* UAC: drop audio pending in both streams so the next call
++			 * does not start with the previous one's tail; no mixb involved */
++			if (cpvt->pvt->icard)
++				snd_pcm_drop(cpvt->pvt->icard);
++			if (cpvt->pvt->ocard)
++				snd_pcm_drop(cpvt->pvt->ocard);
++			cpvt->uac_readpos = 0;
++		}
++		else
++		{
++			mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
++		}
+ 		ast_channel_set_fd (cpvt->channel, 1, -1);
+ 		ast_channel_set_fd (cpvt->channel, 0, -1);
+ 		CPVT_RESET_FLAGS(cpvt, CALL_FLAG_ACTIVATED | CALL_FLAG_MASTER);
+@@ -350,11 +364,36 @@ static void activate_call(struct cpvt* cpvt)
+ 	/* setup call local write possition */
+ 	if(!CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
+ 	{
+-		// FIXME: reset possition?
+-		mixb_attach(&pvt->a_write_mixb, &cpvt->mixstream);
++		if (pvt->uac)
++		{
++			/* UAC: start the capture stream for this call; the playback
++			 * stream only needs to be in PREPARED state, snd_pcm_writei
++			 * auto-starts it (start_threshold) on the first frame */
++			switch (snd_pcm_state(pvt->icard))
++			{
++			case SND_PCM_STATE_RUNNING:
++				break;
++			case SND_PCM_STATE_PREPARED:
++				if (snd_pcm_start(pvt->icard) < 0)
++					ast_debug (1, "[%s] ALSA capture start failed\n", PVT_ID(pvt));
++				break;
++			default:
++				if (snd_pcm_prepare(pvt->icard) < 0 || snd_pcm_start(pvt->icard) < 0)
++					ast_debug (1, "[%s] ALSA capture prepare/start failed\n", PVT_ID(pvt));
++				break;
++			}
++			if (snd_pcm_state(pvt->ocard) != SND_PCM_STATE_PREPARED && snd_pcm_prepare(pvt->ocard) < 0)
++				ast_debug (1, "[%s] ALSA playback prepare failed\n", PVT_ID(pvt));
++			cpvt->uac_readpos = 0;
++		}
++		else
++		{
++			// FIXME: reset possition?
++			mixb_attach(&pvt->a_write_mixb, &cpvt->mixstream);
+ //		rb_init (&cpvt->a_write_rb, cpvt->a_write_buf, sizeof (cpvt->a_write_buf));
+ //		cpvt->write = pvt->a_write_rb.write;
+ //		cpvt->used = pvt->a_write_rb.used;
++		}
+ 	}
+ 
+ 	if (pvt->audio_fd >= 0)
+@@ -699,15 +738,73 @@ static struct ast_frame* channel_read (struct ast_channel* channel)
+ 		cpvt->a_read_frame.offset = AST_FRIENDLY_OFFSET;
+ 		cpvt->a_read_frame.src = AST_MODULE;
+ 
+-		res = read (CPVT_IS_MASTER(cpvt) ? pvt->audio_fd : cpvt->rd_pipe[PIPE_READ], cpvt->a_read_frame.data.ptr, FRAME_SIZE);
+-		if (res <= 0)
++		if (pvt->uac && CPVT_IS_MASTER(cpvt))
+ 		{
+-			if (errno != EAGAIN && errno != EINTR)
++			/* UAC: read from the ALSA capture stream, accumulating partial
++			 * reads until a full frame is ready */
++			int16_t * dst = (int16_t *) (cpvt->a_read_frame.data.ptr + cpvt->uac_readpos * 2);
++			snd_pcm_sframes_t got = 0;
++			snd_pcm_sframes_t rc;
++
++			switch (snd_pcm_state(pvt->icard))
+ 			{
+-				ast_debug (1, "[%s] Read error %d, going to wait for new connection\n", PVT_ID(pvt), errno);
++			case SND_PCM_STATE_RUNNING:
++			case SND_PCM_STATE_PREPARED:
++				break;
++			default:
++				if (snd_pcm_prepare(pvt->icard) < 0)
++				{
++					ast_debug (1, "[%s] ALSA capture prepare failed\n", PVT_ID(pvt));
++					goto e_return;
++				}
++				break;
+ 			}
+ 
+-			goto e_return;
++			do
++			{
++				rc = snd_pcm_readi(pvt->icard, dst, FRAME_SIZE / 2 - cpvt->uac_readpos);
++				if (rc < 0)
++				{
++					if (rc == -EPIPE || rc == -ESTRPIPE)
++					{
++						/* capture overrun: reinit, drop the partial, retry once */
++						cpvt->uac_readpos = 0;
++						dst = (int16_t *) cpvt->a_read_frame.data.ptr;
++						if (snd_pcm_prepare(pvt->icard) < 0)
++							break;
++						rc = snd_pcm_readi(pvt->icard, dst, FRAME_SIZE / 2 - cpvt->uac_readpos);
++						if (rc < 0)
++							break;
++					}
++					else
++					{
++						ast_debug (1, "[%s] ALSA capture read error %d\n", PVT_ID(pvt), (int) rc);
++						break;
++					}
++				}
++				got = rc;
++				cpvt->uac_readpos += (unsigned int) got;
++				dst += got;
++			} while (got > 0 && cpvt->uac_readpos < FRAME_SIZE / 2);
++
++			res = (ssize_t) (cpvt->uac_readpos * 2);
++			if (res < FRAME_SIZE)
++				goto e_return; /* partial frame: asterisk re-polls the capture fd */
++
++			cpvt->uac_readpos = 0;
++		}
++		else
++		{
++			res = read (CPVT_IS_MASTER(cpvt) ? pvt->audio_fd : cpvt->rd_pipe[PIPE_READ], cpvt->a_read_frame.data.ptr, FRAME_SIZE);
++			if (res <= 0)
++			{
++				if (errno != EAGAIN && errno != EINTR)
++				{
++					ast_debug (1, "[%s] Read error %d, going to wait for new connection\n", PVT_ID(pvt), errno);
++				}
++
++				goto e_return;
++			}
+ 		}
+ 
+ /*		ast_debug (7, "[%s] call idx %d read %u\n", PVT_ID(pvt), cpvt->call_idx, (unsigned)res);
+@@ -911,7 +1008,59 @@ static int channel_write (struct ast_channel* channel, struct ast_frame* f)
+ 		}
+ 
+ 
+-		if (pvt->a_timer)
++		if (pvt->uac)
++		{
++			/* UAC: direct write to the ALSA playback stream, bypassing the
++			 * mixb/timer logic (one active audio call at a time, no mixing) */
++			char buf[FRAME_SIZE];
++			snd_pcm_sframes_t done = 0;
++			int retries = 50;
++
++			ast_frame_byteswap_le (f);
++
++			memset (buf, 0, sizeof (buf));
++			memcpy (buf, f->data.ptr, f->datalen < FRAME_SIZE ? f->datalen : FRAME_SIZE);
++			if (f->datalen < FRAME_SIZE)
++				PVT_STAT(pvt, write_tframes) ++;
++
++			while (done < (snd_pcm_sframes_t) (FRAME_SIZE / 2))
++			{
++				snd_pcm_sframes_t rc = snd_pcm_writei(pvt->ocard, (int16_t *) buf + done, (FRAME_SIZE / 2) - done);
++
++				if (rc == -EPIPE)
++				{
++					/* playback underrun: recover and retry the frame */
++					if (snd_pcm_prepare(pvt->ocard) < 0)
++					{
++						ast_debug (1, "[%s] ALSA playback prepare failed\n", PVT_ID(pvt));
++						break;
++					}
++					done = 0;
++					continue;
++				}
++				if (rc < 0)
++				{
++					/* bounded retries: do not spin under pvt->lock */
++					if (retries > 0)
++					{
++						retries--;
++						usleep (1000);
++						continue;
++					}
++					ast_log (LOG_WARNING, "[%s] ALSA playback write failed, dropped frame\n", PVT_ID(pvt));
++					break;
++				}
++				if (rc <= 0)
++					break;
++				done += rc;
++			}
++
++			if (done == (snd_pcm_sframes_t) (FRAME_SIZE / 2))
++				PVT_STAT(pvt, a_write_bytes) += FRAME_SIZE;
++			PVT_STAT(pvt, write_frames) ++;
++		}
++
++		else if (pvt->a_timer)
+ 		{
+ 			count = mixb_free (&pvt->a_write_mixb, &cpvt->mixstream);
+ 
+diff --git a/cpvt.h b/cpvt.h
+index 1ceefbb..4d93b1d 100644
+--- a/cpvt.h
++++ b/cpvt.h
+@@ -72,6 +72,7 @@ typedef struct cpvt {
+ 	struct mixstream	mixstream;			/*!< mix stream */
+ 	char			a_read_buf[FRAME_SIZE + AST_FRIENDLY_OFFSET];/*!< audio read buffer */
+ 	struct ast_frame	a_read_frame;			/*!< read frame buffer */
++	unsigned int		uac_readpos;		/*!< UAC: accumulated 16-bit samples of the in-progress read frame (0..160) */
+ 
+ //	size_t			write;				/*!< write position in pvt->a_write_buf */
+ //	size_t			used;				/*!< bytes used in pvt->a_write_buf */
+diff --git a/dc_config.c b/dc_config.c
+index b1482f7..6bf5c6d 100644
+--- a/dc_config.c
++++ b/dc_config.c
+@@ -31,11 +31,13 @@ static int dc_uconfig_fill(struct ast_config * cfg, const char * cat, struct dc_
+ {
+ 	const char * audio_tty;
+ 	const char * data_tty;
++	const char * alsadev;
+ 	const char * imei;
+ 	const char * imsi;
+ 
+ 	audio_tty = ast_variable_retrieve (cfg, cat, "audio");
+ 	data_tty  = ast_variable_retrieve (cfg, cat, "data");
++	alsadev   = ast_variable_retrieve (cfg, cat, "alsadev");
+ 	imei = ast_variable_retrieve (cfg, cat, "imei");
+ 	imsi = ast_variable_retrieve (cfg, cat, "imsi");
+ 
+@@ -48,27 +50,42 @@ static int dc_uconfig_fill(struct ast_config * cfg, const char * cat, struct dc_
+ 		imsi = NULL;
+ 		}
+ 
+-	if(!audio_tty && !imei && !imsi)
++	if(alsadev)
+ 	{
+-		ast_log (LOG_ERROR, "Skipping device %s. Missing required audio_tty setting\n", cat);
+-		return 1;
++		/* UAC voice: data tty is required, audio tty is not used */
++		if(!data_tty && !imei && !imsi)
++		{
++			ast_log (LOG_ERROR, "Skipping device %s. UAC mode (alsadev) requires data_tty setting\n", cat);
++			return 1;
++		}
++		if (audio_tty)
++			ast_log (LOG_WARNING, "[%s] alsadev and audio are mutually exclusive, audio ignored\n", cat);
+ 	}
+-
+-	if(!data_tty && !imei && !imsi)
++	else
+ 	{
+-		ast_log (LOG_ERROR, "Skipping device %s. Missing required data_tty setting\n", cat);
+-		return 1;
+-	}
++		if(!audio_tty && !imei && !imsi)
++		{
++			ast_log (LOG_ERROR, "Skipping device %s. Missing required audio_tty setting\n", cat);
++			return 1;
++		}
+ 
+-	if((!data_tty && audio_tty) || (data_tty && !audio_tty))
+-	{
+-		ast_log (LOG_ERROR, "Skipping device %s. data_tty and audio_tty should use together\n", cat);
+-		return 1;
++		if(!data_tty && !imei && !imsi)
++		{
++			ast_log (LOG_ERROR, "Skipping device %s. Missing required data_tty setting\n", cat);
++			return 1;
++		}
++
++		if((!data_tty && audio_tty) || (data_tty && !audio_tty))
++		{
++			ast_log (LOG_ERROR, "Skipping device %s. data_tty and audio_tty should use together\n", cat);
++			return 1;
++		}
+ 	}
+ 
+ 	ast_copy_string (config->id,		cat,	             sizeof (config->id));
+ 	ast_copy_string (config->data_tty,	S_OR(data_tty, ""),  sizeof (config->data_tty));
+-	ast_copy_string (config->audio_tty,	S_OR(audio_tty, ""), sizeof (config->audio_tty));
++	ast_copy_string (config->audio_tty,	alsadev ? "" : S_OR(audio_tty, ""), sizeof (config->audio_tty));
++	ast_copy_string (config->alsadev,	S_OR(alsadev, ""),  sizeof (config->alsadev));
+ 	ast_copy_string (config->imei,		S_OR(imei, ""),	     sizeof (config->imei));
+ 	ast_copy_string (config->imsi,		S_OR(imsi, ""),	     sizeof (config->imsi));
+ 
+diff --git a/dc_config.h b/dc_config.h
+index 278d492..dfc71bd 100644
+--- a/dc_config.h
++++ b/dc_config.h
+@@ -113,6 +113,7 @@ typedef struct dc_uconfig
+ 	char			id[DEVNAMELEN];			/*!< id from dongle.conf */
+ 	char			audio_tty[DEVPATHLEN];		/*!< tty for audio connection */
+ 	char			data_tty[DEVPATHLEN];		/*!< tty for AT commands */
++	char			alsadev[DEVPATHLEN];		/*!< ALSA device for UAC voice (e.g. hw:CARD=EC25EUX,DEV=0); presence enables UAC mode */
+ 	char			imei[IMEI_SIZE+1];		/*!< search device by imei */
+ 	char			imsi[IMSI_SIZE+1];		/*!< search device by imsi */
+ } dc_uconfig_t;
+-- 
+2.52.0
+
