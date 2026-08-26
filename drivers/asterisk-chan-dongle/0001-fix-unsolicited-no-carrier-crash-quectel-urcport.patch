@@ -1,0 +1,164 @@
+From 9decee394613c3e1f85ad70fb3a801332a18bd6f Mon Sep 17 00:00:00 2001
+From: Alex Olvin <>
+Date: Wed, 26 Aug 2026 06:18:32 +0300
+Subject: [PATCH] fix: survive unsolicited NO CARRIER; route Quectel call URCs
+ to AT port
+
+- at_response_busy(): do not dereference the queue head task when the
+  AT queue is empty. An unsolicited NO CARRIER arriving while the
+  driver is idle (the network releases an already-answered call) used
+  to crash Asterisk with SIGSEGV (confirmed via coredump backtrace and
+  objdump of the deployed module).
+- RES_NO_CARRIER with an empty queue: resync the call table via
+  AT+CLCC instead of assuming a queued call exists. A still-open call
+  disappears from CLCC and is torn down through CALL_STATE_RELEASED
+  (clean hangup-exten, MixMonitor recording preserved).
+- RES_CMGS: ignore delivery reports that arrive with no pending
+  command instead of dereferencing a NULL task for the uid.
+- Issue AT+QURCCFG="urcport","usbat" right after AT+QPCMV? succeeds
+  (Quectel only). EC25 factory default routes call URCs (RING, +QIND,
+  NO CARRIER) to the modem/PPP port where the driver cannot see them,
+  so incoming calls never reached the PBX.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ at_command.c  | 20 ++++++++++++++++++++
+ at_command.h  |  3 +++
+ at_response.c | 41 ++++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/at_command.c b/at_command.c
+index 5f0137e..b938406 100644
+--- a/at_command.c
++++ b/at_command.c
+@@ -950,6 +950,26 @@ EXPORT_DEF int at_enqueue_clcc(struct cpvt *cpvt)
+ 	return 0;
+ }
+ 
++/*!
++ * \brief Enqueue AT+QURCCFG="urcport","usbat" command
++ * Quectel modules route call URCs (RING, +QIND, NO CARRIER) to the port
++ * selected by "urcport". The EC25 factory default is the modem/PPP port,
++ * where the driver cannot see them, so incoming calls never reach the PBX.
++ * \param cpvt -- cpvt structure
++ * \return 0 on success
++ */
++EXPORT_DEF int at_enqueue_urcport(struct cpvt *cpvt)
++{
++	static const char cmd_qurccfg[] = "AT+QURCCFG=\"urcport\",\"usbat\"\r";
++	static const at_queue_cmd_t at_cmd = ATQ_CMD_DECLARE_ST(CMD_AT_QURCCFG, cmd_qurccfg);
++
++	if (at_queue_insert_const(cpvt, &at_cmd, 1, 0) != 0) {
++		chan_dongle_err = E_QUEUE;
++		return -1;
++	}
++	return 0;
++}
++
+ /*!
+  * \brief Enqueue AT+CHLD=3 command
+  * \param cpvt -- cpvt structure
+diff --git a/at_command.h b/at_command.h
+index 0aeb441..da7eb88 100644
+--- a/at_command.h
++++ b/at_command.h
+@@ -65,6 +65,8 @@
+ 	_( AT_DDSETEX,      "AT^DDSETEX") \
+ 	/* same, but for Quectel EC25 */ \
+ 	_( AT_QPCMV,        "AT+QPCMV") \
++	/* Quectel: route call URCs (RING, +QIND, NO CARRIER) to the AT port */ \
++	_( AT_QURCCFG,      "AT+QURCCFG") \
+ 	_( AT_DTMF,         "AT^DTMF") \
+ 	_( AT_E,            "ATE") \
+ \
+@@ -123,6 +125,7 @@ EXPORT_DECL int at_enqueue_delete_sms(struct cpvt *cpvt, int index);
+ EXPORT_DECL int at_enqueue_hangup(struct cpvt *cpvt, int call_idx);
+ EXPORT_DECL int at_enqueue_volsync(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_clcc(struct cpvt *cpvt);
++EXPORT_DECL int at_enqueue_urcport(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_activate(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_flip_hold(struct cpvt *cpvt);
+ EXPORT_DECL int at_enqueue_conference(struct cpvt *cpvt);
+diff --git a/at_response.c b/at_response.c
+index 1832dae..0aea850 100644
+--- a/at_response.c
++++ b/at_response.c
+@@ -131,6 +131,13 @@ static int at_response_ok (struct pvt* pvt, at_res_t res)
+ 				ast_debug (1, "[%s] Dongle has Quectel voice support\n", PVT_ID(pvt));
+ 				pvt->has_voice = 1;
+ 				pvt->has_voice_quectel = 1;
++				/* Quectel ships with call URCs on the modem/PPP port; route
++				 * them to the AT port or incoming calls never arrive. */
++				if (at_enqueue_urcport(&pvt->sys_chan))
++					ast_log (LOG_ERROR, "[%s] Error enqueueing URC port config\n", PVT_ID(pvt));
++				break;
++			case CMD_AT_QURCCFG:
++				ast_debug (1, "[%s] Call URCs routed to AT port\n", PVT_ID(pvt));
+ 				break;
+ /*
+ 			case CMD_AT_CLIP:
+@@ -375,6 +382,9 @@ static int at_response_error (struct pvt* pvt, at_res_t res)
+ 					ast_log(LOG_WARNING, "[%s] Dongle has NO voice support\n", PVT_ID(pvt));
+ 				}
+ 				break;
++			case CMD_AT_QURCCFG:
++				ast_debug(1, "[%s] Error setting URC port to AT port\n", PVT_ID(pvt));
++				break;
+ /*
+ 			case CMD_AT_CLIP:
+ 				log_cmd_response_error(pvt, ecmd, "[%s] Error enabling calling line indication\n", PVT_ID(pvt));
+@@ -1754,7 +1764,14 @@ static int at_response_cimi (struct pvt* pvt, const char* str)
+ static void at_response_busy(struct pvt* pvt, enum ast_control_frame_type control)
+ {
+ 	const struct at_queue_task * task = at_queue_head_task (pvt);
+-	struct cpvt* cpvt = task->cpvt;
++	struct cpvt* cpvt = NULL;
++
++	/* Unsolicited results (NO CARRIER, BUSY) may arrive when the command
++	 * queue is empty -- e.g. the network releases an already-answered call
++	 * while the driver is idle. Dereferencing the NULL head task here used
++	 * to crash Asterisk (SIGSEGV in chan_dongle.so). */
++	if (task)
++		cpvt = task->cpvt;
+ 
+ 	if(cpvt == &pvt->sys_chan)
+ 		cpvt = pvt->last_dialed_cpvt;
+@@ -1824,7 +1841,16 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
+ 
+ 					char payload[SMSDB_PAYLOAD_MAX_LEN];
+ 					char dst[SMSDB_DST_MAX_LEN];
+-					ssize_t payload_len = smsdb_outgoing_part_put(task->uid, res, dst, payload);
++					ssize_t payload_len;
++
++					if (!task) {
++						/* Unsolicited delivery report with no pending command to
++						 * correlate with. */
++						ast_log (LOG_WARNING, "[%s] SMS delivery report with no pending command, ignored\n", PVT_ID(pvt));
++						break;
++					}
++
++					payload_len = smsdb_outgoing_part_put(task->uid, res, dst, payload);
+ 					if (payload_len >= 0) {
+ 						ast_verb (3, "[%s] Error payload: %.*s\n", PVT_ID(pvt), (int) payload_len, payload);
+ 						channel_var_t vars[] =
+@@ -1925,7 +1951,16 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
+ 				break;
+ 			case RES_NO_CARRIER:
+ 				ast_log (LOG_ERROR, "[%s] Receive NO CARRIER\n", PVT_ID(pvt));
+-				at_response_busy(pvt, AST_CONTROL_CONGESTION);
++				if (task) {
++					at_response_busy(pvt, AST_CONTROL_CONGESTION);
++				} else {
++					/* Unsolicited NO CARRIER with nothing pending: the call was
++					 * released on the network side. Resync the call table -- a
++					 * still-open call disappears from CLCC and is torn down via
++					 * CALL_STATE_RELEASED (clean hangup, hangup-exten, recording). */
++					ast_log (LOG_NOTICE, "[%s] NO CARRIER with empty command queue, resyncing via CLCC\n", PVT_ID(pvt));
++					request_clcc(pvt);
++				}
+ 				break;
+ 			case RES_CPIN:
+ 				/* fatal */
+-- 
+2.52.0
+
