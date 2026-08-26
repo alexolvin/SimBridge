@@ -23,6 +23,7 @@ so the production module can be rebuilt from scratch.
 | Patch | What it fixes |
 |---|---|
 | `asterisk-chan-dongle/0001-fix-unsolicited-no-carrier-crash-quectel-urcport.patch` | (1) **SIGSEGV crash**: `at_response_busy()` dereferenced the AT queue head task without a NULL check — an unsolicited `NO CARRIER` arriving while the queue is empty (network releases an already-answered call) crashed Asterisk (incident 2026-08-26 04:58 MSK, coredump-confirmed). (2) `NO CARRIER` with an empty queue now resyncs the call table via `AT+CLCC`, so a still-open call is torn down cleanly (hangup-exten, recording preserved) instead of crashing. (3) `+CMGS` delivery report with no pending command is ignored instead of crashing. (4) `AT+QURCCFG="urcport","usbat"` is issued automatically after `AT+QPCMV?` succeeds (Quectel only) — the EC25 factory default routes call URCs (RING, +QIND, NO CARRIER) to the modem/PPP port where the driver cannot see them, so incoming calls never reached the PBX. |
+| `asterisk-chan-dongle/0002-ec25-call-teardown-no-cend-stale-cpvt.patch` | Call-lifecycle defects on modules that never send `+CEND` (Quectel EC25): (1) **zombie call + stuck device** — an unsolicited `NO CARRIER` with an empty command queue only requested a CLCC resync, but the driver's dead-cpvt cleanup loop in `at_response_clcc()` is unreachable (the parse loop always returns before reaching it) and a bare-OK (empty) CLCC dispatches no CLCC handler at all — so the channel stayed alive until `Wait()` expired (~72 s later) and the device stayed stuck in `Ring` (Calls/Channels: 1). `NO CARRIER` now releases the tracked call(s) directly via `change_channel_state(RELEASED)` (canonical teardown: hangup-exten, ring flag, cpvt free) and still resyncs via CLCC. (2) **swallowed next call** — the network reuses the call index for the next incoming call; the stale cpvt (no channel, still INCOMING/WAITING) was found by `pvt_find_cpvt()` and the new call was silently dropped. The stale entry is now freed before the PBX is started for the new call. (3) `CEND` for an untracked call index logs a WARNING (was silent). Live-verified 2026-08-26: hangup teardown in <1 s, device back to Free, next call gets through. |
 
 ### Apply, build, install
 
@@ -30,6 +31,7 @@ so the production module can be rebuilt from scratch.
 # on the node, in the build tree
 cd /home/user/asterisk-chan-dongle
 git am /path/to/SimBridge/drivers/asterisk-chan-dongle/0001-*.patch
+git am /path/to/SimBridge/drivers/asterisk-chan-dongle/0002-*.patch
 make          # needs: gcc, make, asterisk-devel (18.x)
 
 sudo cp /usr/lib64/asterisk/modules/chan_dongle.so \
@@ -67,9 +69,12 @@ sudo systemctl restart asterisk
 
 ### Known open questions (as of 2026-08-26)
 
-- Voice path on EC25-EU (serial PCM via `AT+QPCMV`) is not yet confirmed
-  end-to-end with audio. The URC routing + crash fixes are independent of
-  it; a live instrumented call is pending.
+- Voice path on EC25-EU: a live instrumented call (2026-08-26) showed the serial
+  audio port is dead from frame 0 ("Didn't receive a media frame within
+  500 ms of answering"). Per Quectel docs the module's voice is UAC (virtual USB sound card); the serial
+  PCM path (`AT+QPCMV`) is legacy and being phased out. UAC support (one-time
+  `AT+QCFG="USBCFG"` switch + an ALSA/UAC audio backend in the driver) is a separate
+  stage — call setup, ring, notifications, teardown and SMS are independent of it.
 - `AT+QURCCFG` NVRAM persistence across a module reboot: **verified
   2026-08-26** — `"urcport","usbat"` survived a full `AT+CFUN=0/1` cold
   reset (read back after re-registration). The driver still re-issues the

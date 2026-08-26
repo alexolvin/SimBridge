@@ -1,0 +1,105 @@
+From ee10b4f4a9f0795fb9fb25f945c7246b723e11ad Mon Sep 17 00:00:00 2001
+From: Alex Olvin <>
+Date: Wed, 26 Aug 2026 11:12:11 +0300
+Subject: [PATCH] fix: release calls on unsolicited NO CARRIER, drop stale cpvt
+ on call-idx reuse
+
+The Quectel EC25 never sends +CEND, so NO CARRIER is its only call
+release notification. Three defects left the call table inconsistent:
+
+- unsolicited NO CARRIER with an empty command queue only requested a
+  CLCC resync; the driver's CLCC dead-cpvt cleanup loop is unreachable
+  (the parse loop in at_response_clcc() always returns before reaching
+  it), so the answered channel lived on as a zombie until the dialplan
+  timeout expired and the device stayed stuck in Ring with a ghost cpvt
+- an incoming call reusing the index of a stale (channel-less) cpvt
+  matched pvt_find_cpvt() and was silently swallowed (no start_pbx)
+- CEND for an unknown call idx had no log (commented-out line), leaving
+  no trace for call-tracking diagnostics
+
+- RES_NO_CARRIER (empty queue): release every cpvt via
+  change_channel_state(RELEASED) -- canonical teardown (channel hangup
+  with hangup-exten/recording, ring flag clear, cpvt free) -- before
+  the CLCC resync
+- at_response_clcc: a stale cpvt (no channel) meeting a new incoming
+  call on the same index is freed so start_pbx runs for the new call
+- at_response_cend: log unknown-idx CEND as a warning
+
+Live evidence (3p14-aaa, EC25-EU, 2026-08-26): user hangup left a 72 s
+zombie channel, the device stuck in Ring with Calls/Channels: 1 after
+every call, and a second incoming call on the same index was dropped.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ at_response.c | 40 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/at_response.c b/at_response.c
+index 0aea850..a84e24c 100644
+--- a/at_response.c
++++ b/at_response.c
+@@ -752,7 +752,10 @@ static int at_response_cend (struct pvt * pvt, const char* str)
+ 	}
+ 	else
+ 	{
+-//		ast_log (LOG_ERROR, "[%s] CEND event for unknown call idx '%d'\n", PVT_ID(pvt), call_index);
++		/* CEND for a call index the driver does not track: the call was
++		 * rejected or forwarded at the network level without ever reaching
++		 * us. Not an error, but worth visibility for call tracking. */
++		ast_log (LOG_WARNING, "[%s] CEND event for unknown call idx '%d'\n", PVT_ID(pvt), call_index);
+ 	}
+ 
+ 	return 0;
+@@ -922,6 +925,20 @@ static int at_response_clcc (struct pvt* pvt, char* str)
+ 				if(mode == CLCC_CALL_TYPE_VOICE && state <= CALL_STATE_WAITING)
+ 				{
+ 					cpvt = pvt_find_cpvt(pvt, call_idx);
++					if(cpvt && !cpvt->channel && dir == CALL_DIR_INCOMING &&
++					   (state == CALL_STATE_INCOMING || state == CALL_STATE_WAITING))
++					{
++						/* Stale cpvt: the previous call on this index was torn
++						 * down without +CEND (modules like the Quectel EC25
++						 * send no +CEND; a dialplan hangup drops the channel
++						 * but the cpvt itself is never freed). The network has
++						 * reused the call index for a new incoming call: free
++						 * the stale entry so the code below starts the PBX for
++						 * the new call instead of silently swallowing it. */
++						ast_log (LOG_WARNING, "[%s] stale cpvt for call idx %u (no channel), freeing before new incoming call\n", PVT_ID(pvt), call_idx);
++						cpvt_free(cpvt);
++						cpvt = 0;
++					}
+ 					if(cpvt)
+ 					{
+ 						/* cpvt alive */
+@@ -1954,11 +1971,24 @@ int at_response (struct pvt* pvt, const struct iovec iov[2], int iovcnt, at_res_
+ 				if (task) {
+ 					at_response_busy(pvt, AST_CONTROL_CONGESTION);
+ 				} else {
++					struct cpvt * cpvt;
++
+ 					/* Unsolicited NO CARRIER with nothing pending: the call was
+-					 * released on the network side. Resync the call table -- a
+-					 * still-open call disappears from CLCC and is torn down via
+-					 * CALL_STATE_RELEASED (clean hangup, hangup-exten, recording). */
+-					ast_log (LOG_NOTICE, "[%s] NO CARRIER with empty command queue, resyncing via CLCC\n", PVT_ID(pvt));
++					 * released on the network side. Some modules (Quectel EC25)
++					 * never send +CEND, so NO CARRIER is the only release
++					 * notification: tear the call(s) down directly instead of
++					 * relying on a CLCC round-trip (the driver's CLCC dead-cpvt
++					 * cleanup loop is unreachable -- the parse loop in
++					 * at_response_clcc() always returns before reaching it).
++					 * change_channel_state(RELEASED) does the canonical teardown:
++					 * channel hangup (hangup-exten, recording forward), ring
++					 * flag clear, cpvt free. */
++					ast_log (LOG_NOTICE, "[%s] NO CARRIER with empty command queue, releasing call(s) and resyncing via CLCC\n", PVT_ID(pvt));
++					AST_LIST_TRAVERSE_SAFE_BEGIN (&pvt->chans, cpvt, entry)
++					{
++						change_channel_state(cpvt, CALL_STATE_RELEASED, 0);
++					}
++					AST_LIST_TRAVERSE_SAFE_END;
+ 					request_clcc(pvt);
+ 				}
+ 				break;
+-- 
+2.52.0
+
