@@ -531,7 +531,7 @@ class TestIsNumberAttempt:
         "+7 (926) 123-45-55",    # formatted: attempt, rejected
         "+7-926-123-45-55",
         "8989123456",            # 10-digit 8-prefix: attempt, rejected
-        "123",                   # 3 digits: attempt, VALID internal number
+        "123",                   # 3 digits: attempt, VALID service number
         "1234",
         "12345678",              # PIN-like: attempt, rejected (no false-positive call)
         "1234567",               # 7 digits: attempt, rejected

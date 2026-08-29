@@ -327,7 +327,7 @@ class TestCallRegistry:
 
     def test_internal_call_does_not_reserve_modem(self, registry):
         call = registry.create_outgoing(
-            callee_number="123", modem_required=False)
+            callee_number="1234", modem_required=False)
         assert call.state == CallState.MODEM_RESERVED
         assert call.modem_id == ""
 
@@ -338,13 +338,13 @@ class TestCallRegistry:
         with pytest.raises(ModemBusyError):
             registry.create_outgoing(callee_number="+14155552672")
         call = registry.create_outgoing(
-            callee_number="123", modem_required=False)
+            callee_number="1234", modem_required=False)
         assert call.state == CallState.MODEM_RESERVED
 
     def test_internal_cleanup_does_not_release_foreign_modem(self, registry):
         registry.create_outgoing(callee_number="+14155552671")  # reserved
         call = registry.create_outgoing(
-            callee_number="123", modem_required=False)
+            callee_number="1234", modem_required=False)
         registry.transition(call.call_id, CallState.TELEGRAM_CALLING)
         registry.transition(call.call_id, CallState.USER_ACCEPTED)
         registry.transition(call.call_id, CallState.GSM_DIALING)
@@ -957,8 +957,14 @@ class TestStage04Dialplan:
     def test_tg_bridge_context_exists_with_outgoing_leg(self):
         ctx = self._context("tg-bridge")
         assert "AGI(notify-agent-agi.py,outgoing-accepted)" in ctx
-        assert "Dial(Dongle/${MODEM_ID}/+${EXTEN}," \
-               "${OUTBOUND_GSM_RING_SECONDS})" in ctx
+        # 3-digit targets are local service numbers (e.g. 100): the
+        # leading '+' is omitted for them (+100 is not a valid
+        # international number), everything else dials with it.
+        assert "Dial(Dongle/${MODEM_ID}/${IF(${LEN(${EXTEN})}=3?" \
+               "${EXTEN}:+${EXTEN})},${OUTBOUND_GSM_RING_SECONDS})" in ctx
+        # no fixed 3-digit exten: 3 digits take the GSM leg, not the
+        # internal PJSIP route
+        assert "exten => _XXX," not in ctx
         # the h-exten closes the call state when the SIP leg dies
         assert "exten => h,1," in ctx
 

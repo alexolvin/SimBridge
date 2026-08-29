@@ -30,7 +30,7 @@ from core.acl import ACLManager
 from core.audit import AuditLogger
 from core.contacts import ContactResolver
 from core.blacklist import BlacklistManager
-from core.phone import normalize_e164, parse_destination
+from core.phone import is_service_number, normalize_e164, parse_destination
 from core.events import EventType
 from core.errors import SMSErrorType
 from core.recovery import BackoffReconnector
@@ -228,11 +228,12 @@ class Userbot:
             return
 
         # Strict validation (msg #48): only '+'+11-15 digits, '8'+11-15
-        # total, or 3-4 digit internal. Internal extensions cannot
-        # receive SMS; formatted/short-foreign forms are rejected here
-        # instead of being silently normalized as before.
+        # total, 3-digit local service (callable, not sendable), or
+        # 4-digit internal. Internal extensions and service numbers
+        # cannot receive SMS; formatted/short-foreign forms are
+        # rejected here instead of being silently normalized as before.
         dest = parse_destination(phone)
-        if dest is None or dest.is_internal:
+        if dest is None or dest.is_internal or is_service_number(dest.number):
             await evt.reply(SMSErrorType.NUMBER_MALFORMED_SMS.value)
             return
         norm = dest.number
@@ -398,7 +399,7 @@ class Userbot:
         )
         async def handle_bare_number(evt):
             """S04.3: a message that looks like a phone number (e.g.
-            "+79261234555", "89261234555", "123") is an outgoing-call
+            "+79261234555", "89261234555", "100") is an outgoing-call
             attempt. Strict validation (msg #48) decides: allowed forms
             dial, everything else gets "Неправильный номер"."""
             sender_id = evt.sender_id if evt.sender_id else 0
@@ -532,10 +533,11 @@ class Userbot:
                 await evt.reply("Usage: /block <phone>")
                 return
 
-            # Strict validation (msg #48); internal extensions are not
-            # GSM numbers, so they cannot be blocked.
+            # Strict validation (msg #48); internal extensions and
+            # 3-digit service numbers are not carrier numbers, so they
+            # cannot be blocked.
             dest = parse_destination(parts[1])
-            if dest is None or dest.is_internal:
+            if dest is None or dest.is_internal or is_service_number(dest.number):
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
                 return
             norm = dest.number
@@ -582,10 +584,11 @@ class Userbot:
                 await evt.reply("Usage: /unblock <phone>")
                 return
 
-            # Strict validation (msg #48); internal extensions are not
-            # GSM numbers, so they cannot be on the blacklist.
+            # Strict validation (msg #48); internal extensions and
+            # 3-digit service numbers are not carrier numbers, so they
+            # cannot be on the blacklist.
             dest = parse_destination(parts[1])
-            if dest is None or dest.is_internal:
+            if dest is None or dest.is_internal or is_service_number(dest.number):
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED.value)
                 return
             norm = dest.number

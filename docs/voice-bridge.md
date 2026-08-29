@@ -146,8 +146,9 @@ TG user sends a bare phone number (e.g. "+79261234555")
     │  userbot handle_bare_number:
     │    is_number_attempt() → ACL out_call → parse_destination (the
     │      msg #48 strict whitelist: '+' + 11-15 digits, '8' + 11-15
-    │      digits total → normalized to +7, or 3-4 digit internal
-    │      extension; anything else is an error reply, not a call)
+    │      digits total → normalized to +7, a 3-digit local service
+    │      number, or a 4-digit internal extension; anything else is
+    │      an error reply, not a call)
     │    → blacklist (external numbers only)
     │    → agent /v1/call/outgoing (rate-limit, ACL re-check,
     │      whitelist re-check, atomic modem reservation — skipped for
@@ -166,13 +167,14 @@ Asterisk tg-bridge context, EXTEN = target
     │       └─ 200 → SET VARIABLE CALL_ID <id>
     │          404 → CALL_ID stays empty (nocal gate below)
     │  3. GotoIf($["${CALL_ID}" = ""]?nocal)     ← the nocal gate
-    │  4a. EXTEN is 3-4 digits (internal): Goto(internal, EXTEN) —
+    │  4a. EXTEN is 4 digits (internal): Goto(internal, EXTEN) —
     │       the internal context dials a PJSIP endpoint of the same
     │       name (Dial(PJSIP/${EXTEN}), no GSM leg, no modem
     │       reservation); a missing endpoint fails instantly and the
     │       user gets a "call failed" notification
-    │  4b. EXTEN is a phone number:
-    │       Dial(Dongle/${MODEM_ID}/+${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
+    │  4b. EXTEN is a phone number (3-digit local service numbers
+    │      like 100 dial WITHOUT the leading '+'):
+    │       Dial(Dongle/${MODEM_ID}/${IF(${LEN(${EXTEN})}=3?${EXTEN}:+${EXTEN})},${OUTBOUND_GSM_RING_SECONDS})
     │       └─ the TG user hears the target's REAL ringback
     │          (the two-party bridge passes in-band ringback)
     │  5. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
@@ -189,7 +191,7 @@ ring a real phone for a call that no longer exists.
 
 **Modem reservation**: `/v1/call/outgoing` takes the reservation
 atomically in the agent (single call per node while the pool is a
-single member); internal 3-4 digit extensions skip the reservation
+single member); internal 4-digit extensions skip the reservation
 (`modem_required=False` — they never touch the GSM modem), so an
 internal call is allowed even while the modem is busy; if the bridge
 cannot start the Telegram call the userbot rejects the agent-side call
@@ -200,7 +202,9 @@ backstop that reaps any call left in `TELEGRAM_CALLING` past
 **Destination whitelist** (msg #48): the userbot and the agent both
 validate the destination with `core.phone.parse_destination` before
 anything is dialed: `+` + 11-15 digits (as-is), `8` + 11-15 digits
-total (normalized to `+7...`), or a 3-4 digit internal extension.
+total (normalized to `+7...`), a 3-digit local service number (e.g.
+100 — callable via the GSM modem, not sendable or blockable), or a
+4-digit internal extension.
 Anything else — 7/9-prefix, formatted strings, letters, PIN-like codes
 — is an **error reply** (no call, no silent normalization). The same
 whitelist guards `/v1/sms` and the `/block` `/unblock` commands.

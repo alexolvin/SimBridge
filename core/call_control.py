@@ -421,7 +421,7 @@ class CallRegistry:
         or reserved directly (backward compat for single-modem).
 
         modem_required=False (2026-08-22): an internal-network call
-        (3-4 digit extension). Such a call bridges to a PJSIP endpoint
+        (4-digit extension). Such a call bridges to a PJSIP endpoint
         and never touches the GSM modem — no pool selection, no
         reservation, no MODEM_SELECTED audit. The machine still passes
         through MODEM_RESERVED: the state name is historical and the

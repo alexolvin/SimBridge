@@ -104,7 +104,7 @@ class Destination:
 
     number: canonical form to dial/send to — E.164 for external
         numbers, raw digits for internal network numbers.
-    is_internal: True for 3-4 digit in-network numbers. These dial a
+    is_internal: True for 4-digit in-network numbers. These dial a
         PJSIP endpoint of the same name, never the GSM modem.
     """
     number: str
@@ -113,7 +113,8 @@ class Destination:
 
 _EXT_PLUS_RE = re.compile(r"^\+\d{11,15}$")  # '+': 11-15 digits (excl. +)
 _EXT_RU_RE = re.compile(r"^8\d{10,14}$")     # '8': 11-15 digits total
-_INTERNAL_RE = re.compile(r"^\d{3,4}$")      # internal network number
+_EXT_SHORT_RE = re.compile(r"^\d{3}$")       # 3-digit local service number (e.g. 100), dialed as-is
+_INTERNAL_RE = re.compile(r"^\d{4}$")        # internal network number
 
 
 def parse_destination(raw: Optional[str]) -> Optional[Destination]:
@@ -123,7 +124,8 @@ def parse_destination(raw: Optional[str]) -> Optional[Destination]:
 
     - '+' followed by 11-15 digits                  -> external, as-is
     - '8' followed by 10-14 digits (11-15 total)    -> external, "+7"+rest
-    - 3-4 digits                                     -> internal number
+    - 3 digits (local service number, e.g. 100)     -> external, as-is
+    - 4 digits                                      -> internal number
 
     Everything else is rejected: letters, spaces, dashes, parens, other
     lengths, and the bare '7' prefix ("79261234555" is not allowed).
@@ -137,6 +139,8 @@ def parse_destination(raw: Optional[str]) -> Optional[Destination]:
         return Destination(s, is_internal=False)
     if _EXT_RU_RE.match(s):
         return Destination("+7" + s[1:], is_internal=False)
+    if _EXT_SHORT_RE.match(s):
+        return Destination(s, is_internal=False)
     if _INTERNAL_RE.match(s):
         return Destination(s, is_internal=True)
     return None

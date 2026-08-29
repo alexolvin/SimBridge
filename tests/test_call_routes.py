@@ -283,7 +283,7 @@ class TestCallOutgoing:
         assert mal[0]["details"]["to"] == number
 
     def test_internal_number_bypasses_modem_reservation(self, env):
-        # while an external call holds the (single) modem, a 3-4 digit
+        # while an external call holds the (single) modem, a 4-digit
         # internal extension must still be registered — it bridges to a
         # PJSIP endpoint and never touches the GSM modem
         client, registry, audit, ami, app, _ = env
@@ -295,11 +295,11 @@ class TestCallOutgoing:
         assert r1.status_code == 200
         r2 = client.post(
             "/v1/call/outgoing", headers=_auth(),
-            json={"phone_number": "123",
+            json={"phone_number": "1234",
                   "telegram_user_id": ACL_USER},
         )
         assert r2.status_code == 200
-        assert r2.json()["callee_number"] == "123"
+        assert r2.json()["callee_number"] == "1234"
         call2 = registry.get(r2.json()["call_id"])
         assert call2.modem_id == ""
 

@@ -95,7 +95,8 @@ class TestPhoneNormalizer:
 class TestParseDestination:
     """Strict user-input validator (msg #48, 2026-08-22).
 
-    Allowed: '+'+11-15 digits, '8'+11-15 total, 3-4 digit internal.
+    Allowed: '+'+11-15 digits, '8'+11-15 total, 3-digit local service
+    (external), 4-digit internal.
     Everything else -> None; the caller surfaces the localized
     "Неправильный номер" error instead of dialing or going silent.
     Deliberately stricter than normalize_e164 (system-side leniency).
@@ -120,12 +121,21 @@ class TestParseDestination:
         assert parse_destination("89261234555") == Destination("+79261234555", False)
         assert parse_destination("8926123455555") == Destination("+7926123455555", False)
 
-    @pytest.mark.parametrize("raw", ["123", "1234", "8989", "  123  "])
+    @pytest.mark.parametrize("raw", ["1234", "8989"])
     def test_internal_valid(self, raw):
         dest = parse_destination(raw)
         assert dest is not None
         assert dest.number == raw.strip()
         assert dest.is_internal is True
+
+    @pytest.mark.parametrize("raw", ["100", "123", "  100  "])
+    def test_service_3_digit_external_valid(self, raw):
+        # 3 digits = local service number (e.g. 100, Moscow time
+        # service) — external, dialed as-is through the GSM modem.
+        dest = parse_destination(raw)
+        assert dest is not None
+        assert dest.number == raw.strip()
+        assert dest.is_internal is False
 
     @pytest.mark.parametrize(
         "raw",

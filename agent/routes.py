@@ -18,7 +18,7 @@ from core.audit import AuditLogger
 from core.events import EventType
 from core.ratelimit import RateLimiter
 from core.blacklist import BlacklistManager
-from core.phone import parse_destination
+from core.phone import is_service_number, parse_destination
 from core.sms_correlation import SMSCorrelationStore, SMSRecord
 from core.errors import SMSErrorType, asterisk_sms_error_to_type
 from core.acl import ACLManager
@@ -174,9 +174,10 @@ async def send_sms(
 
     # Strict validation (msg #48): the user-input whitelist is enforced
     # here so a malformed destination is a 400, not a modem error.
-    # Internal extensions cannot receive SMS.
+    # Internal extensions and 3-digit service numbers cannot receive
+    # SMS (they are callable, not sendable).
     dest = parse_destination(req.to)
-    if dest is None or dest.is_internal:
+    if dest is None or dest.is_internal or is_service_number(dest.number):
         audit.log(
             EventType.SMS_SEND_REQUESTED,
             telegram_user_id=req.telegram_user_id,
@@ -695,7 +696,8 @@ async def call_outgoing(
     )
 
     # Strict validation (msg #48): only '+'+11-15 digits, '8'+11-15
-    # total, or a 3-4 digit internal extension — anything else is a 400.
+    # total, a 3-digit local service number (dialed via the GSM modem),
+    # or a 4-digit internal extension — anything else is a 400.
     dest = parse_destination(req.phone_number)
     if dest is None:
         audit.log(

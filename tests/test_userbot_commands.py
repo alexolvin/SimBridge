@@ -8,10 +8,12 @@ Covers the user-requested behaviors:
      without the right -> "Недостаточно прав" (msg #47);
   C. a plain reply (no /sms prefix) to a forwarded incoming SMS is
      sent to that number (msg #47);
-  D. strict destination whitelist (msg #48): a call/SMS destination is
-     accepted only as '+'+11-15 digits, '8'+11-15 digits total, or a
-     3-4 digit internal network number; anything else gets an error
-     reply instead of being silently normalized or dialed.
+  D. strict destination whitelist (msg #48): a call destination is
+     accepted only as '+'+11-15 digits, '8'+11-15 digits total, a
+     3-digit local service number, or a 4-digit internal network
+     number; SMS accepts the two carrier forms only (service numbers
+     and internal extensions cannot receive SMS); anything else gets
+     an error reply instead of being silently normalized or dialed.
 
 telethon is not installed in the test environment, so it is stubbed
 with a MagicMock (same pattern as test_s06_wiring.py) and the handler
@@ -473,12 +475,14 @@ class TestSmsSend:
         assert evt.replies == [SMSErrorType.NUMBER_MALFORMED_SMS.value]
         assert posts == []
 
-    def test_sms_to_internal_extension_rejected(self, monkeypatch):
-        # 3-4 digit numbers are internal network extensions: they can
-        # be dialed, but cannot receive SMS
+    @pytest.mark.parametrize("num", ["1234", "100"])
+    def test_sms_to_non_carrier_rejected(self, monkeypatch, num):
+        # a 4-digit number is an internal network extension and a
+        # 3-digit one a local service number: both can be dialed, but
+        # neither can receive SMS
         ub, client = make_ub(monkeypatch)
         posts = fake_http(monkeypatch, FakeResp(200, {}))
-        evt = FakeEvt("/sms 123 hi", MASTER)
+        evt = FakeEvt(f"/sms {num} hi", MASTER)
         _run(client.fn("handle_sms")(evt))
         assert evt.replies == [SMSErrorType.NUMBER_MALFORMED_SMS.value]
         assert posts == []
@@ -629,16 +633,17 @@ class TestBlockUnblock:
         assert not ub._blacklist.contains("+79991234567")
         assert posts[0]["url"] == "http://127.0.0.1:8090/v1/unblock"
 
-    def test_block_internal_extension_rejected(self, monkeypatch):
-        # an internal extension is not a carrier number — it cannot
-        # be blocked
+    @pytest.mark.parametrize("num", ["1234", "100"])
+    def test_block_non_carrier_rejected(self, monkeypatch, num):
+        # a 4-digit internal extension and a 3-digit service number are
+        # not carrier numbers — they cannot be blocked
         ub, client = make_ub(monkeypatch)
         posts = fake_http(monkeypatch, FakeResp(200, {}))
-        evt = FakeEvt("/block 123", MASTER)
+        evt = FakeEvt(f"/block {num}", MASTER)
         _run(client.fn("handle_block")(evt))
         assert evt.replies == [SMSErrorType.NUMBER_MALFORMED.value]
         assert posts == []
-        assert not ub._blacklist.contains("123")
+        assert not ub._blacklist.contains(num)
 
     def test_unblock_7_prefix_rejected(self, monkeypatch):
         ub, client = make_ub(monkeypatch, blacklist=("+79991234567",))
@@ -710,10 +715,9 @@ class TestBareNumber:
         assert posts[0]["json"]["phone_number"] == "+79991234567"
         assert evt.replies == ["Звоню вам в Telegram…"]
 
-    def test_internal_3_digit_dials_as_is(self, monkeypatch):
-        # a 3-4 digit number is an internal network extension — dialed
-        # verbatim to a PJSIP endpoint of the same name, never the GSM
-        # modem
+    def test_service_3_digit_dials_as_is(self, monkeypatch):
+        # a 3-digit number is a local service number (e.g. 100, Moscow
+        # time service) — external, dialed as-is via the GSM modem
         ub, client = make_ub(monkeypatch)
         ub._bridge.start_call = AsyncMock(return_value=True)
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
@@ -737,8 +741,8 @@ class TestBareNumber:
             "9881234567",          # 10 digits — was silently dialed before
             "8989123456",          # 8-prefix but only 10 digits total
             "79991234567",         # 7-prefix not on the whitelist
-            "12",                  # too short for an internal extension
-            "12345",               # too long for an internal extension
+            "12",                  # 2 digits — no rule matches
+            "12345",               # 5 digits — no rule matches
             "12345678",            # PIN-like 8 digits — was a false-positive call
             "+7 (926) 123-45-55",  # formatted — must not be normalized
             "+7-926-123-45-55",
@@ -763,7 +767,7 @@ class TestBareNumber:
         f = client.spec("handle_bare_number")["func"]
         assert f(FakeEvt("+79991234567", MASTER)) is True
         assert f(FakeEvt("89991234567", MASTER)) is True
-        assert f(FakeEvt("123", MASTER)) is True       # internal extension
+        assert f(FakeEvt("123", MASTER)) is True       # 3-digit service number
         assert f(FakeEvt("12345678", MASTER)) is True  # PIN: error, not silence
         assert f(FakeEvt("79991234567", MASTER)) is True
         assert f(FakeEvt("Привет 2026", MASTER)) is False
