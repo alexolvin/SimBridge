@@ -1,0 +1,13 @@
+[Unit]
+Description=SimBridge registration watcher (CREG/CEREG AT poll via chan_dongle)
+After=network-online.target asterisk.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/simbridge/scripts/creg_watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
