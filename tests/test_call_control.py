@@ -751,11 +751,13 @@ class TestConfigGeneratorBridge:
 class TestDialplanBridge:
     """Structural regression tests for [tg-bridge] in the repo dialplan.
 
-    The dialplan is a checked-in artifact (asterisk/extensions.conf),
-    and dialplan walker order is a live incident, not a style point:
-    with extenpatternmatchnew=0 (default) the walker returns the FIRST
-    matching extension in FILE order (18.26.4 main/pbx.c find_extension
-    old path), so an exact exten after a _X. pattern is unreachable.
+    The dialplan is a checked-in artifact (asterisk/extensions.conf).
+    Asterisk ranks matching extensions by SPECIFICITY (a literal exten
+    beats a pattern, a leading literal beats X), not by file order —
+    the position assertions below pin the file order as double
+    insurance. (TZ-06 27.09 correction: an earlier "first match in file
+    order" note was a misleading simplification.) The authoritative
+    check is the live `dialplan show tg-bridge/<exten>` output.
     """
 
     @pytest.fixture(autouse=True)
@@ -769,7 +771,8 @@ class TestDialplanBridge:
 
     def test_probe_target_778_precedes_catchall(self):
         # The S04.2 E2E probe media target must come BEFORE the _X.
-        # pattern, or the catchall shadows it. The mirror-image bug
+        # pattern (double insurance: a literal exten is more specific,
+        # but the position must not regress). The mirror-image bug
         # (catchall shadowing the outgoing GSM leg, both living in
         # [sms-send]) was a live incident 2026-08-18 (3p14-aaa).
         assert self.bridge_block.index("exten => 778,1,") \
@@ -965,7 +968,8 @@ class TestStage04Dialplan:
         # leading '+' is omitted for them (+100 is not a valid
         # international number), everything else dials with it.
         # Implemented as a fixed-length _[0-9]XX pattern BEFORE the _X.
-        # catch-all (file-order precedence, extenpatternmatchnew=0) —
+        # catch-all (specificity — fixed length beats the variable
+        # catch-all — plus the file position as double insurance) —
         # NOT ${IF(${LEN(...)}...)}: this build of Asterisk does not
         # register IF()/LEN() (res_pbx_builtin_functions is not
         # installed on 3p14-aaa) and the IF() version dialed an EMPTY
@@ -977,7 +981,8 @@ class TestStage04Dialplan:
         # must be gone from the actual Dial() invocation
         assert "Dial(Dongle/${MODEM_ID}/${IF(" not in ctx
         # the 3-digit local-service exten must precede the _X. catch-all
-        # (first match in file order wins)
+        # (double insurance; matching is ranked by specificity, and the
+        # live `dialplan show` is the authoritative check)
         assert ctx.index("exten => _[0-9]XX,1,") < ctx.index("exten => _X.,1,")
         # no fixed _XXX exten: 3 digits take the GSM leg, not the
         # internal PJSIP route
@@ -1019,11 +1024,18 @@ class TestStage04Dialplan:
 # =========================================================================
 
 class TestTgBridgeRouting:
-    """Static routing table for [tg-bridge]: with extenpatternmatchnew=0
-    the walker returns the FIRST matching extension in FILE order
-    (18.26.4 main/pbx.c find_extension old path — see TestDialplanBridge).
-    For every dialed string the test replicates the walker and asserts
-    both the pattern hit and the Dial() destination that results.
+    """Static routing table for [tg-bridge].
+
+    KNOWN SIMPLIFICATION: _route() replicates a first-match-in-FILE-order
+    walk, while Asterisk actually ranks matching extensions by
+    SPECIFICITY (a leading literal 0/8 beats X; a fixed length beats the
+    variable _X.) — file order is only a tie-breaker. On THIS pattern set
+    both orderings produce identical routing (each 0/8 pattern is strictly
+    more specific than the pattern it must beat, and it is also placed
+    earlier in the file), so the static table stays valid here.
+    AUTHORITATIVE CHECK: the live `dialplan show tg-bridge/<number>`
+    output, recorded verbatim in .reports/REPORT-TZ06-20260926.md (§5.2,
+    dialplan deploy verification).
     """
 
     @pytest.fixture(autouse=True)
@@ -1112,10 +1124,10 @@ class TestTgBridgeRouting:
             assert self._dial_target(block, number) == dial
 
     def test_service_patterns_precede_catch_alls(self):
-        # file-order precedence (first match wins): a 0-number must not
-        # fall through to the _XXXX internal pattern (4 digits) or the
-        # _X. catch-all (5+ digits), an 8-number must not fall through
-        # to the _X. catch-all either.
+        # The routing is guaranteed by SPECIFICITY (a leading literal 0/8
+        # and a fixed length beat the catch-alls, see the class
+        # docstring); the file position before the catch-alls is double
+        # insurance, and this test pins that position down.
         ctx = self.ctx
         assert ctx.index("exten => _0XXX,1,") < ctx.index("exten => _XXXX,1,")
         assert ctx.index("exten => _0XXXX,1,") < ctx.index("exten => _X.,1,")

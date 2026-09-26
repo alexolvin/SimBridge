@@ -173,10 +173,19 @@ Asterisk tg-bridge context, EXTEN = target
     │       reservation); a missing endpoint fails instantly and the
     │       user gets a "call failed" notification
     │  4b. EXTEN is a phone number (3-digit local service numbers
-    │      like 100 dial WITHOUT the leading '+'):
-    │       Dial(Dongle/${MODEM_ID}/${IF(${LEN(${EXTEN})}=3?${EXTEN}:+${EXTEN})},${OUTBOUND_GSM_RING_SECONDS})
+    │      like 100 dial WITHOUT the leading '+'); the fixed-length
+    │      _[0-9]XX exten is more specific than the _X. catch-all
+    │      (matching is ranked by specificity, not file order; the file
+    │      position is double insurance) and dials as-is, while the _X.
+    │      catch-all dials with '+':
+    │       Dial(Dongle/${MODEM_ID}/${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
+    │       Dial(Dongle/${MODEM_ID}/+${EXTEN},${OUTBOUND_GSM_RING_SECONDS})
     │       └─ the TG user hears the target's REAL ringback
     │          (the two-party bridge passes in-band ringback)
+    │      (No ${IF(${LEN(...)})}: IF()/LEN() are not registered in
+    │      the 3p14-aaa Asterisk build — res_pbx_builtin_functions is
+    │      not installed; the IF() version dialed an EMPTY destination,
+    │      cause 88, found live 2026-09-26, TZ-05)
     │  5. AGI complete ${DIALSTATUS} → agent /v1/call/{id}/complete
     │       └─ per-outcome userbot notification (answered / no_answer /
     │          busy / failed — separate localized messages)

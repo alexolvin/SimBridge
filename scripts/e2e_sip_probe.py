@@ -45,16 +45,17 @@ address the kernel selects for packets toward --gsm-ip. It must NOT
 be 0.0.0.0: for a non-NAT peer Asterisk sends RTP to the SDP c=
 address, so 0.0.0.0 would black-hole the media.
 
-Dialplan note (Asterisk 18.26.4, main/pbx.c): with
-extenpatternmatchnew=0 (the default; no config option, runtime CLI
-only) the extension walker returns the FIRST matching extension in
-FILE order. Hence 778 is defined BEFORE the _X. pattern in the
-[tg-bridge] context — otherwise an INVITE to 778 would match _X.
-(the production nocal path) and never reach the media target. The
-X pattern digit class is [0-9] (case 'X' in _extension_match_core),
-so 11-digit production numbers (79xx...) also match _X. and the
-probe extension is unreachable from real traffic: 778 matches only
-the literal string "778".
+Dialplan note (Asterisk 18.26.4, main/pbx.c): matching is ranked by
+SPECIFICITY, not file order — a literal extension is more specific
+than a pattern, so the literal 778 wins over the _X. pattern in
+[tg-bridge] regardless of file position; it is defined before the
+pattern as double insurance (without the literal, an INVITE to 778
+would match _X. and never reach the media target). The X pattern
+digit class is [0-9] (case 'X' in _extension_match_core), so
+11-digit production numbers (79xx...) also match _X. and the probe
+extension is unreachable from real traffic: 778 matches only the
+literal string "778". Authoritative check of any routing claim: the
+live `dialplan show tg-bridge/<number>` output.
 """
 
 from __future__ import annotations
