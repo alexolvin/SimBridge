@@ -776,9 +776,13 @@ class TestDialplanBridge:
             < self.bridge_block.index("exten => _X.,1,")
 
     def test_probe_target_plays_silence_and_self_terminates(self):
+        # slice only the 778 block (it ends at the next exten, _0XXX);
+        # extending to the _X. catch-all would also capture the service,
+        # internal and local-service legs, which legitimately contain
+        # Dial().
         seg = self.bridge_block[
             self.bridge_block.index("exten => 778,1,")
-            : self.bridge_block.index("exten => _X.,1,")]
+            : self.bridge_block.index("exten => _0XXX,1,")]
         assert "Answer()" in seg
         assert "Playback(silence/5000)" in seg
         assert "Hangup()" in seg
@@ -960,9 +964,22 @@ class TestStage04Dialplan:
         # 3-digit targets are local service numbers (e.g. 100): the
         # leading '+' is omitted for them (+100 is not a valid
         # international number), everything else dials with it.
-        assert "Dial(Dongle/${MODEM_ID}/${IF(${LEN(${EXTEN})}=3?" \
-               "${EXTEN}:+${EXTEN})},${OUTBOUND_GSM_RING_SECONDS})" in ctx
-        # no fixed 3-digit exten: 3 digits take the GSM leg, not the
+        # Implemented as a fixed-length _[0-9]XX pattern BEFORE the _X.
+        # catch-all (file-order precedence, extenpatternmatchnew=0) —
+        # NOT ${IF(${LEN(...)}...)}: this build of Asterisk does not
+        # register IF()/LEN() (res_pbx_builtin_functions is not
+        # installed on 3p14-aaa) and the IF() version dialed an EMPTY
+        # destination (cause 88), found live 2026-09-26 (TZ-05).
+        assert "exten => _[0-9]XX,1," in ctx
+        assert "Dial(Dongle/${MODEM_ID}/${EXTEN},${OUTBOUND_GSM_RING_SECONDS})" in ctx
+        assert "Dial(Dongle/${MODEM_ID}/+${EXTEN},${OUTBOUND_GSM_RING_SECONDS})" in ctx
+        # the old IF()/LEN() Dial line (which dialed an EMPTY destination)
+        # must be gone from the actual Dial() invocation
+        assert "Dial(Dongle/${MODEM_ID}/${IF(" not in ctx
+        # the 3-digit local-service exten must precede the _X. catch-all
+        # (first match in file order wins)
+        assert ctx.index("exten => _[0-9]XX,1,") < ctx.index("exten => _X.,1,")
+        # no fixed _XXX exten: 3 digits take the GSM leg, not the
         # internal PJSIP route
         assert "exten => _XXX," not in ctx
         # the h-exten closes the call state when the SIP leg dies
@@ -995,6 +1012,122 @@ class TestStage04Dialplan:
                     f"duplicate exten {key[0]} priority {key[1]} in "
                     f"[{ctx_name}] — the second is dead code")
                 seen.add(key)
+
+
+# =========================================================================
+# tg-bridge routing — 0-service numbers and the 8-trunk format (TZ-06)
+# =========================================================================
+
+class TestTgBridgeRouting:
+    """Static routing table for [tg-bridge]: with extenpatternmatchnew=0
+    the walker returns the FIRST matching extension in FILE order
+    (18.26.4 main/pbx.c find_extension old path — see TestDialplanBridge).
+    For every dialed string the test replicates the walker and asserts
+    both the pattern hit and the Dial() destination that results.
+    """
+
+    @pytest.fixture(autouse=True)
+    def load_dialplan(self):
+        path = Path(__file__).resolve().parent.parent / "asterisk" / "extensions.conf"
+        self.dialplan = path.read_text()
+
+    @property
+    def ctx(self):
+        m = re.search(r"\[tg-bridge\](.*?)(?=\n\[|\Z)", self.dialplan, re.S)
+        assert m, "[tg-bridge] context not found"
+        return m.group(1)
+
+    @staticmethod
+    def _pattern_regex(pat):
+        """'_XXXX' -> exactly 4 digits; '_X.' -> >=1; '_[0-9]XX' -> 3."""
+        body = pat[1:]
+        if body.endswith("."):
+            core, tail = body[:-1], "[0-9]*"
+        else:
+            core, tail = body, ""
+        core = "".join("[0-9]" if ch == "X" else ch for ch in core)
+        return re.compile(f"^{core}{tail}$")
+
+    def _extens(self):
+        """(exten, block) pairs in file order; a block ends at the next
+        'exten =>' line (or the context end)."""
+        extens, cur = [], None
+        for line in self.ctx.splitlines():
+            m = re.match(r"exten => ([A-Za-z0-9_*.+[\]-]+),", line)
+            if m:
+                cur = [m.group(1)]
+                extens.append(cur)
+            elif cur is not None:
+                cur.append(line)
+        return [(e[0], "\n".join(e[1:])) for e in extens]
+
+    def _route(self, number):
+        for exten, block in self._extens():
+            if exten.startswith("_"):
+                if self._pattern_regex(exten).match(number):
+                    return exten, block
+            elif exten == number:
+                return exten, block
+        return None, None
+
+    @staticmethod
+    def _dial_target(block, number):
+        """First Dial(Dongle/...) destination in the block with ${EXTEN}
+        expanded as the PBX would (incl. the :1 string slice)."""
+        m = re.search(r"Dial\(Dongle/\$\{MODEM_ID\}/([^,]+),", block)
+        assert m, "no Dial(Dongle/...) in block"
+        dest = m.group(1)
+        dest = dest.replace("${EXTEN:1}", number[1:])
+        dest = dest.replace("${EXTEN}", number)
+        return dest
+
+    @pytest.mark.parametrize(
+        ("number", "exten", "dial"),
+        [
+            # 0-service numbers are dialed AS DIALED (TZ-06 list):
+            ("0611", "_0XXX", "0611"),
+            ("0605", "_0XXX", "0605"),
+            ("0850", "_0XXX", "0850"),
+            ("0676", "_0XXX", "0676"),
+            ("0717", "_0XXX", "0717"),
+            ("0603", "_0XXX", "0603"),
+            ("0533", "_0XXX", "0533"),
+            ("06503", "_0XXXX", "06503"),
+            ("064012", "_0XXXXX", "064012"),
+            ("065050", "_0XXXXX", "065050"),
+            # the 8 trunk prefix becomes the +7 international format:
+            ("88007000611", "_8XXXXXXXXXX", "+78007000611"),
+            # everything else keeps the pre-TZ-06 routing:
+            ("79267523624", "_X.", "+79267523624"),
+            ("1234", "_XXXX", None),    # 4 digits -> internal PJSIP route
+            ("100", "_[0-9]XX", "100"), # 3 digits -> local service leg
+            ("778", "778", None),       # S04.2 probe media target
+        ],
+    )
+    def test_routing(self, number, exten, dial):
+        got_exten, block = self._route(number)
+        assert got_exten == exten, (
+            f"{number} routed to {got_exten!r}, expected {exten!r}")
+        if dial is not None:
+            assert self._dial_target(block, number) == dial
+
+    def test_service_patterns_precede_catch_alls(self):
+        # file-order precedence (first match wins): a 0-number must not
+        # fall through to the _XXXX internal pattern (4 digits) or the
+        # _X. catch-all (5+ digits), an 8-number must not fall through
+        # to the _X. catch-all either.
+        ctx = self.ctx
+        assert ctx.index("exten => _0XXX,1,") < ctx.index("exten => _XXXX,1,")
+        assert ctx.index("exten => _0XXXX,1,") < ctx.index("exten => _X.,1,")
+        assert ctx.index("exten => _8XXXXXXXXXX,1,") < ctx.index("exten => _X.,1,")
+
+    def test_service_legs_dial_without_plus(self):
+        # a '+'-prefixed 0-number is not a valid international number:
+        # the service legs must dial the number exactly as dialed
+        for number in ("0611", "06503", "064012"):
+            exten, block = self._route(number)
+            assert exten and exten.startswith("_0")
+            assert not self._dial_target(block, number).startswith("+")
 
 
 # =========================================================================
