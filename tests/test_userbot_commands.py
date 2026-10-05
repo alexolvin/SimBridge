@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -45,6 +46,7 @@ from userbot.userbot import (  # noqa: E402
 )
 from core.errors import SMSErrorType  # noqa: E402
 from core.events import EventType  # noqa: E402
+from core.user_contacts import UserContactsStore  # noqa: E402
 
 
 def _run(coro):
@@ -131,20 +133,36 @@ class FakeBlacklist:
     def unblock(self, n):
         self.nums.discard(n)
 
+    def list(self):
+        return sorted(self.nums)
+
 
 class FakeMsg:
-    def __init__(self, text, mid=101):
+    def __init__(self, text, mid=101, file_data=None):
         self.text = text
         self.id = mid
+        # file_data: bytes of a document attachment (vCard import path)
+        if file_data is None:
+            self.file = None
+        else:
+            self.file = SimpleNamespace(size=len(file_data), data=file_data)
+
+    async def download_bytes(self):
+        if self.file is None:
+            raise AssertionError("download_bytes on a message without a file")
+        return self.file.data
 
 
 class FakeEvt:
-    def __init__(self, text, sender_id, reply_to=None, voice=False, mid=101):
-        self.message = FakeMsg(text, mid)
+    def __init__(self, text, sender_id, reply_to=None, voice=False, mid=101,
+                 file_data=None, contact=None):
+        self.message = FakeMsg(text, mid, file_data=file_data)
         self.sender_id = sender_id
         self.text = text
         self.id = mid
         self.voice = voice
+        # a forwarded Telegram contact card (MessageMediaContact)
+        self.contact = contact
         self.is_reply = reply_to is not None
         self.reply_to_msg_id = reply_to.id if reply_to else None
         self.reply_to = reply_to
@@ -176,6 +194,9 @@ def make_ub(monkeypatch, rights=None, blacklist=()):
     ub._agent_url = "http://127.0.0.1:8090"
     ub._agent_token = "test-token"
     ub._bridge = MagicMock()
+    ub._last_call = {}
+    # per-user vCard store on a throwaway file (absent file = empty store)
+    ub._user_contacts = UserContactsStore(tempfile.mktemp(suffix=".json"))
     ub._register_handlers()
     return ub, client
 
@@ -272,6 +293,11 @@ class TestCaseInsensitivePatterns:
             "handle_broadcast": ["/Broadcast hi", "/bRoAdCaSt hi"],
             "handle_block": ["/BLOCK +79991234567", "/Block +79991234567"],
             "handle_unblock": ["/UNBLOCK +79991234567", "/Unblock +79991234567"],
+            "handle_listblock": ["/LISTBLOCK", "/Listblock"],
+            "handle_redial": ["/REDIAL", "/Redial"],
+            "handle_call": ["/CALL Ivan", "/Call +79991234567"],
+            "handle_contacts": ["/CONTACTS", "/Contacts"],
+            "handle_del": ["/DEL Ivan", "/Del +79991234567"],
             "handle_help": ["/HELP", "/Help"],
         }
         for name, samples in cases.items():
@@ -286,6 +312,11 @@ class TestCaseInsensitivePatterns:
             "handle_broadcast": "/broadcast hi",
             "handle_block": "/block +79991234567",
             "handle_unblock": "/unblock +79991234567",
+            "handle_listblock": "/listblock",
+            "handle_redial": "/redial",
+            "handle_call": "/call Ivan",
+            "handle_contacts": "/contacts",
+            "handle_del": "/del Ivan",
             "handle_help": "/help",
         }
         for name, s in cases.items():
@@ -328,6 +359,7 @@ class TestAccessGate:
             "handle_broadcast": "/broadcast hi",
             "handle_block": "/block +79991234567",
             "handle_unblock": "/unblock +79991234567",
+            "handle_listblock": "/listblock",
         }
         for name, text in denied.items():
             evt = FakeEvt(text, PARTIAL)
@@ -350,6 +382,7 @@ class TestAccessGate:
             "handle_broadcast": "/broadcast hi",
             "handle_block": "/block +79991234567",
             "handle_unblock": "/unblock +79991234567",
+            "handle_listblock": "/listblock",
             "handle_help": "/help",
             "handle_unknown_command": "/EEE whatever",
             "handle_bare_number": "+79991234567",
@@ -437,6 +470,43 @@ class TestMalformedNumbers:
         _run(client.fn("handle_block")(evt))
         assert evt.replies == [SMSErrorType.NUMBER_MALFORMED.value]
         assert posts == []
+
+
+# ---------------------------------------------------------------------------
+# /listblock — full blacklist view (read-only)
+# ---------------------------------------------------------------------------
+
+class TestListblock:
+    def test_lists_all_numbers_sorted(self, monkeypatch):
+        ub, client = make_ub(
+            monkeypatch,
+            blacklist=["+79991234567", "+79120001122"],
+        )
+        evt = FakeEvt("/listblock", MASTER)
+        _run(client.fn("handle_listblock")(evt))
+        assert evt.replies == [
+            "Blacklist (2):\n  +79120001122\n  +79991234567"
+        ]
+
+    def test_empty_blacklist(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/listblock", MASTER)
+        _run(client.fn("handle_listblock")(evt))
+        assert evt.replies == ["Blacklist is empty."]
+
+    def test_no_http_traffic(self, monkeypatch):
+        # read-only: /listblock must not touch the agent API
+        ub, client = make_ub(monkeypatch, blacklist=["+79991234567"])
+        posts = fake_http(monkeypatch, FakeResp(200, {}))
+        evt = FakeEvt("/listblock", MASTER)
+        _run(client.fn("handle_listblock")(evt))
+        assert posts == []
+
+    def test_help_lists_listblock_for_out_sms(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/help", MASTER)
+        _run(client.fn("handle_help")(evt))
+        assert any("/listblock" in r for r in evt.replies)
 
 
 # ---------------------------------------------------------------------------
@@ -699,7 +769,7 @@ class TestBareNumber:
 
     def test_plus_form_dials(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
-        ub._bridge.start_call = AsyncMock(return_value=True)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("+79991234567", MASTER)
         _run(client.fn("handle_bare_number")(evt))
@@ -708,7 +778,7 @@ class TestBareNumber:
 
     def test_8_prefix_normalized_then_dialed(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
-        ub._bridge.start_call = AsyncMock(return_value=True)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("89991234567", MASTER)
         _run(client.fn("handle_bare_number")(evt))
@@ -719,7 +789,7 @@ class TestBareNumber:
         # a 3-digit number is a local service number (e.g. 100, Moscow
         # time service) — external, dialed as-is via the GSM modem
         ub, client = make_ub(monkeypatch)
-        ub._bridge.start_call = AsyncMock(return_value=True)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("123", MASTER)
         _run(client.fn("handle_bare_number")(evt))
@@ -728,7 +798,7 @@ class TestBareNumber:
 
     def test_internal_4_digit_dials_as_is(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
-        ub._bridge.start_call = AsyncMock(return_value=True)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("1234", MASTER)
         _run(client.fn("handle_bare_number")(evt))
@@ -773,3 +843,584 @@ class TestBareNumber:
         assert f(FakeEvt("Привет 2026", MASTER)) is False
         assert f(FakeEvt("тел: +79991234567", MASTER)) is False
         assert f(FakeEvt(None, MASTER)) is False
+
+
+class TestRedial:
+    """/redial — redial this user's last dialed number."""
+
+    SECOND = 492551834  # second user with out_call (per-user memory)
+
+    def test_word_boundary_enforced(self, monkeypatch):
+        # /redialx must NOT trigger the handler (same \b rule as /sms)
+        ub, client = make_ub(monkeypatch)
+        rx = re.compile(client.spec("handle_redial")["pattern"])
+        assert rx.match("/redialx") is None
+        assert rx.match("/redial") is not None
+
+    def test_stranger_silence_and_no_post(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/redial", STRANGER)
+        _run(client.fn("handle_redial")(evt))
+        assert evt.replies == []
+        assert posts == []
+        et, kw = ub._audit.calls[-1]
+        assert et == EventType.USER_DENIED
+        assert kw["outcome"] == "unknown_user"
+
+    def test_denied_without_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/redial", PARTIAL)
+        _run(client.fn("handle_redial")(evt))
+        assert evt.replies == [SMSErrorType.DENIED.value]
+        assert posts == []
+
+    def test_no_last_number(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/redial", MASTER)
+        _run(client.fn("handle_redial")(evt))
+        assert evt.replies == ["Нет последнего номера для повтора"]
+        assert posts == []
+
+    def test_redials_last_number(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+
+        evt1 = FakeEvt("+79991234567", MASTER)
+        _run(client.fn("handle_bare_number")(evt1))
+        assert posts[0]["json"]["phone_number"] == "+79991234567"
+        assert evt1.replies == ["Звоню вам в Telegram…"]
+
+        evt2 = FakeEvt("/redial", MASTER)
+        _run(client.fn("handle_redial")(evt2))
+        assert len(posts) == 2
+        assert posts[1]["json"]["phone_number"] == "+79991234567"
+        assert posts[1]["json"]["telegram_user_id"] == MASTER
+        assert ub._bridge.start_call.await_count == 2
+        assert evt2.replies == ["Звоню вам в Telegram…"]
+
+    def test_memory_is_per_user(self, monkeypatch):
+        rights = {
+            MASTER: {"out_sms", "out_call", "in_sms", "in_call"},
+            TestRedial.SECOND: {"out_call"},
+        }
+        ub, client = make_ub(monkeypatch, rights=rights)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+
+        _run(client.fn("handle_bare_number")(FakeEvt("+79991234567", MASTER)))
+        # the second user never dialed — must not see MASTER's number
+        evt = FakeEvt("/redial", TestRedial.SECOND)
+        _run(client.fn("handle_redial")(evt))
+        assert evt.replies == ["Нет последнего номера для повтора"]
+        assert len(posts) == 1
+
+    def test_last_number_updates_on_new_dial(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+
+        _run(client.fn("handle_bare_number")(FakeEvt("+79991234567", MASTER)))
+        _run(client.fn("handle_bare_number")(FakeEvt("89261234555", MASTER)))
+        evt = FakeEvt("/redial", MASTER)
+        _run(client.fn("handle_redial")(evt))
+        assert posts[-1]["json"]["phone_number"] == "+79261234555"
+
+    def test_redial_respects_blacklist(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+
+        _run(client.fn("handle_bare_number")(FakeEvt("+79991234567", MASTER)))
+        ub._blacklist.block("+79991234567")  # blocked after the first dial
+
+        evt = FakeEvt("/redial", MASTER)
+        _run(client.fn("handle_redial")(evt))
+        assert evt.replies == [SMSErrorType.BLACKLISTED.value]
+        assert len(posts) == 1  # no second agent registration
+
+    def test_failed_dial_not_remembered(self, monkeypatch):
+        # 503 "modem busy" — the call was not placed, /redial has no source
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(503, {}))
+
+        evt1 = FakeEvt("+79991234567", MASTER)
+        _run(client.fn("handle_bare_number")(evt1))
+        assert evt1.replies == ["Модем занят — другой звонок идёт."]
+        assert ub._last_call.get(MASTER) is None
+
+        evt2 = FakeEvt("/redial", MASTER)
+        _run(client.fn("handle_redial")(evt2))
+        assert evt2.replies == ["Нет последнего номера для повтора"]
+
+    def test_help_lists_redial_for_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/help", MASTER)
+        _run(client.fn("handle_help")(evt))
+        assert "/redial — redial the last number" in evt.replies[0]
+
+        evt2 = FakeEvt("/help", PARTIAL)
+        _run(client.fn("handle_help")(evt2))
+        assert "/redial" not in evt2.replies[0]
+
+
+VCARD_TWO = (
+    "BEGIN:VCARD\n"
+    "FN:Ivanov Ivan\n"
+    "TEL;TYPE=CELL:+79261111111\n"
+    "END:VCARD\n"
+    "BEGIN:VCARD\n"
+    "FN:Ivanov Petr\n"
+    "TEL;TYPE=CELL:+79262222222\n"
+    "END:VCARD\n"
+).encode("utf-8")
+
+
+def _contact(**over):
+    """A forwarded Telegram contact card as Telethon 1.44 delivers it:
+    MessageMediaContact with phone_number/first_name/last_name/vcard/
+    user_id (there is no .phone attribute in the current TL schema)."""
+    fields = {
+        "phone_number": "+79261111111",
+        "first_name": "Ivan",
+        "last_name": "Ivanov",
+        "vcard": None,
+        "user_id": 12345,
+    }
+    fields.update(over)
+    return SimpleNamespace(**fields)
+
+
+class TestContactFileImport:
+    def test_import_replaces_directory(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, file_data=VCARD_TWO)
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == ["Справочник заменён: 2 контактов."]
+        assert [e["name"] for e in ub._user_contacts.get(MASTER)] == \
+            ["Ivanov Ivan", "Ivanov Petr"]
+
+    def test_import_audited(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        _run(client.fn("handle_contact_file")(
+            FakeEvt(None, MASTER, file_data=VCARD_TWO)))
+        et, kw = ub._audit.calls[-1]
+        assert kw["details"]["kind"] == "user_contacts_import"
+        assert kw["details"]["entries"] == 2
+        assert kw["telegram_user_id"] == MASTER
+
+    def test_not_vcard(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, file_data=b"hello, not a vcard")
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies[0].startswith("Это не vCard-файл")
+        assert ub._user_contacts.get(MASTER) == []
+
+    def test_vcard_without_usable_cards(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER,
+                      file_data=b"BEGIN:VCARD\nFN:NoNumber\nEND:VCARD\n")
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies[0].startswith("vCard не распознан")
+
+    def test_too_large_file(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        big = b"BEGIN:VCARD\n" + b"x" * (1_000_001)
+        evt = FakeEvt(None, MASTER, file_data=big)
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == ["Файл слишком большой (макс. 1 МБ)"]
+        assert ub._user_contacts.get(MASTER) == []
+
+    def test_stranger_silence(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, STRANGER, file_data=VCARD_TWO)
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == []
+        assert ub._user_contacts.get(STRANGER) == []
+
+    def test_denied_without_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, PARTIAL, file_data=VCARD_TWO)
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == [SMSErrorType.DENIED.value]
+
+    def test_dispatch_ignores_voice_and_plain_text(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        f = client.spec("handle_contact_file")["func"]
+        assert f(FakeEvt(None, MASTER, file_data=VCARD_TWO)) is True
+        assert f(FakeEvt(None, MASTER, contact=_contact())) is True
+        assert f(FakeEvt("text", MASTER)) is False
+        assert f(FakeEvt(None, MASTER, voice=True)) is False
+
+    def test_forwarded_contact_saved(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, contact=_contact())
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == [
+            "Сохранено: Ivan Ivanov (+79261111111). В справочнике: 1."]
+        assert ub._user_contacts.get(MASTER) == [
+            {"name": "Ivan Ivanov", "number": "+79261111111"}]
+
+    def test_forwarded_contact_accumulates(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        _run(client.fn("handle_contact_file")(FakeEvt(
+            None, MASTER, contact=_contact())))
+        _run(client.fn("handle_contact_file")(FakeEvt(
+            None, MASTER, contact=_contact(
+                phone_number="+79262222222",
+                first_name="Petr", last_name="Petrov"))))
+        assert [e["name"] for e in ub._user_contacts.get(MASTER)] == \
+            ["Ivan Ivanov", "Petr Petrov"]
+
+    def test_forwarded_contact_updates_same_number(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        _run(client.fn("handle_contact_file")(FakeEvt(
+            None, MASTER, contact=_contact())))
+        evt = FakeEvt(None, MASTER, contact=_contact(last_name="New"))
+        _run(client.fn("handle_contact_file")(evt))
+        assert ub._user_contacts.get(MASTER) == [
+            {"name": "Ivan New", "number": "+79261111111"}]
+        assert "В справочнике: 1." in evt.replies[0]
+
+    def test_forwarded_contact_without_number(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, contact=_contact(
+            phone_number=None, first_name="NoNum", last_name=None))
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies[0].startswith("У этого контакта нет номера")
+        assert "(NoNum)" in evt.replies[0]
+        assert ub._user_contacts.get(MASTER) == []
+
+    def test_vcard_fallback_recovers_number(self, monkeypatch):
+        # phone_number empty, but the embedded vCard carries the number
+        # (this is what a contact card looks like when the client puts
+        # the data only into the vcard field)
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, contact=_contact(
+            phone_number=None,
+            vcard="BEGIN:VCARD\nFN:VCard Only\n"
+                  "TEL;TYPE=CELL:+79263333333\nEND:VCARD\n"))
+        _run(client.fn("handle_contact_file")(evt))
+        assert ub._user_contacts.get(MASTER) == [
+            {"name": "Ivan Ivanov", "number": "+79263333333"}]
+        assert "В справочнике: 1." in evt.replies[0]
+
+    def test_vcard_fallback_recovers_name_too(self, monkeypatch):
+        # no structured names either — the vCard supplies both
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, contact=_contact(
+            phone_number=None, first_name=None, last_name=None,
+            vcard="BEGIN:VCARD\nFN:From VCard\n"
+                  "TEL:+79264444444\nEND:VCARD\n"))
+        _run(client.fn("handle_contact_file")(evt))
+        assert ub._user_contacts.get(MASTER) == [
+            {"name": "From VCard", "number": "+79264444444"}]
+
+    def test_legacy_phone_attribute_still_read(self, monkeypatch):
+        # old Telethon schema (nested Contact with .phone) — defensive
+        # fallback, must keep working
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, contact=SimpleNamespace(
+            first_name="Old", last_name="Schema", phone="+79265555555"))
+        _run(client.fn("handle_contact_file")(evt))
+        assert ub._user_contacts.get(MASTER) == [
+            {"name": "Old Schema", "number": "+79265555555"}]
+
+    def test_card_fields_logged(self, monkeypatch, caplog):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, MASTER, contact=_contact(
+            phone_number="+79261111111",
+            vcard="BEGIN:VCARD\nFN:Ivan Ivanov\n"
+                  "TEL;TYPE=CELL:+79261111111\nEND:VCARD\n"))
+        with caplog.at_level("INFO", logger="simbridge.userbot"):
+            _run(client.fn("handle_contact_file")(evt))
+        assert "card fields" in caplog.text
+        assert "+79261111111" in caplog.text
+        assert "BEGIN:VCARD" in caplog.text
+
+    def test_stranger_silence(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, STRANGER, contact=_contact())
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == []
+        assert ub._user_contacts.get(STRANGER) == []
+
+    def test_denied_without_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt(None, PARTIAL, contact=_contact())
+        _run(client.fn("handle_contact_file")(evt))
+        assert evt.replies == [SMSErrorType.DENIED.value]
+
+
+class TestCallCommand:
+    def test_stranger_silence(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call Ivan", STRANGER)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies == []
+        assert posts == []
+
+    def test_denied_without_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call Ivan", PARTIAL)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies == [SMSErrorType.DENIED.value]
+        assert posts == []
+
+    def test_empty_query_usage(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/call", MASTER)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies == ["Использование: /call <имя или номер>"]
+
+    def test_number_dials_directly(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call +79991234567", MASTER)
+        _run(client.fn("handle_call")(evt))
+        assert posts[0]["json"]["phone_number"] == "+79991234567"
+        assert evt.replies == ["Звоню вам в Telegram…"]
+
+    # ---- bridge busy vs unavailable: distinct messages (TZ-09, 27c26ee1) ----
+
+    def test_bridge_busy_says_busy_not_unavailable(self, monkeypatch):
+        # bridge already on another call -> "busy". The user must hear
+        # "занят", NOT "недоступен" (which sends them to re-dial into the
+        # same 503). The agent-side call is still rejected (modem released).
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="busy")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call +79991234567", MASTER)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies == ["Мост занят — другой звонок идёт."]
+        assert posts[-1]["url"].endswith("/v1/call/c1/reject")
+
+    def test_bridge_error_says_unavailable(self, monkeypatch):
+        # bridge down / unreachable -> "error" -> "недоступен" (the old
+        # message is correct for this state, not for a busy bridge).
+        ub, client = make_ub(monkeypatch)
+        ub._bridge.start_call = AsyncMock(return_value="error")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call +79991234567", MASTER)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies == ["Ошибка: голосовой мост недоступен"]
+        assert posts[-1]["url"].endswith("/v1/call/c1/reject")
+
+    def test_name_unique_match_dials(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov Ivan", "number": "+79261111111"}])
+        ub._bridge.start_call = AsyncMock(return_value="ok")
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call Ivanov", MASTER)
+        _run(client.fn("handle_call")(evt))
+        assert posts[0]["json"]["phone_number"] == "+79261111111"
+        assert evt.replies == ["Звоню вам в Telegram…"]
+
+    def test_name_multiple_matches_lists(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov Ivan", "number": "+79261111111"},
+            {"name": "Ivanov Petr", "number": "+79262222222"}])
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call Ivanov", MASTER)
+        _run(client.fn("handle_call")(evt))
+        reply = evt.replies[0]
+        assert reply.startswith("Несколько совпадений:")
+        assert "Ivanov Ivan" in reply and "+79261111111" in reply
+        assert "Ivanov Petr" in reply and "+79262222222" in reply
+        assert posts == []  # nothing dialed until the user picks
+
+    def test_name_not_found_hint(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        evt = FakeEvt("/call Nobody", MASTER)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies[0].startswith("Не найдено: Nobody")
+        assert "vCard" in evt.replies[0]
+        assert posts == []
+
+    def test_memory_is_per_user(self, monkeypatch):
+        rights = {
+            MASTER: {"out_sms", "out_call", "in_sms", "in_call"},
+            TestRedial.SECOND: {"out_call"},
+        }
+        ub, client = make_ub(monkeypatch, rights=rights)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov", "number": "+79261111111"}])
+        posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
+        # SECOND does not see MASTER's directory
+        evt = FakeEvt("/call Ivanov", TestRedial.SECOND)
+        _run(client.fn("handle_call")(evt))
+        assert evt.replies[0].startswith("Не найдено: Ivanov")
+        assert posts == []
+
+
+class TestContactsCommand:
+    def test_stranger_silence(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/contacts", STRANGER)
+        _run(client.fn("handle_contacts")(evt))
+        assert evt.replies == []
+
+    def test_denied_without_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/contacts", PARTIAL)
+        _run(client.fn("handle_contacts")(evt))
+        assert evt.replies == [SMSErrorType.DENIED.value]
+
+    def test_empty_directory(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/contacts", MASTER)
+        _run(client.fn("handle_contacts")(evt))
+        assert "Справочник пуст" in evt.replies[0]
+        assert "vCard" in evt.replies[0]
+
+    def test_lists_entries(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov Ivan", "number": "+79261111111"},
+            {"name": "Petrov", "number": "+79263333333"}])
+        evt = FakeEvt("/contacts", MASTER)
+        _run(client.fn("handle_contacts")(evt))
+        reply = evt.replies[0]
+        assert "Справочник (2):" in reply
+        assert "Ivanov Ivan  +79261111111" in reply
+        assert "Petrov  +79263333333" in reply
+
+    def test_truncated_at_50(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": f"Contact {i}", "number": f"+7926{i:08d}"}
+            for i in range(55)])
+        evt = FakeEvt("/contacts", MASTER)
+        _run(client.fn("handle_contacts")(evt))
+        reply = evt.replies[0]
+        assert "Справочник (55):" in reply
+        # entries[0..49] shown (Contact 0..49), entries[50..54] hidden
+        assert "Contact 49  " in reply
+        assert "Contact 54" not in reply
+        assert "и ещё 5" in reply
+
+    def test_help_lists_call_and_contacts(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/help", MASTER)
+        _run(client.fn("handle_help")(evt))
+        help_text = evt.replies[0]
+        assert "/call <name|number> — call from your directory" in help_text
+        assert "/contacts — show your directory" in help_text
+        assert "send a vCard file or forward a contact to import" in help_text
+
+        evt2 = FakeEvt("/help", PARTIAL)
+        _run(client.fn("handle_help")(evt2))
+        assert "/call" not in evt2.replies[0]
+
+
+class TestDelCommand:
+    def test_stranger_silence(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/del Ivan", STRANGER)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == []
+
+    def test_denied_without_out_call(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/del Ivan", PARTIAL)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == [SMSErrorType.DENIED.value]
+
+    def test_empty_query_usage(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/del", MASTER)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Использование: /del <имя или номер>"]
+
+    def test_delete_by_number(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov", "number": "+79261111111"},
+            {"name": "Petrov", "number": "+79262222222"}])
+        evt = FakeEvt("/del +79261111111", MASTER)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Удалено: 1 (номер +79261111111)"]
+        assert ub._user_contacts.get(MASTER) == \
+            [{"name": "Petrov", "number": "+79262222222"}]
+
+    def test_delete_by_number_normalized(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov", "number": "+79261111111"}])
+        evt = FakeEvt("/del 89261111111", MASTER)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Удалено: 1 (номер +79261111111)"]
+        assert ub._user_contacts.get(MASTER) == []
+
+    def test_delete_by_number_not_found(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov", "number": "+79261111111"}])
+        evt = FakeEvt("/del +79000000000", MASTER)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Не найден номер +79000000000"]
+        assert ub._user_contacts.get(MASTER) == \
+            [{"name": "Ivanov", "number": "+79261111111"}]
+
+    def test_delete_by_unique_name(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov Ivan", "number": "+79261111111"},
+            {"name": "Petrov", "number": "+79262222222"}])
+        evt = FakeEvt("/del ivanov", MASTER)  # unique prefix match
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Удалено: Ivanov Ivan (+79261111111)"]
+        assert ub._user_contacts.get(MASTER) == \
+            [{"name": "Petrov", "number": "+79262222222"}]
+
+    def test_ambiguous_name_lists_instead_of_deleting(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov Ivan", "number": "+79261111111"},
+            {"name": "Ivanov Petr", "number": "+79262222222"}])
+        evt = FakeEvt("/del Ivanov", MASTER)
+        _run(client.fn("handle_del")(evt))
+        reply = evt.replies[0]
+        assert reply.startswith("Несколько совпадений:")
+        assert "/del <номер>" in reply
+        # nothing deleted
+        assert len(ub._user_contacts.get(MASTER)) == 2
+
+    def test_delete_not_found(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov", "number": "+79261111111"}])
+        evt = FakeEvt("/del Nobody", MASTER)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Не найдено: Nobody"]
+        assert len(ub._user_contacts.get(MASTER)) == 1
+
+    def test_memory_is_per_user(self, monkeypatch):
+        rights = {
+            MASTER: {"out_sms", "out_call", "in_sms", "in_call"},
+            TestRedial.SECOND: {"out_call"},
+        }
+        ub, client = make_ub(monkeypatch, rights=rights)
+        ub._user_contacts.replace_for(MASTER, [
+            {"name": "Ivanov", "number": "+79261111111"}])
+        evt = FakeEvt("/del +79261111111", TestRedial.SECOND)
+        _run(client.fn("handle_del")(evt))
+        assert evt.replies == ["Не найден номер +79261111111"]
+        assert ub._user_contacts.get(MASTER) == \
+            [{"name": "Ivanov", "number": "+79261111111"}]
+
+    def test_help_lists_del(self, monkeypatch):
+        ub, client = make_ub(monkeypatch)
+        evt = FakeEvt("/help", MASTER)
+        _run(client.fn("handle_help")(evt))
+        assert "/del <name|number> — remove from your directory" in evt.replies[0]

@@ -59,11 +59,22 @@ class BridgeControl:
             else {}
         )
 
-    async def start_call(self, user_id: int, target: str) -> bool:
+    async def start_call(self, user_id: int, target: str) -> str:
         """Start a Telegram call to *user_id* targeting *target*.
 
-        Returns True only on a 2xx — otherwise no Telegram call is
-        being ringed and the caller must close the agent-side call.
+        Returns a three-state outcome, not a bool — the caller must tell
+        the user whether the bridge is *busy* (already on another call)
+        or *unavailable* (down / unreachable). Reporting a busy bridge as
+        "недоступен" sends the user to re-dial into the same 503 (live
+        2026-10-05, call 27c26ee1).
+          - ``"ok"``    — 2xx: the bridge is ringing the user.
+          - ``"busy"``  — 503 ``{"error":"busy"}``: another call is in
+                         progress for this chat.
+          - ``"error"`` — anything else (4xx/5xx, unreachable): no
+                         Telegram call was started.
+        ``"busy"`` and ``"error"`` both mean the caller must reject the
+        agent-side call (the reserved modem must not sit in
+        TELEGRAM_CALLING until the timeout).
         """
         try:
             async with httpx.AsyncClient(timeout=5.0) as http:
@@ -77,9 +88,18 @@ class BridgeControl:
                     },
                     headers=self._headers(),
                 )
-                return 200 <= resp.status_code < 300
+                if 200 <= resp.status_code < 300:
+                    return "ok"
+                if resp.status_code == 503:
+                    try:
+                        body = resp.json()
+                    except ValueError:
+                        body = {}
+                    if isinstance(body, dict) and body.get("error") == "busy":
+                        return "busy"
+                return "error"
         except httpx.HTTPError:
-            return False
+            return "error"
 
     async def cancel_call(self, user_id: Optional[int] = None) -> bool:
         """Cancel the in-progress Telegram ring/call for *user_id*

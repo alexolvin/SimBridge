@@ -21,7 +21,8 @@ import re
 import sys
 import uuid
 from logging import getLogger
-from typing import Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from telethon import TelegramClient, events
 
@@ -31,6 +32,7 @@ from core.audit import AuditLogger
 from core.contacts import ContactResolver
 from core.blacklist import BlacklistManager
 from core.phone import is_service_number, normalize_e164, parse_destination
+from core.user_contacts import UserContactsStore, parse_vcard
 from core.events import EventType
 from core.errors import SMSErrorType
 from core.recovery import BackoffReconnector
@@ -44,6 +46,10 @@ logger = getLogger("simbridge.userbot")
 TG_RECONNECT_MIN_DELAY = 5.0
 TG_RECONNECT_MAX_DELAY = 300.0
 TG_RECONNECT_MAX_RETRIES = 10
+
+# vCard phonebook import: a real phonebook export fits well under this;
+# the cap guards against sending the bot a 100 MB file.
+VCARD_IMPORT_MAX_BYTES = 1_000_000
 
 # Pattern for explicit-number SMS: +79261234555: message
 EXPLICIT_NUMBER_RE = re.compile(
@@ -82,7 +88,7 @@ def is_number_attempt(text: Optional[str]) -> bool:
 # Telethon event (telethon is not installed in the test environment).
 # ---------------------------------------------------------------------------
 
-KNOWN_COMMANDS = frozenset({"sms", "broadcast", "block", "unblock", "help"})
+KNOWN_COMMANDS = frozenset({"sms", "broadcast", "block", "unblock", "listblock", "redial", "call", "contacts", "del", "help"})
 
 
 def command_token(text: Optional[str]) -> Optional[str]:
@@ -164,6 +170,24 @@ class Userbot:
         # S04.3: voice bridge control API (loopback, same node)
         self._bridge = BridgeControl(self.cfg)
 
+        # /redial: last dialed number per Telegram user, remembered on
+        # successful agent call registration (see _place_call).
+        # In-memory by design — after a restart the user simply dials
+        # the number again.
+        self._last_call: Dict[int, str] = {}
+
+        # Per-user phonebooks (vCard import): dial-by-name (/call) and
+        # per-recipient caller identification. Optional config key
+        # paths.user_contacts; default — next to the global contacts
+        # cache (same directory), logged at startup.
+        uc_path = self.cfg.get("paths.user_contacts")
+        if not uc_path:
+            uc_path = str(
+                Path(self.cfg["paths.contacts_cache"]).parent / "user_contacts.json"
+            )
+        self._user_contacts = UserContactsStore(uc_path)
+        logger.info("User contacts store: %s", uc_path)
+
         # Register handlers
         self._register_handlers()
 
@@ -210,6 +234,115 @@ class Userbot:
         exactly "the user is in the access list".
         """
         return bool(self._acl.get_user_rights(sender_id))
+
+    async def _place_call(self, evt, sender_id: int, dest) -> None:
+        """Dial a validated *dest*: blacklist check, agent registration,
+        bridge ring, user reply (S04.3).
+
+        Shared by handle_bare_number (the user typed the number) and
+        handle_redial (/redial — the remembered last number) — one
+        submission path, one error vocabulary (Rule 1). The caller has
+        passed the out_call access gate.
+
+        On a successful agent registration *dest.number* is remembered
+        as this user's last dialed number (the /redial source).
+        """
+        norm = dest.number
+
+        # S02.2 parity: a blacklisted target is not dialed. The
+        # blacklist holds carrier E.164 numbers — an internal
+        # extension cannot match it.
+        if not dest.is_internal and self._blacklist.contains(norm):
+            await evt.reply(SMSErrorType.BLACKLISTED.value)
+            return
+
+        # Register the call with the agent (ACL re-check + atomic
+        # modem reservation happen there).
+        cid = uuid.uuid4().hex
+        import httpx
+
+        try:
+            async with httpx.AsyncClient() as http:
+                resp = await http.post(
+                    f"{self._agent_url}/v1/call/outgoing",
+                    json={
+                        "phone_number": norm,
+                        "telegram_user_id": sender_id,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {self._agent_token}",
+                        "Content-Type": "application/json",
+                        "x-correlation-id": cid,
+                    },
+                    timeout=10.0,
+                )
+        except httpx.HTTPError as e:
+            # The user gets a short message; the agent-side cause
+            # (connection refused, timeout, 5xx) goes to the log —
+            # without it the user sees "Сервис звонков недоступен"
+            # with nothing to diagnose (live incident 2026-08-20,
+            # Тест #1).
+            logger.exception(
+                "outgoing call registration failed (agent_url=%s): %s",
+                self._agent_url, e,
+            )
+            await evt.reply("Сервис звонков недоступен")
+            return
+
+        if resp.status_code == 403:
+            await evt.reply(SMSErrorType.BLACKLISTED.value)
+            return
+        if resp.status_code == 429:
+            await evt.reply("Слишком много звонков. Попробуйте позже.")
+            return
+        if resp.status_code == 503:
+            await evt.reply("Модем занят — другой звонок идёт.")
+            return
+        if resp.status_code >= 400:
+            await evt.reply(SMSErrorType.SEND_FAILED.value)
+            return
+
+        try:
+            call_id = resp.json().get("call_id", "")
+        except ValueError:
+            call_id = ""
+
+        # /redial source: the number the agent accepted for dialing.
+        self._last_call[sender_id] = norm
+
+        # Ring the Telegram user through the bridge (S04.3). On a
+        # non-"ok" outcome: reject the agent-side call — the reserved
+        # modem must not sit in TELEGRAM_CALLING until the 30 s timeout.
+        # "busy" (bridge already on another call) and "error" (bridge
+        # down / unreachable) are different states and get different
+        # messages — a busy bridge reported as "недоступен" sends the
+        # user to re-dial into the same 503 (live 2026-10-05, 27c26ee1).
+        result = await self._bridge.start_call(sender_id, norm)
+        if result != "ok":
+            try:
+                async with httpx.AsyncClient() as http:
+                    await http.post(
+                        f"{self._agent_url}/v1/call/{call_id}/reject",
+                        headers={
+                            "Authorization": f"Bearer {self._agent_token}",
+                            "Content-Type": "application/json",
+                            "x-correlation-id": uuid.uuid4().hex,
+                        },
+                        timeout=10.0,
+                    )
+            except httpx.HTTPError as e:
+                # The call will still expire via /call/check-timeouts
+                # (TELEGRAM_CALLING window) — logged, not fatal.
+                logger.warning(
+                    "bridge start failed and agent reject failed: %s", e
+                )
+            if result == "busy":
+                await evt.reply("Мост занят — другой звонок идёт.")
+            else:
+                await evt.reply("Ошибка: голосовой мост недоступен")
+            return
+
+        await evt.reply("Звоню вам в Telegram…")
 
     async def _do_send_sms(self, evt, phone: str, text: str,
                            sender_id: int) -> None:
@@ -417,91 +550,281 @@ class Userbot:
             if dest is None:
                 await evt.reply(SMSErrorType.NUMBER_MALFORMED_CALL.value)
                 return
-            norm = dest.number
+            await self._place_call(evt, sender_id, dest)
 
-            # S02.2 parity: a blacklisted target is not dialed. The
-            # blacklist holds carrier E.164 numbers — an internal
-            # extension cannot match it.
-            if not dest.is_internal and self._blacklist.contains(norm):
-                await evt.reply(SMSErrorType.BLACKLISTED.value)
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/redial\b"))
+        async def handle_redial(evt):
+            """/redial — redial this user's last dialed number.
+
+            The number is remembered when the agent accepts an outgoing
+            call (see _place_call); the memory is per Telegram user and
+            in-memory only (lost on restart — the user dials again).
+            Same access gate and error path as a bare-number call.
+            """
+            sender_id = evt.sender_id if evt.sender_id else 0
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
                 return
 
-            # Register the call with the agent (ACL re-check + atomic
-            # modem reservation happen there).
-            cid = uuid.uuid4().hex
-            import httpx
+            stored = self._last_call.get(sender_id)
+            if stored is None:
+                await evt.reply("Нет последнего номера для повтора")
+                return
+            # Re-validate through the same strict parser: the stored
+            # number is always a parseable form (it was dialed through
+            # it), this guards the invariant explicitly.
+            dest = parse_destination(stored)
+            if dest is None:
+                await evt.reply(SMSErrorType.NUMBER_MALFORMED_CALL.value)
+                return
+            await self._place_call(evt, sender_id, dest)
 
-            try:
-                async with httpx.AsyncClient() as http:
-                    resp = await http.post(
-                        f"{self._agent_url}/v1/call/outgoing",
-                        json={
-                            "phone_number": norm,
-                            "telegram_user_id": sender_id,
-                        },
-                        headers={
-                            "Authorization": f"Bearer {self._agent_token}",
-                            "Content-Type": "application/json",
-                            "x-correlation-id": cid,
-                        },
-                        timeout=10.0,
-                    )
-            except httpx.HTTPError as e:
-                # The user gets a short message; the agent-side cause
-                # (connection refused, timeout, 5xx) goes to the log —
-                # without it the user sees "Сервис звонков недоступен"
-                # with nothing to diagnose (live incident 2026-08-20,
-                # Тест #1).
-                logger.exception(
-                    "outgoing call registration failed (agent_url=%s): %s",
-                    self._agent_url, e,
+        @self._client.on(
+            events.NewMessage(
+                func=lambda e: (
+                    (e.message.file is not None and not e.voice)
+                    or e.contact is not None
                 )
-                await evt.reply("Сервис звонков недоступен")
+            )
+        )
+        async def handle_contact_file(evt):
+            """Directory import, two forms (same out_call gate):
+
+            - a DOCUMENT (.vcf phonebook export): the user's directory
+              is REPLACED — a file is a full phonebook;
+            - a FORWARDED CONTACT card (MessageMediaContact): ONE entry
+              is upserted (added or updated by number) — the user can
+              forward contacts one by one.
+
+            Every outcome is logged (2026-09-28: an import that
+            produced neither a reply the user remembered nor a log
+            line is a black box) and always ends in a user reply.
+            """
+            sender_id = evt.sender_id if evt.sender_id else 0
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
                 return
 
-            if resp.status_code == 403:
-                await evt.reply(SMSErrorType.BLACKLISTED.value)
-                return
-            if resp.status_code == 429:
-                await evt.reply("Слишком много звонков. Попробуйте позже.")
-                return
-            if resp.status_code == 503:
-                await evt.reply("Модем занят — другой звонок идёт.")
-                return
-            if resp.status_code >= 400:
-                await evt.reply(SMSErrorType.SEND_FAILED.value)
-                return
-
-            try:
-                call_id = resp.json().get("call_id", "")
-            except ValueError:
-                call_id = ""
-
-            # Ring the Telegram user through the bridge (S04.3). On
-            # failure: reject the agent-side call — the reserved modem
-            # must not sit in TELEGRAM_CALLING until the 30 s timeout.
-            if not await self._bridge.start_call(sender_id, norm):
-                try:
-                    async with httpx.AsyncClient() as http:
-                        await http.post(
-                            f"{self._agent_url}/v1/call/{call_id}/reject",
-                            headers={
-                                "Authorization": f"Bearer {self._agent_token}",
-                                "Content-Type": "application/json",
-                                "x-correlation-id": uuid.uuid4().hex,
-                            },
-                            timeout=10.0,
-                        )
-                except httpx.HTTPError as e:
-                    # The call will still expire via /call/check-timeouts
-                    # (TELEGRAM_CALLING window) — logged, not fatal.
-                    logger.warning(
-                        "bridge start failed and agent reject failed: %s", e
+            contact = getattr(evt, "contact", None)
+            if contact is not None:
+                # Telethon 1.44 TL schema: MessageMediaContact exposes
+                # phone_number / first_name / last_name / vcard / user_id
+                # (there is no .phone attribute — reading it always gave
+                # None, so every card looked number-less). The vcard field
+                # carries the full vCard the client shared.
+                phone = (getattr(contact, "phone_number", None)
+                         or getattr(contact, "phone", None))
+                vcard = getattr(contact, "vcard", None)
+                name = " ".join(
+                    p for p in (
+                        getattr(contact, "first_name", None),
+                        getattr(contact, "last_name", None),
+                    ) if p
+                ).strip()
+                vcard_head = (
+                    vcard[:400] + "…" if vcard and len(vcard) > 400 else vcard
+                )
+                logger.info(
+                    "contact import: user %s card fields: "
+                    "phone_number=%r first=%r last=%r user_id=%r vcard=%r",
+                    sender_id,
+                    getattr(contact, "phone_number", None),
+                    getattr(contact, "first_name", None),
+                    getattr(contact, "last_name", None),
+                    getattr(contact, "user_id", None),
+                    vcard_head,
+                )
+                # The structured field can be empty while the embedded
+                # vCard still carries the number — recover it from there.
+                if not phone and vcard:
+                    entries = parse_vcard(vcard)
+                    if entries:
+                        phone = entries[0]["number"]
+                        if not name:
+                            name = entries[0]["name"]
+                if not phone:
+                    logger.warning("contact import: user %s card has no "
+                                   "number (phone_number and vcard both "
+                                   "empty; name: %r)", sender_id,
+                                   name or "<none>")
+                    await evt.reply(
+                        f"У этого контакта нет номера"
+                        + (f" ({name})." if name else ".")
+                        + " Проверьте номер в контакте в телефоне "
+                          "или отправьте файл .vcf."
                     )
-                await evt.reply("Ошибка: голосовой мост недоступен")
+                    return
+                if not name:
+                    name = f"Контакт {phone}"
+                total = self._user_contacts.upsert_for(
+                    sender_id,
+                    {"name": name, "number": normalize_e164(phone) or phone},
+                )
+                logger.info("contact import: user %s saved %s (%s), "
+                            "total %d", sender_id, name, phone, total)
+                await evt.reply(f"Сохранено: {name} ({phone}). "
+                                f"В справочнике: {total}.")
                 return
 
-            await evt.reply("Звоню вам в Telegram…")
+            size = getattr(evt.message.file, "size", None)
+            logger.info("contact import: user %s sent a document (%s bytes)",
+                        sender_id, size)
+            if size is not None and size > VCARD_IMPORT_MAX_BYTES:
+                logger.warning("contact import: user %s document too large "
+                               "(%s bytes)", sender_id, size)
+                await evt.reply("Файл слишком большой (макс. 1 МБ)")
+                return
+            try:
+                data = await evt.message.download_bytes()
+                text = data.decode("utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                logger.warning("vCard import: unreadable document: %s", e)
+                await evt.reply("Не удалось прочитать файл как vCard")
+                return
+
+            if "BEGIN:VCARD" not in text:
+                logger.warning("contact import: user %s document is not a "
+                               "vCard (%d chars)", sender_id, len(text))
+                await evt.reply("Это не vCard-файл. Пришлите экспорт "
+                                "телефонной книги (.vcf) или перешлите "
+                                "контакт из своих контактов.")
+                return
+            entries = parse_vcard(text)
+            if not entries:
+                logger.warning("contact import: user %s vCard parsed to 0 "
+                               "entries (%d chars)", sender_id, len(text))
+                await evt.reply("vCard не распознан: нет контактов с "
+                                "именем и номером.")
+                return
+            n = self._user_contacts.replace_for(sender_id, entries)
+            self._audit.log(
+                EventType.CONFIG_RELOADED,
+                telegram_user_id=sender_id,
+                outcome="ok",
+                details={"kind": "user_contacts_import", "entries": n},
+            )
+            await evt.reply(f"Справочник заменён: {n} контактов.")
+
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/call\b"))
+        async def handle_call(evt):
+            """/call <name|number> — dial from the user's directory.
+
+            A parseable number dials directly (same path as a bare
+            number); anything else is a name search in the user's own
+            vCard directory: one match dials, several are listed (the
+            user then sends the number), none gets a hint to import.
+            """
+            sender_id = evt.sender_id if evt.sender_id else 0
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
+            raw = (evt.message.text or "").strip()
+            raw = re.sub(r"(?i)^/call\b\s*", "", raw)
+            if not raw:
+                await evt.reply("Использование: /call <имя или номер>")
+                return
+
+            dest = parse_destination(raw)
+            if dest is None:
+                matches = self._user_contacts.find_by_name(sender_id, raw)
+                if not matches:
+                    await evt.reply(
+                        f"Не найдено: {raw}\n"
+                        "Пришлите vCard-файл телефонной книги, "
+                        "чтобы создать справочник."
+                    )
+                    return
+                if len(matches) > 1:
+                    lines = [f"{i}) {m['name']}  {m['number']}"
+                             for i, m in enumerate(matches[:10], 1)]
+                    more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
+                    await evt.reply("Несколько совпадений:\n" + "\n".join(lines)
+                                    + more + "\nНаберите номер, чтобы позвонить.")
+                    return
+                dest = parse_destination(matches[0]["number"])
+                if dest is None:
+                    await evt.reply(f"Номер в справочнике некорректен: "
+                                    f"{matches[0]['number']}")
+                    return
+                logger.info("/call: user %s dialed %r -> %s",
+                            sender_id, raw, dest.number)
+            await self._place_call(evt, sender_id, dest)
+
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/contacts\b"))
+        async def handle_contacts(evt):
+            """/contacts — show this user's imported directory (out_call)."""
+            sender_id = evt.sender_id if evt.sender_id else 0
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
+            entries = self._user_contacts.get(sender_id)
+            if not entries:
+                await evt.reply("Справочник пуст. Пришлите vCard-файл "
+                                "телефонной книги (.vcf) или перешлите "
+                                "контакт из своих контактов.")
+                return
+            lines = [f"{e['name']}  {e['number']}" for e in entries[:50]]
+            more = f"\n… и ещё {len(entries) - 50}" if len(entries) > 50 else ""
+            await evt.reply(f"Справочник ({len(entries)}):\n" + "\n".join(lines) + more)
+
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/del\b"))
+        async def handle_del(evt):
+            """/del <name|number> — remove entries from the user's directory.
+
+            A parseable number deletes by exact (E.164-normalized)
+            number — unambiguous. A name deletes only on a unique
+            case-insensitive match; ambiguous matches are listed so the
+            user deletes by number. Destructive by design, hence the
+            strict matching. Full reset = send a new vCard file
+            (import replaces the directory).
+            """
+            sender_id = evt.sender_id if evt.sender_id else 0
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
+            raw = re.sub(r"(?i)^/del\b\s*", "", (evt.message.text or "").strip())
+            if not raw:
+                await evt.reply("Использование: /del <имя или номер>")
+                return
+
+            dest = parse_destination(raw)
+            if dest is not None:
+                n = self._user_contacts.delete_by_number(sender_id, dest.number)
+                if n:
+                    await evt.reply(f"Удалено: {n} (номер {dest.number})")
+                else:
+                    await evt.reply(f"Не найден номер {dest.number}")
+                return
+
+            matches = self._user_contacts.find_by_name(sender_id, raw)
+            if not matches:
+                await evt.reply(f"Не найдено: {raw}")
+                return
+            if len(matches) > 1:
+                lines = [f"{i}) {m['name']}  {m['number']}"
+                         for i, m in enumerate(matches[:10], 1)]
+                await evt.reply("Несколько совпадений:\n" + "\n".join(lines)
+                                + "\nУдалите по номеру: /del <номер>")
+                return
+            n = self._user_contacts.delete_by_name(sender_id, matches[0]["name"])
+            if n:
+                await evt.reply(f"Удалено: {matches[0]['name']} "
+                                f"({matches[0]['number']})")
+            else:
+                await evt.reply("Не удалось удалить (запись не найдена)")
 
         @self._client.on(events.NewMessage(func=lambda e: e.voice is not None))
         async def handle_voice_note(evt):
@@ -615,6 +938,28 @@ class Userbot:
             except httpx.HTTPError as e:
                 await evt.reply(f"Error unblocking number: {e}")
 
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/listblock\b"))
+        async def handle_listblock(evt):
+            """Handle /listblock — show the full blacklist (S02.2).
+
+            Same access gate as /block and /unblock (out_sms): unknown
+            -> silence, known without out_sms -> "Недостаточно прав".
+            """
+            sender_id = evt.sender_id or 0
+            verdict = self._access(sender_id, "out_sms")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
+            numbers = self._blacklist.list()
+            if not numbers:
+                await evt.reply("Blacklist is empty.")
+                return
+            lines = [f"Blacklist ({len(numbers)}):"]
+            lines.extend(f"  {n}" for n in numbers)
+            await evt.reply("\n".join(lines))
+
         @self._client.on(events.NewMessage(pattern=r"(?i)^/help\b"))
         async def handle_help(evt):
             """Show available commands (known ACL users only)."""
@@ -631,8 +976,14 @@ class Userbot:
                 help_text += "  /broadcast <message> — send to all\n"
                 help_text += "  /block <phone> — block number\n"
                 help_text += "  /unblock <phone> — unblock number\n"
+                help_text += "  /listblock — show blocked numbers\n"
             if "out_call" in rights:
                 help_text += "  <phone> — voice call (send the number alone)\n"
+                help_text += "  /redial — redial the last number\n"
+                help_text += "  /call <name|number> — call from your directory\n"
+                help_text += "  /contacts — show your directory\n"
+                help_text += "  /del <name|number> — remove from your directory\n"
+                help_text += "  (send a vCard file or forward a contact to import)\n"
             if "in_sms" in rights:
                 help_text += "  (incoming SMS forwarded automatically)\n"
 
@@ -813,6 +1164,10 @@ class Userbot:
     @property
     def contacts(self) -> ContactResolver:
         return self._contacts
+
+    @property
+    def user_contacts(self) -> UserContactsStore:
+        return self._user_contacts
 
     @property
     def blacklist(self) -> BlacklistManager:
