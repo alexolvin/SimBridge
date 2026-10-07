@@ -1,5 +1,7 @@
 # SimBridge
 
+**Языки:** [English](README.md) | Русский
+
 Мост между Telegram и GSM-телефонией (Asterisk + chan_dongle).
 
 SMS, голосовые сообщения и живые голосовые звонки — управляются через команды Telegram с личного аккаунта пользователя (MTProto, не Bot API). Построено по стандартам финансового класса: сбои могут стоить реальных денег, поэтому корректность важнее скорости.
@@ -109,7 +111,7 @@ sudo apt remove tailscale   # Ubuntu
 sudo yum remove tailscale   # EL9
 
 # 9. Удалить директорию проекта
-cd /home/user/myhub
+cd ~/projects
 rm -rf SimBridge
 ```
 
@@ -142,7 +144,7 @@ sudo rm -rf /var/log/simbridge/
 # 1. Остановить сервисы
 sudo systemctl stop simbridge-userbot
 # Если tg-bridge через Docker:
-sudo docker compose -f /home/user/myhub/SimBridge/deploy/docker-compose.yml down --remove-orphans
+sudo docker compose -f ~/projects/SimBridge/deploy/docker-compose.yml down --remove-orphans
 
 # 2. Отключить автозапуск
 sudo systemctl disable simbridge-userbot
@@ -161,7 +163,7 @@ sudo rm -rf /var/lib/simbridge/
 sudo rm -rf /var/log/simbridge/
 
 # 7. Удалить директорию проекта
-cd /home/user/myhub
+cd ~/projects
 rm -rf SimBridge
 ```
 

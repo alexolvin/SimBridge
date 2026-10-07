@@ -54,3 +54,8 @@ build/
 
 # Claude Code
 .claude/
+
+# Agent / local AI tooling (never publish)
+.agent/
+.qwen/
+.reports/

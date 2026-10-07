@@ -1,5 +1,7 @@
 # SimBridge
 
+**Languages:** English | [Русский](README.ru.md)
+
 Bridge between Telegram and GSM telephony (Asterisk + chan_dongle).
 
 SMS, voicemail, and live voice calls — managed via Telegram commands on a
@@ -109,7 +111,7 @@ sudo apt remove tailscale   # Ubuntu
 sudo yum remove tailscale   # EL9
 
 # 9. Remove project directory
-cd /home/user/myhub
+cd ~/projects
 rm -rf SimBridge
 ```
 
@@ -142,7 +144,7 @@ sudo rm -rf /var/log/simbridge/
 # 1. Stop services
 sudo systemctl stop simbridge-userbot
 # If using Docker for tg-bridge:
-sudo docker compose -f /home/user/myhub/SimBridge/deploy/docker-compose.yml down --remove-orphans
+sudo docker compose -f ~/projects/SimBridge/deploy/docker-compose.yml down --remove-orphans
 
 # 2. Disable services
 sudo systemctl disable simbridge-userbot
@@ -161,7 +163,7 @@ sudo rm -rf /var/lib/simbridge/
 sudo rm -rf /var/log/simbridge/
 
 # 7. Remove project directory
-cd /home/user/myhub
+cd ~/projects
 rm -rf SimBridge
 ```
 
