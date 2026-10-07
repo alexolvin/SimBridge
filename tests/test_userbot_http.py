@@ -50,7 +50,8 @@ class FakeAudit:
 SECRET = "sec"
 
 
-def _make_env(tmp_path, client=None, acl_lines="111 in_sms\n222 in_call\n"):
+def _make_env(tmp_path, client=None, acl_lines="111 in_sms\n222 in_call\n",
+              user_contacts=None):
     acl_file = tmp_path / "acl.conf"
     acl_file.write_text(acl_lines)
     acl = ACLManager(str(acl_file))
@@ -61,6 +62,7 @@ def _make_env(tmp_path, client=None, acl_lines="111 in_sms\n222 in_call\n"):
         acl=acl,
         audit=audit,
         client=client,
+        user_contacts=user_contacts,
     )
     return TestClient(app), audit
 
@@ -194,7 +196,7 @@ class TestEventsDelivery:
         )
         assert r.status_code == 200
         assert r.json()["notified"] is True
-        assert tg.sent == [(7, "Доставлено: +79261234555")]
+        assert tg.sent == [(7, "Delivered: +79261234555")]
         etype, kw = audit.calls[0]
         assert etype == EventType.SMS_DELIVERY_REPORT
         assert kw["outcome"] == "delivered"
@@ -210,7 +212,7 @@ class TestEventsDelivery:
         )
         (uid, text), = tg.sent
         assert uid == 7
-        assert "SMS не доставлена" in text
+        assert "SMS not delivered" in text
         assert "+79261234555" in text
         assert "Expired" in text
         assert audit.calls[0][1]["outcome"] == "failed"
@@ -291,7 +293,7 @@ class TestEventsVoicemail:
         assert r.status_code == 200
         assert r.json()["delivered_to"] == [222]
         # only the in_call user — not in_sms / out_sms
-        assert tg.sent == [(222, "🎙 Голосовое — +79261234555")]
+        assert tg.sent == [(222, "🎙 Voice note — +79261234555")]
         assert len(tg.files) == 1
         uid, path, voice_note = tg.files[0]
         assert uid == 222
@@ -311,7 +313,7 @@ class TestEventsVoicemail:
         client, audit = _make_env(tmp_path, client=tg)
         r = self._post(client, vm_type="early_hangup")
         assert r.status_code == 200
-        assert tg.sent == [(222, "📞 Звонок — +79261234555")]
+        assert tg.sent == [(222, "📞 Call — +79261234555")]
         assert tg.files == []  # no voice note for a greeting fragment
         etype, kw = audit.calls[0]
         assert etype == EventType.VOICEMAIL_EARLY_HANGUP
@@ -337,7 +339,7 @@ class TestEventsVoicemail:
             headers={"X-SimBridge-Secret": SECRET},
         )
         assert r.status_code == 200
-        assert tg.sent == [(222, "📞 Звонок — +79261234555")]
+        assert tg.sent == [(222, "📞 Call — +79261234555")]
         assert tg.files == []
         etype, kw = audit.calls[0]
         assert etype == EventType.VOICEMAIL_EARLY_HANGUP
@@ -363,7 +365,7 @@ class TestEventsVoicemail:
         client, audit = _make_env(tmp_path, client=tg)
         r = self._post(client, vm_type="recording_missing", with_file=False)
         assert r.status_code == 200
-        assert tg.sent == [(222, "⚠️ Нет записи — +79261234555")]
+        assert tg.sent == [(222, "⚠️ No recording — +79261234555")]
         assert tg.files == []
 
     def test_normal_without_file_is_text_only(self, tmp_path):
@@ -371,7 +373,7 @@ class TestEventsVoicemail:
         client, audit = _make_env(tmp_path, client=tg)
         r = self._post(client, vm_type="normal", with_file=False)
         assert r.status_code == 200
-        assert tg.sent == [(222, "🎙 Голосовое — +79261234555")]
+        assert tg.sent == [(222, "🎙 Voice note — +79261234555")]
         assert tg.files == []
         assert audit.calls[0][1]["details"]["has_audio"] is False
 
@@ -418,10 +420,10 @@ class TestEventsCall:
         assert r.status_code == 401
 
     @pytest.mark.parametrize("status,snippet", [
-        ("answered", "Соединено с "),
-        ("no_answer", "Нет ответа: "),
-        ("busy", "Занято: "),
-        ("failed", "Ошибка сети: "),
+        ("answered", "Connected to "),
+        ("no_answer", "No answer: "),
+        ("busy", "Busy: "),
+        ("failed", "Network error: "),
     ])
     def test_outcome_notifies_only_caller(self, tmp_path, status, snippet):
         """S04.3: separate localized message per GSM outcome, going ONLY
@@ -555,3 +557,79 @@ class TestIsNumberAttempt:
     ])
     def test_not_a_number_attempt(self, text):
         assert is_number_attempt(text) is False
+
+
+# ---------------------------------------------------------------------------
+# Per-recipient contact names (vCard phonebooks, TZ-07 A4)
+# ---------------------------------------------------------------------------
+
+from core.user_contacts import UserContactsStore  # noqa: E402
+
+
+class TestPerRecipientNames:
+    def _store(self, tmp_path, dirs):
+        store = UserContactsStore(str(tmp_path / "uc.json"))
+        for uid, entries in dirs.items():
+            store.replace_for(uid, entries)
+        return store
+
+    def test_sms_personal_name_per_user(self, tmp_path):
+        # 111 has the sender in their own directory, 222 does not —
+        # the same SMS reaches them under different names.
+        store = self._store(tmp_path, {
+            111: [{"name": "Boss", "number": "+79261234555"}],
+        })
+        tg = FakeClient()
+        client, _ = _make_env(
+            tmp_path, client=tg,
+            acl_lines="111 in_sms\n222 in_sms\n",
+            user_contacts=store,
+        )
+        r = client.post(
+            "/events/sms",
+            json={"phone_number": "+79261234555", "text": "hi"},
+            headers={"X-SimBridge-Secret": SECRET},
+        )
+        assert r.status_code == 200
+        assert (111, "SMS +79261234555 (Boss):\nhi") in tg.sent
+        assert (222, "SMS +79261234555:\nhi") in tg.sent
+
+    def test_sms_no_user_contacts_keeps_old_behavior(self, tmp_path):
+        tg = FakeClient()
+        client, _ = _make_env(
+            tmp_path, client=tg,
+            acl_lines="111 in_sms\n",
+            user_contacts=None,
+        )
+        r = client.post(
+            "/events/sms",
+            json={"phone_number": "+79261234555", "text": "hi"},
+            headers={"X-SimBridge-Secret": SECRET},
+        )
+        assert r.status_code == 200
+        assert tg.sent == [(111, "SMS +79261234555:\nhi")]
+
+    def test_voicemail_personal_label_per_user(self, tmp_path):
+        store = self._store(tmp_path, {
+            222: [{"name": "Neighbor", "number": "+79261234555"}],
+        })
+        tg = FakeClient()
+        client, _ = _make_env(
+            tmp_path, client=tg,
+            acl_lines="111 in_call\n222 in_call\n",
+            user_contacts=store,
+        )
+        r = client.post(
+            "/events/voicemail",
+            data={
+                "phone_number": "+79261234555",
+                "voicemail_type": "early_hangup",
+                "correlation_id": "corr-vm-uc",
+                "duration": "2",
+            },
+            headers={"X-SimBridge-Secret": SECRET},
+        )
+        assert r.status_code == 200
+        texts = {uid: text for uid, text in tg.sent}
+        assert texts[222] == "📞 Call — Neighbor (+79261234555)"
+        assert texts[111] == "📞 Call — +79261234555"

@@ -17,7 +17,7 @@ import os
 import tempfile
 import threading
 from datetime import datetime, timezone
-from typing import Optional, Set
+from typing import List, Optional, Set
 
 from core.phone import normalize_e164
 
@@ -121,6 +121,15 @@ class BlacklistManager:
             self._write()
             logger.info("Unblocked number: %s", norm)
             return True
+
+    def list(self) -> List[str]:
+        """Return all blacklisted numbers, sorted.
+
+        Hot-reloads from disk first, same as ``contains``/``count``.
+        """
+        self._maybe_reload()
+        with self._lock:
+            return sorted(self._numbers)
 
     def _write(self) -> None:
         """Atomically write the blacklist file.

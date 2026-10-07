@@ -76,6 +76,7 @@ async def async_main() -> None:
         client=ub.client,
         master_id=ub.master_id,
         metrics=metrics,
+        user_contacts=ub.user_contacts,
     )
 
     import uvicorn

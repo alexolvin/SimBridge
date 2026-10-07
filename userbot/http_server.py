@@ -23,6 +23,7 @@ from core.contacts import ContactResolver
 from core.errors import SMSErrorType
 from core.events import EventType, SMSEvent
 from core.logging_config import set_correlation
+from core.user_contacts import UserContactsStore
 
 logger = getLogger("simbridge.userbot.http")
 
@@ -36,6 +37,7 @@ def create_http_server(
     client=None,
     master_id: Optional[int] = None,
     metrics=None,
+    user_contacts: Optional[UserContactsStore] = None,
 ) -> FastAPI:
     """Create the HTTP server for receiving Asterisk events.
 
@@ -47,6 +49,11 @@ def create_http_server(
     *master_id* (S06.2): the master user's Telegram ID — the recipient
     of alerts forwarded from the agent node. *metrics* (S06.2): the
     userbot-side MetricsCollector (incoming SMS, exported at /health).
+
+    *user_contacts*: per-user vCard phonebooks. When set, the caller
+    name in delivered notifications is resolved from the RECIPIENT's
+    own directory first, then the global contacts cache — each
+    recipient can see the same number under their own name.
     """
 
     app = FastAPI(title="SimBridge Userbot HTTP")
@@ -58,6 +65,19 @@ def create_http_server(
     app.state.client = client
     app.state.master_id = master_id
     app.state.metrics = metrics
+    app.state.user_contacts = user_contacts
+
+    def _resolve_name(uid: Optional[int], number: str) -> Optional[str]:
+        """Caller display name for *number* addressed to recipient *uid*:
+        the recipient's own vCard directory first, then the global
+        contacts cache."""
+        if uid is not None and user_contacts is not None:
+            name = user_contacts.resolve_number(uid, number)
+            if name:
+                return name
+        if contacts is not None:
+            return contacts.resolve(number)
+        return None
 
     # S06.2: correlation IDs on every request (same contract as the
     # agent app) so the userbot's JSON log lines join the same trace as
@@ -112,7 +132,9 @@ def create_http_server(
         else:
             # S02.1: the sender number is ALWAYS part of the message
             # (legacy parity — "SMS +7...: text"); the contact name is
-            # added when the resolver has one.
+            # added when the resolver has one. This copy (global
+            # resolver) is for audit/response; each recipient gets the
+            # name resolved from their own directory first (below).
             name = contacts.resolve(phone) if contacts else None
             if name:
                 formatted_text = f"SMS {phone} ({name}):\n{sms_event.text}"
@@ -147,7 +169,14 @@ def create_http_server(
         else:
             for uid in audience:
                 try:
-                    await client.send_message(uid, formatted_text)
+                    # Per-recipient name: the user's own vCard directory
+                    # wins over the global contacts cache, so the same
+                    # sender shows up under each reader's own name.
+                    text = formatted_text
+                    name = _resolve_name(uid, phone)
+                    if name:
+                        text = f"SMS {phone} ({name}):\n{sms_event.text}"
+                    await client.send_message(uid, text)
                     delivered.append(uid)
                 except Exception as e:
                     failed.append(uid)
@@ -244,28 +273,33 @@ def create_http_server(
         correlation_id = form.get("correlation_id", "")
         duration = form.get("duration", "0")
 
-        # S03.1: Resolve contact name (S02 feature)
+        # S03.1: Resolve contact name (S02 feature). The label is built
+        # per recipient: their own vCard directory wins over the global
+        # contacts cache (the vm_label below — global resolution — is
+        # kept for logging/audit).
         from core.phone import normalize_e164
         norm = normalize_e164(phone_number) or phone_number
-        name = None
-        if contacts:
-            name = contacts.resolve(norm)
 
-        # Build Telegram notification text
-        if vm_type == "early_hangup":
-            vm_label = "📞 Звонок (брёл)"  # called, hung up during greeting
-            if name:
-                vm_label = f"📞 Звонок — {name} ({norm})"
-            else:
-                vm_label = f"📞 Звонок — {norm}"
-        elif vm_type == "recording_missing":
-            vm_label = f"⚠️ Нет записи — {norm}"
-            if name:
-                vm_label = f"⚠️ Нет записи — {name} ({norm})"
-        else:  # normal
-            vm_label = f"🎙 Голосовое — {norm}"
-            if name:
-                vm_label = f"🎙 Голосовое — {name} ({norm})"
+        def _vm_label_for(uid: Optional[int]) -> str:
+            name = _resolve_name(uid, norm)
+            if vm_type == "early_hangup":
+                label = "📞 Call (roamed)"  # called, hung up during greeting
+                if name:
+                    label = f"📞 Call — {name} ({norm})"
+                else:
+                    label = f"📞 Call — {norm}"
+            elif vm_type == "recording_missing":
+                label = f"⚠️ No recording — {norm}"
+                if name:
+                    label = f"⚠️ No recording — {name} ({norm})"
+            else:  # normal
+                label = f"🎙 Voice note — {norm}"
+                if name:
+                    label = f"🎙 Voice note — {name} ({norm})"
+            return label
+
+        vm_label = _vm_label_for(None)
+        name_for_audit = _resolve_name(None, norm)
 
         logger.info(
             "Received voicemail from %s type=%s duration=%ss correlation=%s",
@@ -311,7 +345,7 @@ def create_http_server(
                     # Label text first, then the voice note: the text
                     # carries the caller number + resolved name and
                     # must land even if the media send fails.
-                    await client.send_message(uid, vm_label)
+                    await client.send_message(uid, _vm_label_for(uid))
                     if has_audio:
                         await client.send_file(uid, temp_path, voice_note=True)
                     delivered.append(uid)
@@ -351,7 +385,7 @@ def create_http_server(
             correlation_id=correlation_id,
             details={
                 "from": norm,
-                "name": name,
+                "name": name_for_audit,
                 "voicemail_type": vm_type,
                 "duration": duration,
                 "audience": audience,
@@ -392,7 +426,7 @@ def create_http_server(
         error = body.get("error")
 
         if status == "delivered":
-            text = f"Доставлено: {phone}"
+            text = f"Delivered: {phone}"
         elif status == "failed":
             text = f"{SMSErrorType.DELIVERY_FAILED.value}: {phone}"
             if error:
@@ -469,10 +503,10 @@ def create_http_server(
 
         # S04.3: separate localized messages per GSM outcome.
         messages = {
-            "answered": f"Соединено с {to}",
-            "no_answer": f"Нет ответа: {to}",
-            "busy": f"Занято: {to}",
-            "failed": f"Ошибка сети: {to}",
+            "answered": f"Connected to {to}",
+            "no_answer": f"No answer: {to}",
+            "busy": f"Busy: {to}",
+            "failed": f"Network error: {to}",
         }
         text = messages.get(status)
         if text is None:
