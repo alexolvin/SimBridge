@@ -17,24 +17,24 @@ restrict automation. You are responsible for the consequences of account suspens
 ## Architecture
 
 ```
-  Telegram ◄────────────────────────────────────────►
+  Telegram <------------------------------------------>
                (MTProto + WebRTC)
 
-  ┌─────────────────── TELEGRAM NODE ────────────────────┐
-  │                                                      │
-  │  userbot (Telethon)         tg-bridge (ntgcalls<->SIP│
-  │       │                          │                   │
-  │       │ HTTP (control)           │ SIP 5062 + RTP    │
-  └──────────────────────────────────────────────────────┘
-          │        TAILSCALE        │
-          │                         │
-  ┌────────────────────── GSM NODE ──────────────────────┐
-  │                                                      │
-  │  simbridge-agent          Asterisk 18                │
-  │                             │                        │
-  │                        chan_dongle                   │
-  └──────────────────────────────────────────────────────┘
-                                    │
+  +------------------TELEGRAM NODE-------------------+
+  |                                                  |
+  |  userbot (Telethon)     tg-bridge (ntgcalls<->SIP|
+  |       |                       |                  |
+  |       | HTTP (control)        | SIP 5062 + RTP   |
+  +--------------------------------------------------+
+          |        TAILSCALE        |
+          |                         |
+  +---------------------GSM NODE---------------------+
+  |                                                  |
+  |  simbridge-agent      Asterisk 18                |
+  |                           |                      |
+  |                      chan_dongle                 |
+  +--------------------------------------------------+
+                                    |
                                     GSM modem / SIM
 ```
 
