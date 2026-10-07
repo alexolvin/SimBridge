@@ -8,7 +8,7 @@ SMS, voicemail, and live voice calls — managed via Telegram commands on a
 personal user account (MTProto, not Bot API). Built to financial-grade standards:
 failures can cost real money, so correctness takes priority over speed.
 
-**Requirements:** Asterisk 18+ on EL9/Ubuntu, `chan_dongle` + USB GSM modem (Huawei E173 tested),
+**Requirements:** Asterisk 18+ on EL9/Ubuntu, `chan_dongle` + USB/Mini PCIe GSM modem (Quectel EC25-EUX tested),
 a Telegram user account (Bot API cannot place voice calls), Tailscale for distributed deployments.
 
 **⚠️  Account risk:** This uses a Telegram user account. Telegram's Terms of Service may
@@ -66,11 +66,24 @@ See `docs/quick-start.md` or `docs/install-distributed.md` for full guides.
 
 | Command | Permission | Description |
 |---|---|---|
-| `/sms <phone> <message>` | `out_sms` | Send SMS |
-| `/broadcast <message>` | `out_sms` | Send to all users |
-| `/help` | — | Show available commands |
+| `<number>` | `out_call` | Voice call (simply enter the number) |
+| `/redial` | `out_call` | Redial the last number |
+| `/add <name> [number]` | `out_call` | Add a contact to the phonebook |
+| `/show` | `out_call` | Show the phonebook |
+| `/del <name\|number>` | `out_call` | Delete from the phonebook |
+| `/call <name\|number>` | `out_call` | Call a contact from the phonebook |
+| `/sms <name\|number> <message>` | `out_sms` | Send an SMS |
+| `/block <number>` | `out_sms` or `out_call` | Block a number |
+| `/listblock` | `out_sms` or `out_call` | Show blocked numbers |
+| `/unblock <number>` | `out_sms` or `out_call` | Unblock a number |
+| `/help` | — | Show available commands (filtered by permissions) |
 
 Incoming SMS and voicemail are forwarded automatically to users with `in_sms` / `in_call` rights.
+
+## Hardware
+
+- **Modem:** Quectel EC25-EUX (Cat 6, Mini PCIe) — tested with A09 firmware.
+- **⚠️ Flash ban:** Do NOT flash, FOTA-update, or power-cycle (`AT+QPOWD`) the modem. A13+ firmware carries a geo-registration lock (RUS) and irreversible anti-rollback. Bricking the module = permanent loss.
 
 ## Removal
 
