@@ -11,34 +11,34 @@ from typing import Optional
 
 
 class SMSErrorType(Enum):
-    """Categorized SMS errors with localized messages."""
+    """Categorized SMS errors with localized messages (English)."""
 
     # Submit-time errors
-    NUMBER_MISSING = "Номер не указан"
-    NUMBER_MALFORMED = "Некорректный формат номера"
+    NUMBER_MISSING = "Number not specified"
+    NUMBER_MALFORMED = "Invalid number format"
     # Context-specific malformed-number messages (user-facing, 2026-08-22):
     # the user should see WHY the number was rejected — an SMS destination
     # vs a call target. NUMBER_MALFORMED is kept for paths that are neither
     # (e.g. /block, /unblock) and for the agent-side vocabulary.
-    NUMBER_MALFORMED_SMS = "Неправильный номер для СМС"
-    NUMBER_MALFORMED_CALL = "Неправильный номер для звонка"
-    MODEM_UNAVAILABLE = "Модем недоступен"
-    NO_GSM_REGISTRATION = "Модем не зарегистрирован в сети"
-    SIM_UNAVAILABLE = "SIM-карта недоступна"
-    SEND_FAILED = "Ошибка отправки SMS"
-    BLACKLISTED = "Номер в черном списке"
-    DENIED = "Недостаточно прав"
+    NUMBER_MALFORMED_SMS = "Invalid number for SMS"
+    NUMBER_MALFORMED_CALL = "Invalid number for call"
+    MODEM_UNAVAILABLE = "Modem unavailable"
+    NO_GSM_REGISTRATION = "Modem not registered on the network"
+    SIM_UNAVAILABLE = "SIM card unavailable"
+    SEND_FAILED = "SMS send error"
+    BLACKLISTED = "Number is blacklisted"
+    DENIED = "Insufficient permissions"
 
     # Delivery-time errors
-    DELIVERY_FAILED = "SMS не доставлена"
-    DELIVERY_EXPIRED = "SMS истекла (не доставлена)"
+    DELIVERY_FAILED = "SMS not delivered"
+    DELIVERY_EXPIRED = "SMS expired (not delivered)"
 
     # Generic
-    UNKNOWN = "Неизвестная ошибка"
+    UNKNOWN = "Unknown error"
     # UX-layer error (not a modem submit): the message started with "/"
     # but is not a known command. Surfaced only to users who ARE in the
     # ACL — unknown users get total silence (see userbot access gating).
-    UNKNOWN_COMMAND = "Неизвестная команда"
+    UNKNOWN_COMMAND = "Unknown command"
 
 
     @property

@@ -284,17 +284,17 @@ class Userbot:
                 "outgoing call registration failed (agent_url=%s): %s",
                 self._agent_url, e,
             )
-            await evt.reply("Сервис звонков недоступен")
+            await evt.reply("Call service unavailable")
             return
 
         if resp.status_code == 403:
             await evt.reply(SMSErrorType.BLACKLISTED.value)
             return
         if resp.status_code == 429:
-            await evt.reply("Слишком много звонков. Попробуйте позже.")
+            await evt.reply("Too many calls. Try later.")
             return
         if resp.status_code == 503:
-            await evt.reply("Модем занят — другой звонок идёт.")
+            await evt.reply("Modem busy — another call in progress.")
             return
         if resp.status_code >= 400:
             await evt.reply(SMSErrorType.SEND_FAILED.value)
@@ -335,12 +335,12 @@ class Userbot:
                     "bridge start failed and agent reject failed: %s", e
                 )
             if result == "busy":
-                await evt.reply("Мост занят — другой звонок идёт.")
+                await evt.reply("Bridge busy — another call in progress.")
             else:
-                await evt.reply("Ошибка: голосовой мост недоступен")
+                await evt.reply("Error: voice bridge unavailable")
             return
 
-        await evt.reply("Звоню вам в Telegram…")
+        await evt.reply("Calling you in Telegram…")
 
     async def _do_send_sms(self, evt, phone: str, text: str,
                            sender_id: int) -> None:
@@ -355,7 +355,7 @@ class Userbot:
             # Only reachable via the reply path (a "/sms" reply with no
             # body) — an empty SMS would waste a submission to a real
             # phone.
-            await evt.reply("Пустое сообщение")
+            await evt.reply("Empty message")
             return
 
         # Strict validation (msg #48): only '+'+11-15 digits, '8'+11-15
@@ -400,7 +400,7 @@ class Userbot:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                await evt.reply("Отправлено")
+                await evt.reply("Sent")
         except httpx.HTTPStatusError as e:
             # S02.4: Map HTTP errors to user-friendly messages.
             # The agent returns {"detail": "<localized>"} on 4xx/5xx
@@ -413,10 +413,10 @@ class Userbot:
             if e.response.status_code == 403:
                 await evt.reply(SMSErrorType.BLACKLISTED.value)
             elif e.response.status_code == 429:
-                await evt.reply("Слишком много SMS. Попробуйте позже.")
+                await evt.reply("Too many SMS. Try later.")
             else:
                 await evt.reply(
-                    f"Ошибка отправки: {detail}" if detail
+                    f"Send error: {detail}" if detail
                     else SMSErrorType.SEND_FAILED.value
                 )
         except httpx.HTTPError as e:
@@ -485,20 +485,20 @@ class Userbot:
                     matches = self._user_contacts.find_by_name(sender_id, target)
                     if not matches:
                         await evt.reply(
-                            f"Не найдено: {target}\n"
-                            "Добавьте контакт: /add <имя> <номер>"
+                            f"Not found: {target}\n"
+                            "Add a contact: /add <name> <number>"
                         )
                         return
                     if len(matches) > 1:
                         lines = [f"{i}) {m['name']}  {m['number']}"
                                  for i, m in enumerate(matches[:10], 1)]
-                        more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
-                        await evt.reply("Несколько совпадений. Для отправки СМС "
-                                        "отправьте номер:\n" + "\n".join(lines) + more)
+                        more = "" if len(matches) <= 10 else f"\n… and {len(matches) - 10} more"
+                        await evt.reply("Multiple matches. To send the SMS, "
+                                        "send the number:\n" + "\n".join(lines) + more)
                         return
                     phone = matches[0]["number"]
                     if parse_destination(phone) is None:
-                        await evt.reply(f"Номер в справочнике некорректен: {phone}")
+                        await evt.reply(f"Number in the directory is invalid: {phone}")
                         return
 
             await self._do_send_sms(evt, phone, text, sender_id)
@@ -548,7 +548,7 @@ class Userbot:
 
             stored = self._last_call.get(sender_id)
             if stored is None:
-                await evt.reply("Нет последнего номера для повтора")
+                await evt.reply("No last number to redial")
                 return
             # Re-validate through the same strict parser: the stored
             # number is always a parseable form (it was dialed through
@@ -578,7 +578,7 @@ class Userbot:
             raw = (evt.message.text or "").strip()
             raw = re.sub(r"(?i)^/call\b\s*", "", raw)
             if not raw:
-                await evt.reply("Использование: /call <имя или номер>")
+                await evt.reply("Usage: /call <name or number>")
                 return
 
             dest = parse_destination(raw)
@@ -586,21 +586,21 @@ class Userbot:
                 matches = self._user_contacts.find_by_name(sender_id, raw)
                 if not matches:
                     await evt.reply(
-                        f"Не найдено: {raw}\n"
-                        "Добавьте контакт: /add <имя> <номер>"
+                        f"Not found: {raw}\n"
+                        "Add a contact: /add <name> <number>"
                     )
                     return
                 if len(matches) > 1:
                     lines = [f"{i}) {m['name']}  {m['number']}"
                              for i, m in enumerate(matches[:10], 1)]
-                    more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
-                    await evt.reply("Несколько совпадений. Для звонка отправьте "
-                                    "номер правильного контакта:\n" + "\n".join(lines)
+                    more = "" if len(matches) <= 10 else f"\n… and {len(matches) - 10} more"
+                    await evt.reply("Multiple matches. To call, send the "
+                                    "number of the correct contact:\n" + "\n".join(lines)
                                     + more)
                     return
                 dest = parse_destination(matches[0]["number"])
                 if dest is None:
-                    await evt.reply(f"Номер в справочнике некорректен: "
+                    await evt.reply(f"Number in the directory is invalid: "
                                     f"{matches[0]['number']}")
                     return
                 logger.info("/call: user %s dialed %r -> %s",
@@ -619,12 +619,12 @@ class Userbot:
 
             entries = self._user_contacts.get(sender_id)
             if not entries:
-                await evt.reply("Справочник пуст. "
-                                "Добавьте контакт: /add <имя> <номер>")
+                await evt.reply("Directory is empty. "
+                                "Add a contact: /add <name> <number>")
                 return
             lines = [f"{e['name']}  {e['number']}" for e in entries[:50]]
-            more = f"\n… и ещё {len(entries) - 50}" if len(entries) > 50 else ""
-            await evt.reply(f"Справочник ({len(entries)}):\n" + "\n".join(lines) + more)
+            more = f"\n… and {len(entries) - 50} more" if len(entries) > 50 else ""
+            await evt.reply(f"Directory ({len(entries)}):\n" + "\n".join(lines) + more)
 
         @self._client.on(events.NewMessage(pattern=r"(?i)^/add\b"))
         async def handle_add(evt):
@@ -642,7 +642,7 @@ class Userbot:
 
             raw = re.sub(r"(?i)^/add\b\s*", "", (evt.message.text or "").strip())
             if not raw:
-                await evt.reply("Использование: /add <имя> [номер]")
+                await evt.reply("Usage: /add <name> [number]")
                 return
 
             # number = the LAST token starting with '+' or a digit; name = rest.
@@ -655,22 +655,22 @@ class Userbot:
                 number = self._last_call.get(sender_id)
 
             if not number:
-                await evt.reply("Нет последнего номера. "
-                                "Используйте /add <имя> <номер>.")
+                await evt.reply("No last number. "
+                                "Use /add <name> <number>.")
                 return
 
             ok, reason, detail = self._user_contacts.add_unique(sender_id, name, number)
             display_name = name.strip().replace(" ", "_")
             if ok:
-                await evt.reply(f"Добавлено: {display_name} ({detail})")
+                await evt.reply(f"Added: {display_name} ({detail})")
             elif reason == "number_exists":
-                await evt.reply(f"Отказ: номер уже есть (контакт «{detail}»).")
+                await evt.reply(f"Rejected: number already exists (contact «{detail}»).")
             elif reason == "name_exists":
-                await evt.reply(f"Отказ: имя уже занято ({detail}).")
+                await evt.reply(f"Rejected: name already taken ({detail}).")
             elif detail == "no name":
-                await evt.reply("Нет имени. Используйте /add <имя> <номер>.")
+                await evt.reply("No name. Use /add <name> <number>.")
             else:
-                await evt.reply("Некорректный номер.")
+                await evt.reply("Invalid number.")
 
         @self._client.on(events.NewMessage(pattern=r"(?i)^/del\b"))
         async def handle_del(evt):
@@ -691,35 +691,35 @@ class Userbot:
 
             raw = re.sub(r"(?i)^/del\b\s*", "", (evt.message.text or "").strip())
             if not raw:
-                await evt.reply("Использование: /del <имя или номер>")
+                await evt.reply("Usage: /del <name or number>")
                 return
 
             dest = parse_destination(raw)
             if dest is not None:
                 n = self._user_contacts.delete_by_number(sender_id, dest.number)
                 if n:
-                    await evt.reply(f"Удалено: {n} (номер {dest.number})")
+                    await evt.reply(f"Deleted: {n} (number {dest.number})")
                 else:
-                    await evt.reply(f"Не найден номер {dest.number}")
+                    await evt.reply(f"Number not found: {dest.number}")
                 return
 
             matches = self._user_contacts.find_by_name(sender_id, raw)
             if not matches:
-                await evt.reply(f"Не найдено: {raw}")
+                await evt.reply(f"Not found: {raw}")
                 return
             if len(matches) > 1:
                 lines = [f"{i}) {m['name']}  {m['number']}"
                          for i, m in enumerate(matches[:10], 1)]
-                more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
-                await evt.reply("Несколько совпадений. Удалите по номеру:\n"
+                more = "" if len(matches) <= 10 else f"\n… and {len(matches) - 10} more"
+                await evt.reply("Multiple matches. Delete by number:\n"
                                 + "\n".join(lines) + more)
                 return
             n = self._user_contacts.delete_by_name(sender_id, matches[0]["name"])
             if n:
-                await evt.reply(f"Удалено: {matches[0]['name']} "
+                await evt.reply(f"Deleted: {matches[0]['name']} "
                                 f"({matches[0]['number']})")
             else:
-                await evt.reply("Не удалось удалить (запись не найдена)")
+                await evt.reply("Failed to delete (record not found)")
 
         @self._client.on(events.NewMessage(func=lambda e: e.voice is not None))
         async def handle_voice_note(evt):
@@ -931,7 +931,7 @@ class Userbot:
                 )
                 return
             await evt.reply(
-                f"{SMSErrorType.UNKNOWN_COMMAND.value}. /help — список команд."
+                f"{SMSErrorType.UNKNOWN_COMMAND.value}. /help — command list."
             )
 
         @self._client.on(

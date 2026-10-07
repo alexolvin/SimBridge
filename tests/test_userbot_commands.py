@@ -368,7 +368,7 @@ class TestAccessGate:
         # not rights-gated — PARTIAL still gets a reply
         evt = FakeEvt("/EEE", PARTIAL)
         _run(client.fn("handle_unknown_command")(evt))
-        assert evt.replies and "Неизвестная команда" in evt.replies[0]
+        assert evt.replies and "Unknown command" in evt.replies[0]
         evt = FakeEvt("/help", PARTIAL)
         _run(client.fn("handle_help")(evt))
         assert evt.replies  # at least the header line
@@ -407,7 +407,7 @@ class TestUnknownCommand:
         evt = FakeEvt("/EEE whatever", MASTER)
         _run(client.fn("handle_unknown_command")(evt))
         assert evt.replies == [
-            f"{SMSErrorType.UNKNOWN_COMMAND.value}. /help — список команд."
+            f"{SMSErrorType.UNKNOWN_COMMAND.value}. /help — command list."
         ]
 
     def test_stranger_silence_and_audit(self, monkeypatch):
@@ -449,7 +449,7 @@ class TestMalformedNumbers:
         posts = fake_http(monkeypatch, FakeResp(200, {}))
         evt = FakeEvt("/sms abc hello", MASTER)
         _run(client.fn("handle_sms")(evt))
-        assert evt.replies[0].startswith("Не найдено: abc")
+        assert evt.replies[0].startswith("Not found: abc")
         assert posts == []
 
     def test_bare_number_too_long(self, monkeypatch):
@@ -518,7 +518,7 @@ class TestSmsSend:
         posts = fake_http(monkeypatch, FakeResp(200, {}))
         evt = FakeEvt("/SMS +79991234567 Выход", MASTER)
         _run(client.fn("handle_sms")(evt))
-        assert evt.replies == ["Отправлено"]
+        assert evt.replies == ["Sent"]
         assert len(posts) == 1
         p = posts[0]
         assert p["url"] == "http://127.0.0.1:8090/v1/sms"
@@ -532,7 +532,7 @@ class TestSmsSend:
         posts = fake_http(monkeypatch, FakeResp(200, {}))
         evt = FakeEvt("/sms 89991234567 hi", MASTER)
         _run(client.fn("handle_sms")(evt))
-        assert evt.replies == ["Отправлено"]
+        assert evt.replies == ["Sent"]
         assert posts[0]["json"]["to"] == "+79991234567"
 
     def test_sms_7_prefix_rejected(self, monkeypatch):
@@ -568,14 +568,14 @@ class TestSmsSend:
         fake_http(monkeypatch, FakeResp(429, {"detail": "slow down"}))
         evt = FakeEvt("/sms +79991234567 x", MASTER)
         _run(client.fn("handle_sms")(evt))
-        assert evt.replies == ["Слишком много SMS. Попробуйте позже."]
+        assert evt.replies == ["Too many SMS. Try later."]
 
     def test_agent_5xx_detail_surfaced(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
         fake_http(monkeypatch, FakeResp(502, {"detail": "Asterisk AMI unavailable"}))
         evt = FakeEvt("/sms +79991234567 x", MASTER)
         _run(client.fn("handle_sms")(evt))
-        assert evt.replies == ["Ошибка отправки: Asterisk AMI unavailable"]
+        assert evt.replies == ["Send error: Asterisk AMI unavailable"]
 
     def test_connect_error_maps_to_modem_unavailable(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -607,7 +607,7 @@ class TestSmsReply:
         posts = fake_http(monkeypatch, FakeResp(200, {}))
         evt = FakeEvt("Ответ", MASTER, reply_to=self.sms_msg())
         _run(client.fn("handle_sms_reply")(evt))
-        assert evt.replies == ["Отправлено"]
+        assert evt.replies == ["Sent"]
         assert posts[0]["json"]["to"] == "+79991234567"
         assert posts[0]["json"]["text"] == "Ответ"
 
@@ -616,7 +616,7 @@ class TestSmsReply:
         posts = fake_http(monkeypatch, FakeResp(200, {}))
         evt = FakeEvt("/SMS Выход", MASTER, reply_to=self.sms_msg())
         _run(client.fn("handle_sms")(evt))
-        assert evt.replies == ["Отправлено"]
+        assert evt.replies == ["Sent"]
         assert posts[0]["json"]["to"] == "+79991234567"
         assert posts[0]["json"]["text"] == "Выход"
 
@@ -756,7 +756,7 @@ class TestBareNumber:
         evt = FakeEvt("+79991234567", MASTER)
         _run(client.fn("handle_bare_number")(evt))
         assert posts[0]["json"]["phone_number"] == "+79991234567"
-        assert evt.replies == ["Звоню вам в Telegram…"]
+        assert evt.replies == ["Calling you in Telegram…"]
 
     def test_8_prefix_normalized_then_dialed(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -765,7 +765,7 @@ class TestBareNumber:
         evt = FakeEvt("89991234567", MASTER)
         _run(client.fn("handle_bare_number")(evt))
         assert posts[0]["json"]["phone_number"] == "+79991234567"
-        assert evt.replies == ["Звоню вам в Telegram…"]
+        assert evt.replies == ["Calling you in Telegram…"]
 
     def test_service_3_digit_dials_as_is(self, monkeypatch):
         # a 3-digit number is a local service number (e.g. 100, Moscow
@@ -776,7 +776,7 @@ class TestBareNumber:
         evt = FakeEvt("123", MASTER)
         _run(client.fn("handle_bare_number")(evt))
         assert posts[0]["json"]["phone_number"] == "123"
-        assert evt.replies == ["Звоню вам в Telegram…"]
+        assert evt.replies == ["Calling you in Telegram…"]
 
     def test_internal_4_digit_dials_as_is(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -785,7 +785,7 @@ class TestBareNumber:
         evt = FakeEvt("1234", MASTER)
         _run(client.fn("handle_bare_number")(evt))
         assert posts[0]["json"]["phone_number"] == "1234"
-        assert evt.replies == ["Звоню вам в Telegram…"]
+        assert evt.replies == ["Calling you in Telegram…"]
 
     @pytest.mark.parametrize(
         "text",
@@ -863,7 +863,7 @@ class TestRedial:
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("/redial", MASTER)
         _run(client.fn("handle_redial")(evt))
-        assert evt.replies == ["Нет последнего номера для повтора"]
+        assert evt.replies == ["No last number to redial"]
         assert posts == []
 
     def test_redials_last_number(self, monkeypatch):
@@ -874,7 +874,7 @@ class TestRedial:
         evt1 = FakeEvt("+79991234567", MASTER)
         _run(client.fn("handle_bare_number")(evt1))
         assert posts[0]["json"]["phone_number"] == "+79991234567"
-        assert evt1.replies == ["Звоню вам в Telegram…"]
+        assert evt1.replies == ["Calling you in Telegram…"]
 
         evt2 = FakeEvt("/redial", MASTER)
         _run(client.fn("handle_redial")(evt2))
@@ -882,7 +882,7 @@ class TestRedial:
         assert posts[1]["json"]["phone_number"] == "+79991234567"
         assert posts[1]["json"]["telegram_user_id"] == MASTER
         assert ub._bridge.start_call.await_count == 2
-        assert evt2.replies == ["Звоню вам в Telegram…"]
+        assert evt2.replies == ["Calling you in Telegram…"]
 
     def test_memory_is_per_user(self, monkeypatch):
         rights = {
@@ -897,7 +897,7 @@ class TestRedial:
         # the second user never dialed — must not see MASTER's number
         evt = FakeEvt("/redial", TestRedial.SECOND)
         _run(client.fn("handle_redial")(evt))
-        assert evt.replies == ["Нет последнего номера для повтора"]
+        assert evt.replies == ["No last number to redial"]
         assert len(posts) == 1
 
     def test_last_number_updates_on_new_dial(self, monkeypatch):
@@ -932,12 +932,12 @@ class TestRedial:
 
         evt1 = FakeEvt("+79991234567", MASTER)
         _run(client.fn("handle_bare_number")(evt1))
-        assert evt1.replies == ["Модем занят — другой звонок идёт."]
+        assert evt1.replies == ["Modem busy — another call in progress."]
         assert ub._last_call.get(MASTER) is None
 
         evt2 = FakeEvt("/redial", MASTER)
         _run(client.fn("handle_redial")(evt2))
-        assert evt2.replies == ["Нет последнего номера для повтора"]
+        assert evt2.replies == ["No last number to redial"]
 
     def test_help_lists_redial_for_out_call(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -971,7 +971,7 @@ class TestCallCommand:
         ub, client = make_ub(monkeypatch)
         evt = FakeEvt("/call", MASTER)
         _run(client.fn("handle_call")(evt))
-        assert evt.replies == ["Использование: /call <имя или номер>"]
+        assert evt.replies == ["Usage: /call <name or number>"]
 
     def test_number_dials_directly(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -980,7 +980,7 @@ class TestCallCommand:
         evt = FakeEvt("/call +79991234567", MASTER)
         _run(client.fn("handle_call")(evt))
         assert posts[0]["json"]["phone_number"] == "+79991234567"
-        assert evt.replies == ["Звоню вам в Telegram…"]
+        assert evt.replies == ["Calling you in Telegram…"]
 
     # ---- bridge busy vs unavailable: distinct messages (TZ-09, 27c26ee1) ----
 
@@ -993,7 +993,7 @@ class TestCallCommand:
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("/call +79991234567", MASTER)
         _run(client.fn("handle_call")(evt))
-        assert evt.replies == ["Мост занят — другой звонок идёт."]
+        assert evt.replies == ["Bridge busy — another call in progress."]
         assert posts[-1]["url"].endswith("/v1/call/c1/reject")
 
     def test_bridge_error_says_unavailable(self, monkeypatch):
@@ -1004,7 +1004,7 @@ class TestCallCommand:
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("/call +79991234567", MASTER)
         _run(client.fn("handle_call")(evt))
-        assert evt.replies == ["Ошибка: голосовой мост недоступен"]
+        assert evt.replies == ["Error: voice bridge unavailable"]
         assert posts[-1]["url"].endswith("/v1/call/c1/reject")
 
     def test_name_unique_match_dials(self, monkeypatch):
@@ -1016,7 +1016,7 @@ class TestCallCommand:
         evt = FakeEvt("/call Ivanov", MASTER)
         _run(client.fn("handle_call")(evt))
         assert posts[0]["json"]["phone_number"] == "+79261111111"
-        assert evt.replies == ["Звоню вам в Telegram…"]
+        assert evt.replies == ["Calling you in Telegram…"]
 
     def test_name_multiple_matches_lists(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1027,8 +1027,8 @@ class TestCallCommand:
         evt = FakeEvt("/call Ivanov", MASTER)
         _run(client.fn("handle_call")(evt))
         reply = evt.replies[0]
-        assert reply.startswith("Несколько совпадений.")
-        assert "Для звонка отправьте номер" in reply
+        assert reply.startswith("Multiple matches.")
+        assert "To call, send the number" in reply
         assert "Ivanov Ivan" in reply and "+79261111111" in reply
         assert "Ivanov Petr" in reply and "+79262222222" in reply
         assert posts == []  # nothing dialed until the user picks
@@ -1038,7 +1038,7 @@ class TestCallCommand:
         posts = fake_http(monkeypatch, FakeResp(200, {"call_id": "c1"}))
         evt = FakeEvt("/call Nobody", MASTER)
         _run(client.fn("handle_call")(evt))
-        assert evt.replies[0].startswith("Не найдено: Nobody")
+        assert evt.replies[0].startswith("Not found: Nobody")
         assert "/add" in evt.replies[0]
         assert posts == []
 
@@ -1054,7 +1054,7 @@ class TestCallCommand:
         # SECOND does not see MASTER's directory
         evt = FakeEvt("/call Ivanov", TestRedial.SECOND)
         _run(client.fn("handle_call")(evt))
-        assert evt.replies[0].startswith("Не найдено: Ivanov")
+        assert evt.replies[0].startswith("Not found: Ivanov")
         assert posts == []
 
 
@@ -1075,7 +1075,7 @@ class TestShowCommand:
         ub, client = make_ub(monkeypatch)
         evt = FakeEvt("/show", MASTER)
         _run(client.fn("handle_show")(evt))
-        assert "Справочник пуст" in evt.replies[0]
+        assert "Directory is empty" in evt.replies[0]
 
     def test_lists_entries(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1085,7 +1085,7 @@ class TestShowCommand:
         evt = FakeEvt("/show", MASTER)
         _run(client.fn("handle_show")(evt))
         reply = evt.replies[0]
-        assert "Справочник (2):" in reply
+        assert "Directory (2):" in reply
         assert "Ivanov Ivan  +79261111111" in reply
         assert "Petrov  +79263333333" in reply
 
@@ -1097,11 +1097,11 @@ class TestShowCommand:
         evt = FakeEvt("/show", MASTER)
         _run(client.fn("handle_show")(evt))
         reply = evt.replies[0]
-        assert "Справочник (55):" in reply
+        assert "Directory (55):" in reply
         # entries[0..49] shown (Contact 0..49), entries[50..54] hidden
         assert "Contact 49  " in reply
         assert "Contact 54" not in reply
-        assert "и ещё 5" in reply
+        assert "and 5 more" in reply
 
     def test_help_lists_show(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1133,7 +1133,7 @@ class TestDelCommand:
         ub, client = make_ub(monkeypatch)
         evt = FakeEvt("/del", MASTER)
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Использование: /del <имя или номер>"]
+        assert evt.replies == ["Usage: /del <name or number>"]
 
     def test_delete_by_number(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1142,7 +1142,7 @@ class TestDelCommand:
             {"name": "Petrov", "number": "+79262222222"}])
         evt = FakeEvt("/del +79261111111", MASTER)
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Удалено: 1 (номер +79261111111)"]
+        assert evt.replies == ["Deleted: 1 (number +79261111111)"]
         assert ub._user_contacts.get(MASTER) == \
             [{"name": "Petrov", "number": "+79262222222"}]
 
@@ -1152,7 +1152,7 @@ class TestDelCommand:
             {"name": "Ivanov", "number": "+79261111111"}])
         evt = FakeEvt("/del 89261111111", MASTER)
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Удалено: 1 (номер +79261111111)"]
+        assert evt.replies == ["Deleted: 1 (number +79261111111)"]
         assert ub._user_contacts.get(MASTER) == []
 
     def test_delete_by_number_not_found(self, monkeypatch):
@@ -1161,7 +1161,7 @@ class TestDelCommand:
             {"name": "Ivanov", "number": "+79261111111"}])
         evt = FakeEvt("/del +79000000000", MASTER)
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Не найден номер +79000000000"]
+        assert evt.replies == ["Number not found: +79000000000"]
         assert ub._user_contacts.get(MASTER) == \
             [{"name": "Ivanov", "number": "+79261111111"}]
 
@@ -1172,7 +1172,7 @@ class TestDelCommand:
             {"name": "Petrov", "number": "+79262222222"}])
         evt = FakeEvt("/del ivanov", MASTER)  # unique prefix match
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Удалено: Ivanov Ivan (+79261111111)"]
+        assert evt.replies == ["Deleted: Ivanov Ivan (+79261111111)"]
         assert ub._user_contacts.get(MASTER) == \
             [{"name": "Petrov", "number": "+79262222222"}]
 
@@ -1184,8 +1184,8 @@ class TestDelCommand:
         evt = FakeEvt("/del Ivanov", MASTER)
         _run(client.fn("handle_del")(evt))
         reply = evt.replies[0]
-        assert reply.startswith("Несколько совпадений.")
-        assert "Удалите по номеру" in reply
+        assert reply.startswith("Multiple matches.")
+        assert "Delete by number" in reply
         # nothing deleted
         assert len(ub._user_contacts.get(MASTER)) == 2
 
@@ -1195,7 +1195,7 @@ class TestDelCommand:
             {"name": "Ivanov", "number": "+79261111111"}])
         evt = FakeEvt("/del Nobody", MASTER)
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Не найдено: Nobody"]
+        assert evt.replies == ["Not found: Nobody"]
         assert len(ub._user_contacts.get(MASTER)) == 1
 
     def test_memory_is_per_user(self, monkeypatch):
@@ -1208,7 +1208,7 @@ class TestDelCommand:
             {"name": "Ivanov", "number": "+79261111111"}])
         evt = FakeEvt("/del +79261111111", TestRedial.SECOND)
         _run(client.fn("handle_del")(evt))
-        assert evt.replies == ["Не найден номер +79261111111"]
+        assert evt.replies == ["Number not found: +79261111111"]
         assert ub._user_contacts.get(MASTER) == \
             [{"name": "Ivanov", "number": "+79261111111"}]
 
@@ -1238,7 +1238,7 @@ class TestAddCommand:
         _run(client.fn("handle_add")(evt))
         assert ub._user_contacts.get(MASTER) == [
             {"name": "Ivanov", "number": "+79261111111"}]
-        assert evt.replies == ["Добавлено: Ivanov (+79261111111)"]
+        assert evt.replies == ["Added: Ivanov (+79261111111)"]
 
     def test_add_name_with_spaces_becomes_underscores(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1246,7 +1246,7 @@ class TestAddCommand:
         _run(client.fn("handle_add")(evt))
         assert ub._user_contacts.get(MASTER) == [
             {"name": "Ivanov_Ivan", "number": "+79261111111"}]
-        assert evt.replies == ["Добавлено: Ivanov_Ivan (+79261111111)"]
+        assert evt.replies == ["Added: Ivanov_Ivan (+79261111111)"]
 
     def test_add_last_number(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1255,21 +1255,21 @@ class TestAddCommand:
         _run(client.fn("handle_add")(evt))
         assert ub._user_contacts.get(MASTER) == [
             {"name": "Petrow", "number": "+79262222222"}]
-        assert evt.replies == ["Добавлено: Petrow (+79262222222)"]
+        assert evt.replies == ["Added: Petrow (+79262222222)"]
 
     def test_add_no_last_number(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
         evt = FakeEvt("/add Petrow", MASTER)
         _run(client.fn("handle_add")(evt))
         assert evt.replies == [
-            "Нет последнего номера. Используйте /add <имя> <номер>."
+            "No last number. Use /add <name> <number>."
         ]
 
     def test_add_no_args_usage(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
         evt = FakeEvt("/add", MASTER)
         _run(client.fn("handle_add")(evt))
-        assert evt.replies == ["Использование: /add <имя> [номер]"]
+        assert evt.replies == ["Usage: /add <name> [number]"]
 
     def test_add_duplicate_number_rejected(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
@@ -1277,7 +1277,7 @@ class TestAddCommand:
             {"name": "Ivanov", "number": "+79261111111"}])
         evt = FakeEvt("/add Petrov +79261111111", MASTER)
         _run(client.fn("handle_add")(evt))
-        assert evt.replies == ["Отказ: номер уже есть (контакт «Ivanov»)."]
+        assert evt.replies == ["Rejected: number already exists (contact «Ivanov»)."]
         assert ub._user_contacts.get(MASTER) == [
             {"name": "Ivanov", "number": "+79261111111"}]
 
@@ -1287,7 +1287,7 @@ class TestAddCommand:
             {"name": "Ivanov_Ivan", "number": "+79261111111"}])
         evt = FakeEvt("/add Ivanov Ivan +79262222222", MASTER)
         _run(client.fn("handle_add")(evt))
-        assert evt.replies == ["Отказ: имя уже занято (+79261111111)."]
+        assert evt.replies == ["Rejected: name already taken (+79261111111)."]
 
     def test_help_lists_add(self, monkeypatch):
         ub, client = make_ub(monkeypatch)
