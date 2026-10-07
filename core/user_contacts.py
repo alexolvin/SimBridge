@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from core.phone import normalize_e164
+from core.phone import normalize_e164, parse_destination
 
 logger = logging.getLogger("simbridge.user_contacts")
 
@@ -139,8 +139,11 @@ class UserContactsStore:
         """Add ONE entry, rejecting a duplicate number OR name.
 
         Names are stored with spaces replaced by underscores (single-token).
+        The number must be a dialable destination (E.164, 8-prefix, a 3-digit
+        local service number, or a 4-digit internal extension) and is stored
+        in its canonical dial form.
         Returns ``(ok, reason, detail)``:
-          - ``(True, "ok", "<normalized_number>")`` — added;
+          - ``(True, "ok", "<canonical_number>")`` — added;
           - ``(False, "number_exists", "<existing_name>")``;
           - ``(False, "name_exists", "<existing_number>")``;
           - ``(False, "invalid", "no name" | "bad number")``.
@@ -149,12 +152,14 @@ class UserContactsStore:
         number = str(number or "").strip()
         if not name:
             return (False, "invalid", "no name")
-        norm = normalize_e164(number)
-        if not norm:
+        dest = parse_destination(number)
+        if dest is None:
             return (False, "invalid", "bad number")
+        norm = dest.number
         entries = self.get(user_id)
         for e in entries:
-            if (normalize_e164(e["number"]) or e["number"]) == norm:
+            e_dest = parse_destination(e["number"])
+            if (e_dest.number if e_dest else e["number"]) == norm:
                 return (False, "number_exists", e["name"])
         for e in entries:
             if e["name"].casefold() == name.casefold():

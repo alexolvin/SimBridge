@@ -98,6 +98,27 @@ class TestStoreAddUnique:
         assert (ok, detail) == (True, "+79261111111")
         assert s.get(111) == [{"name": "Ivanov", "number": "+79261111111"}]
 
+    def test_short_internal_number_accepted(self, tmp_path):
+        # a 4-digit internal extension is dialable (parse_destination),
+        # even though it is not E.164
+        s = _store(tmp_path)
+        ok, reason, detail = s.add_unique(111, "Beeline", "0611")
+        assert (ok, detail) == (True, "0611")
+        assert s.get(111) == [{"name": "Beeline", "number": "0611"}]
+
+    def test_short_service_number_accepted(self, tmp_path):
+        # a 3-digit local service number is dialable too
+        s = _store(tmp_path)
+        ok, reason, detail = s.add_unique(111, "Operator", "100")
+        assert (ok, detail) == (True, "100")
+        assert s.get(111) == [{"name": "Operator", "number": "100"}]
+
+    def test_short_number_duplicate_rejected(self, tmp_path):
+        s = _store(tmp_path)
+        s.add_unique(111, "Beeline", "0611")
+        ok, reason, detail = s.add_unique(111, "Other", "0611")
+        assert (ok, reason, detail) == (False, "number_exists", "Beeline")
+
     def test_name_spaces_to_underscores(self, tmp_path):
         s = _store(tmp_path)
         ok, reason, detail = s.add_unique(111, "Ivanov Ivan", "+79261111111")
