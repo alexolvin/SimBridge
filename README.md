@@ -17,19 +17,25 @@ restrict automation. You are responsible for the consequences of account suspens
 ## Architecture
 
 ```
-                    ┌─────────────────── TELEGRAM NODE ──────────────────┐
-   Telegram ◄──────►│  userbot (Telethon)     tg-bridge (ntgcalls↔SIP)   │
-   (MTProto+WebRTC) │       │ control                    │ SIP 5062      │
-                    └───────┼────────────────────────────┼───────────────┘
-                            │  authenticated HTTP        │  SIP + RTP
-                            │  (control plane)           │  (media plane)
-                       ─────┼────────── TAILSCALE ───────┼─────
-                            │                            │
-                    ┌───────┼────────────────────────────┼─── GSM NODE ──┐
-                    │  simbridge-agent            Asterisk 18 (5060)     │
-                    │                                    │ chan_dongle   │
-                    └────────────────────────────────────┼───────────────┘
-                                                    GSM modem / SIM
+  Telegram ◄────────────────────────────────────────►
+               (MTProto + WebRTC)
+
+  ┌─────────────────── TELEGRAM NODE ────────────────────┐
+  │                                                      │
+  │  userbot (Telethon)         tg-bridge (ntgcalls<->SIP│
+  │       │                          │                   │
+  │       │ HTTP (control)           │ SIP 5062 + RTP    │
+  └──────────────────────────────────────────────────────┘
+          │        TAILSCALE        │
+          │                         │
+  ┌────────────────────── GSM NODE ──────────────────────┐
+  │                                                      │
+  │  simbridge-agent          Asterisk 18                │
+  │                             │                        │
+  │                        chan_dongle                   │
+  └──────────────────────────────────────────────────────┘
+                                    │
+                                    GSM modem / SIM
 ```
 
 - **userbot** — Telegram user account (Telethon). Receives commands, forwards SMS/voicemail to Telegram.
