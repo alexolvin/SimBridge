@@ -1,14 +1,15 @@
-"""Per-user phonebooks (vCard import) — dial-by-name and caller ID.
+"""Per-user phonebooks — dial-by-name and caller ID.
 
-Each Telegram user can import their own phonebook as a vCard file;
-entries are stored per user and used for:
+Each Telegram user keeps their own phonebook, managed with the /add and
+/del commands (no file import); entries are stored per user and used for:
 - /call <name> — name -> number resolution before dialing;
-- incoming-event identification (SMS / voicemail) — the recipient's
-  own directory is consulted before the global contacts cache.
+- /sms <name> — name -> number resolution for outgoing SMS;
+- incoming-event identification (SMS) — the recipient's own directory is
+  consulted before the global contacts cache.
 
 Storage: ONE JSON file on the Telegram node, keyed by Telegram user ID::
 
-    {"449550030": [{"name": "Ivanov Ivan", "number": "+79261234555"}]}
+    {"449550030": [{"name": "Ivanov_Ivan", "number": "+79261234555"}]}
 
 Design notes:
 - hot-reload by mtime (same discipline as ACL / contacts cache) so an
@@ -16,8 +17,8 @@ Design notes:
 - atomic writes (tmp file + os.replace) — a crash never leaves a
   truncated store;
 - pure stdlib, no network I/O, thread-safe via a single lock;
-- a new import REPLACES the user's previous directory (the reply tells
-  the user it was replaced, not merged).
+- names are stored with spaces replaced by underscores (single-token),
+  so a name never contains a whitespace.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import tempfile
 import threading
 from pathlib import Path
@@ -34,122 +34,6 @@ from typing import Dict, List, Optional
 from core.phone import normalize_e164
 
 logger = logging.getLogger("simbridge.user_contacts")
-
-
-# ---------------------------------------------------------------------------
-# vCard parsing
-# ---------------------------------------------------------------------------
-
-_VCARD_ESCAPES = {"\\,": ",", "\\;": ";", "\\\\": "\\", "\\n": " ", "\\N": " "}
-
-
-def _unescape(value: str) -> str:
-    """Undo vCard text escaping (RFC 6350 §3.2). \\n -> space (display name)."""
-    out = value
-    for esc, repl in _VCARD_ESCAPES.items():
-        out = out.replace(esc, repl)
-    return out.strip()
-
-
-def _unfold(lines: List[str]) -> List[str]:
-    """RFC 6350 §3.1: a line starting with a space/tab continues the previous one."""
-    out: List[str] = []
-    for line in lines:
-        if line[:1] in (" ", "\t") and out:
-            out[-1] += line[1:]
-        else:
-            out.append(line)
-    return out
-
-
-def _tel_number(value: str) -> Optional[str]:
-    """Extract the number from a TEL property value ("+7...", "tel:+7...", ...)."""
-    v = value.strip()
-    if not v:
-        return None
-    if v.startswith(("tel:", "TEL:")):
-        v = v[4:]
-    # parameters like ;pref=1 are not expected in the value part, but a
-    # stray ';' (e.g. "+7...;ext=1") keeps only the first part
-    v = v.split(";")[0].strip()
-    return v or None
-
-
-def parse_vcard(text: str) -> List[Dict[str, str]]:
-    """Parse vCard 3.0/4.0 text into [{"name": str, "number": str}, ...].
-
-    Rules:
-    - multiple VCARD blocks per document are all parsed;
-    - name: FN if present, else N (surname + given + prefix, space-joined);
-    - number: the TEL marked CELL/CELLULAR if any, else the first TEL;
-      normalized to E.164 when the normalizer accepts it, raw otherwise;
-    - cards without a usable name OR number are dropped (logged).
-    """
-    cards: List[Dict[str, str]] = []
-    lines = _unfold(text.replace("\r\n", "\n").split("\n"))
-
-    block: List[str] = []
-    in_block = False
-    for line in lines:
-        upper = line.upper().split(":", 1)[0].strip()
-        if upper == "BEGIN" and "VCARD" in line.upper():
-            block = []
-            in_block = True
-            continue
-        if upper == "END" and "VCARD" in line.upper():
-            if in_block:
-                card = _parse_block(block)
-                if card:
-                    cards.append(card)
-            in_block = False
-            block = []
-            continue
-        if in_block:
-            block.append(line)
-
-    if not cards:
-        logger.debug("parse_vcard: no VCARD blocks found (%d chars)", len(text))
-    return cards
-
-
-def _parse_block(block: List[str]) -> Optional[Dict[str, str]]:
-    names: List[str] = []
-    tels: List[tuple] = []  # (is_cell, raw_number)
-
-    for line in block:
-        if ":" not in line:
-            continue
-        prop, _, value = line.partition(":")
-        key = prop.strip().upper()
-        if key == "FN":
-            names.append(_unescape(value))
-        elif key == "N":
-            parts = [p.strip() for p in value.split(";")]
-            # N: Surname;Given;Additional;Additional;Prefix
-            given = parts[1] if len(parts) > 1 else ""
-            prefix = parts[4] if len(parts) > 4 else ""
-            joined = " ".join(p for p in (given, parts[0], prefix) if p)
-            if joined:
-                names.append(joined)
-        elif key.startswith("TEL"):
-            num = _tel_number(value)
-            if num:
-                type_part = prop[len("TEL"):].upper()
-                is_cell = "CELL" in type_part
-                tels.append((is_cell, num))
-
-    name = next((n for n in names if n), "")
-    if not name:
-        logger.debug("parse_vcard: card without a usable name dropped")
-        return None
-    if not tels:
-        logger.debug("parse_vcard: card '%s' without a number dropped", name)
-        return None
-
-    cell = [t for t in tels if t[0]]
-    raw = (cell[0][1] if cell else tels[0][1])
-    number = normalize_e164(raw) or raw
-    return {"name": name, "number": number}
 
 
 # ---------------------------------------------------------------------------
@@ -251,27 +135,34 @@ class UserContactsStore:
 
     # -- write API ---------------------------------------------------------
 
-    def upsert_for(self, user_id: int, entry: Dict[str, str]) -> int:
-        """Add or update ONE entry (matched by E.164-normalized number).
+    def add_unique(self, user_id: int, name: str, number: str) -> tuple[bool, str, str]:
+        """Add ONE entry, rejecting a duplicate number OR name.
 
-        For single-contact imports (a forwarded Telegram contact card):
-        unlike replace_for (full vCard file), this accumulates — the
-        user can forward contacts one by one. Returns the total count
-        after the upsert.
+        Names are stored with spaces replaced by underscores (single-token).
+        Returns ``(ok, reason, detail)``:
+          - ``(True, "ok", "<normalized_number>")`` — added;
+          - ``(False, "number_exists", "<existing_name>")``;
+          - ``(False, "name_exists", "<existing_number>")``;
+          - ``(False, "invalid", "no name" | "bad number")``.
         """
-        name = str(entry.get("name", "")).strip()
-        number = str(entry.get("number", "")).strip()
-        if not name or not number:
-            return self.count(user_id)
-        norm = normalize_e164(number) or number
-        entries = [
-            e for e in self.get(user_id)
-            if (normalize_e164(e["number"]) or e["number"]) != norm
-        ]
+        name = str(name or "").strip().replace(" ", "_")
+        number = str(number or "").strip()
+        if not name:
+            return (False, "invalid", "no name")
+        norm = normalize_e164(number)
+        if not norm:
+            return (False, "invalid", "bad number")
+        entries = self.get(user_id)
+        for e in entries:
+            if (normalize_e164(e["number"]) or e["number"]) == norm:
+                return (False, "number_exists", e["name"])
+        for e in entries:
+            if e["name"].casefold() == name.casefold():
+                return (False, "name_exists", e["number"])
         entries.append({"name": name, "number": norm})
-        n = self.replace_for(user_id, entries)
-        logger.info("user contacts: user %s upserted %s (%s)", user_id, name, norm)
-        return n
+        self.replace_for(user_id, entries)
+        logger.info("user contacts: user %s added %s (%s)", user_id, name, norm)
+        return (True, "ok", norm)
 
     def delete_by_number(self, user_id: int, number: str) -> int:
         """Remove all of the user's entries with this number (exact,

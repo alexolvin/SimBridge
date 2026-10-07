@@ -1,11 +1,13 @@
-"""Userbot main module — Telethon client with SMS/broadcast handlers.
+"""Userbot main module — Telethon client with SMS/call/phonebook handlers.
 
 Runs on the Telegram node. Communicates with simbridge-agent via HTTP
-for outgoing SMS. Receives incoming SMS via its own HTTP endpoint.
+for outgoing SMS and the voice bridge. Receives incoming SMS via its own
+HTTP endpoint.
 
-S02 features:
-- Contact name resolution for incoming SMS display
-- BLOCK/UNBLOCK commands with persistence
+Features:
+- Phonebook: /add /show /del (per-user, command-managed, no file import)
+- Dial-by-name: /call <name|number>, /sms <name|number> <message>
+- BLOCK/UNBLOCK/LISTBLOCK commands with persistence
 - Reply routing: reply to incoming SMS sends to that number
 - Error surfaces: localized, user-facing messages
 
@@ -32,7 +34,7 @@ from core.audit import AuditLogger
 from core.contacts import ContactResolver
 from core.blacklist import BlacklistManager
 from core.phone import is_service_number, normalize_e164, parse_destination
-from core.user_contacts import UserContactsStore, parse_vcard
+from core.user_contacts import UserContactsStore
 from core.events import EventType
 from core.errors import SMSErrorType
 from core.recovery import BackoffReconnector
@@ -46,10 +48,6 @@ logger = getLogger("simbridge.userbot")
 TG_RECONNECT_MIN_DELAY = 5.0
 TG_RECONNECT_MAX_DELAY = 300.0
 TG_RECONNECT_MAX_RETRIES = 10
-
-# vCard phonebook import: a real phonebook export fits well under this;
-# the cap guards against sending the bot a 100 MB file.
-VCARD_IMPORT_MAX_BYTES = 1_000_000
 
 # Pattern for explicit-number SMS: +79261234555: message
 EXPLICIT_NUMBER_RE = re.compile(
@@ -88,7 +86,7 @@ def is_number_attempt(text: Optional[str]) -> bool:
 # Telethon event (telethon is not installed in the test environment).
 # ---------------------------------------------------------------------------
 
-KNOWN_COMMANDS = frozenset({"sms", "broadcast", "block", "unblock", "listblock", "redial", "call", "contacts", "del", "help"})
+KNOWN_COMMANDS = frozenset({"sms", "block", "unblock", "listblock", "redial", "call", "show", "add", "del", "help"})
 
 
 def command_token(text: Optional[str]) -> Optional[str]:
@@ -176,8 +174,8 @@ class Userbot:
         # the number again.
         self._last_call: Dict[int, str] = {}
 
-        # Per-user phonebooks (vCard import): dial-by-name (/call) and
-        # per-recipient caller identification. Optional config key
+        # Per-user phonebooks (/add, /call by name, /show): dial-by-name
+        # and per-recipient caller identification. Optional config key
         # paths.user_contacts; default — next to the global contacts
         # cache (same directory), logged at startup.
         uc_path = self.cfg.get("paths.user_contacts")
@@ -429,8 +427,10 @@ class Userbot:
 
         @self._client.on(events.NewMessage(pattern=r"(?i)^/sms\b"))
         async def handle_sms(evt):
-            """Handle /sms <phone> <message> (case-insensitive, 2026-08-22)
-            or a /sms-prefixed reply to an incoming SMS."""
+            """Handle /sms <name|number> <message> (case-insensitive,
+            2026-08-22) or a /sms-prefixed reply to an incoming SMS. The
+            first argument is a phone number (used directly) or a contact
+            name (resolved via the user's phonebook, with disambiguation)."""
             sender_id = evt.sender_id if evt.sender_id else 0
 
             # Access gate FIRST (2026-08-22): unknown sender -> silence,
@@ -470,60 +470,38 @@ class Userbot:
                 # Not a reply, parse arguments
                 parts = evt.message.text.split(None, 2)
                 if len(parts) < 3:
-                    await evt.reply("Usage: /sms <phone> <message>")
+                    await evt.reply("Usage: /sms <name|number> <message>")
                     return
-                phone = parts[1]
+                target = parts[1]
                 text = parts[2]
+                if parse_destination(target) is not None:
+                    phone = target
+                elif target.isdigit():
+                    # a numeric target that is not a valid destination is a
+                    # malformed number, not a name to look up
+                    await evt.reply(SMSErrorType.NUMBER_MALFORMED_SMS.value)
+                    return
+                else:
+                    matches = self._user_contacts.find_by_name(sender_id, target)
+                    if not matches:
+                        await evt.reply(
+                            f"Не найдено: {target}\n"
+                            "Добавьте контакт: /add <имя> <номер>"
+                        )
+                        return
+                    if len(matches) > 1:
+                        lines = [f"{i}) {m['name']}  {m['number']}"
+                                 for i, m in enumerate(matches[:10], 1)]
+                        more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
+                        await evt.reply("Несколько совпадений. Для отправки СМС "
+                                        "отправьте номер:\n" + "\n".join(lines) + more)
+                        return
+                    phone = matches[0]["number"]
+                    if parse_destination(phone) is None:
+                        await evt.reply(f"Номер в справочнике некорректен: {phone}")
+                        return
 
             await self._do_send_sms(evt, phone, text, sender_id)
-
-        @self._client.on(events.NewMessage(pattern=r"(?i)^/broadcast\b"))
-        async def handle_broadcast(evt):
-            """Handle /broadcast <message> — send to all out_sms users
-            (case-insensitive, 2026-08-22)."""
-            sender_id = evt.sender_id or 0
-
-            # Access gate FIRST (2026-08-22): unknown -> silence,
-            # known without out_sms -> "Недостаточно прав". The usage
-            # hint is only shown to users who passed the gate.
-            verdict = self._access(sender_id, "out_sms")
-            if verdict != "ok":
-                if verdict == "denied":
-                    await evt.reply(SMSErrorType.DENIED.value)
-                return
-
-            parts = evt.message.text.split(None, 1)
-            if len(parts) < 2:
-                await evt.reply("Usage: /broadcast <message>")
-                return
-
-            message = parts[1]
-
-            # D13: send the raw text to every user with out_sms,
-            # including the sender. Per-user isolation.
-            recipients = sorted(self._acl.users_with_right("out_sms"))
-            sent: list[int] = []
-            failed: list[int] = []
-            for uid in recipients:
-                try:
-                    await self._client.send_message(uid, message)
-                    sent.append(uid)
-                except Exception as e:
-                    failed.append(uid)
-                    logger.warning("broadcast: user %s failed: %s", uid, e)
-            self._audit.log(
-                EventType.BROADCAST_SENT,
-                telegram_user_id=sender_id,
-                outcome="ok" if not failed else "partial",
-                details={
-                    "recipients": recipients,
-                    "delivered_to": sent,
-                    "text_len": len(message),
-                },
-            )
-            await evt.reply(
-                f"Рассылка: доставлено {len(sent)} из {len(recipients)}"
-            )
 
         @self._client.on(
             events.NewMessage(
@@ -581,142 +559,14 @@ class Userbot:
                 return
             await self._place_call(evt, sender_id, dest)
 
-        @self._client.on(
-            events.NewMessage(
-                func=lambda e: (
-                    (e.message.file is not None and not e.voice)
-                    or e.contact is not None
-                )
-            )
-        )
-        async def handle_contact_file(evt):
-            """Directory import, two forms (same out_call gate):
-
-            - a DOCUMENT (.vcf phonebook export): the user's directory
-              is REPLACED — a file is a full phonebook;
-            - a FORWARDED CONTACT card (MessageMediaContact): ONE entry
-              is upserted (added or updated by number) — the user can
-              forward contacts one by one.
-
-            Every outcome is logged (2026-09-28: an import that
-            produced neither a reply the user remembered nor a log
-            line is a black box) and always ends in a user reply.
-            """
-            sender_id = evt.sender_id if evt.sender_id else 0
-            verdict = self._access(sender_id, "out_call")
-            if verdict != "ok":
-                if verdict == "denied":
-                    await evt.reply(SMSErrorType.DENIED.value)
-                return
-
-            contact = getattr(evt, "contact", None)
-            if contact is not None:
-                # Telethon 1.44 TL schema: MessageMediaContact exposes
-                # phone_number / first_name / last_name / vcard / user_id
-                # (there is no .phone attribute — reading it always gave
-                # None, so every card looked number-less). The vcard field
-                # carries the full vCard the client shared.
-                phone = (getattr(contact, "phone_number", None)
-                         or getattr(contact, "phone", None))
-                vcard = getattr(contact, "vcard", None)
-                name = " ".join(
-                    p for p in (
-                        getattr(contact, "first_name", None),
-                        getattr(contact, "last_name", None),
-                    ) if p
-                ).strip()
-                vcard_head = (
-                    vcard[:400] + "…" if vcard and len(vcard) > 400 else vcard
-                )
-                logger.info(
-                    "contact import: user %s card fields: "
-                    "phone_number=%r first=%r last=%r user_id=%r vcard=%r",
-                    sender_id,
-                    getattr(contact, "phone_number", None),
-                    getattr(contact, "first_name", None),
-                    getattr(contact, "last_name", None),
-                    getattr(contact, "user_id", None),
-                    vcard_head,
-                )
-                # The structured field can be empty while the embedded
-                # vCard still carries the number — recover it from there.
-                if not phone and vcard:
-                    entries = parse_vcard(vcard)
-                    if entries:
-                        phone = entries[0]["number"]
-                        if not name:
-                            name = entries[0]["name"]
-                if not phone:
-                    logger.warning("contact import: user %s card has no "
-                                   "number (phone_number and vcard both "
-                                   "empty; name: %r)", sender_id,
-                                   name or "<none>")
-                    await evt.reply(
-                        f"У этого контакта нет номера"
-                        + (f" ({name})." if name else ".")
-                        + " Проверьте номер в контакте в телефоне "
-                          "или отправьте файл .vcf."
-                    )
-                    return
-                if not name:
-                    name = f"Контакт {phone}"
-                total = self._user_contacts.upsert_for(
-                    sender_id,
-                    {"name": name, "number": normalize_e164(phone) or phone},
-                )
-                logger.info("contact import: user %s saved %s (%s), "
-                            "total %d", sender_id, name, phone, total)
-                await evt.reply(f"Сохранено: {name} ({phone}). "
-                                f"В справочнике: {total}.")
-                return
-
-            size = getattr(evt.message.file, "size", None)
-            logger.info("contact import: user %s sent a document (%s bytes)",
-                        sender_id, size)
-            if size is not None and size > VCARD_IMPORT_MAX_BYTES:
-                logger.warning("contact import: user %s document too large "
-                               "(%s bytes)", sender_id, size)
-                await evt.reply("Файл слишком большой (макс. 1 МБ)")
-                return
-            try:
-                data = await evt.message.download_bytes()
-                text = data.decode("utf-8")
-            except (OSError, UnicodeDecodeError) as e:
-                logger.warning("vCard import: unreadable document: %s", e)
-                await evt.reply("Не удалось прочитать файл как vCard")
-                return
-
-            if "BEGIN:VCARD" not in text:
-                logger.warning("contact import: user %s document is not a "
-                               "vCard (%d chars)", sender_id, len(text))
-                await evt.reply("Это не vCard-файл. Пришлите экспорт "
-                                "телефонной книги (.vcf) или перешлите "
-                                "контакт из своих контактов.")
-                return
-            entries = parse_vcard(text)
-            if not entries:
-                logger.warning("contact import: user %s vCard parsed to 0 "
-                               "entries (%d chars)", sender_id, len(text))
-                await evt.reply("vCard не распознан: нет контактов с "
-                                "именем и номером.")
-                return
-            n = self._user_contacts.replace_for(sender_id, entries)
-            self._audit.log(
-                EventType.CONFIG_RELOADED,
-                telegram_user_id=sender_id,
-                outcome="ok",
-                details={"kind": "user_contacts_import", "entries": n},
-            )
-            await evt.reply(f"Справочник заменён: {n} контактов.")
-
         @self._client.on(events.NewMessage(pattern=r"(?i)^/call\b"))
         async def handle_call(evt):
             """/call <name|number> — dial from the user's directory.
 
             A parseable number dials directly (same path as a bare
             number); anything else is a name search in the user's own
-            vCard directory: one match dials, several are listed (the
-            user then sends the number), none gets a hint to import.
+            phonebook: one match dials, several are listed (the user
+            then sends the number), none gets a hint to /add.
             """
             sender_id = evt.sender_id if evt.sender_id else 0
             verdict = self._access(sender_id, "out_call")
@@ -737,16 +587,16 @@ class Userbot:
                 if not matches:
                     await evt.reply(
                         f"Не найдено: {raw}\n"
-                        "Пришлите vCard-файл телефонной книги, "
-                        "чтобы создать справочник."
+                        "Добавьте контакт: /add <имя> <номер>"
                     )
                     return
                 if len(matches) > 1:
                     lines = [f"{i}) {m['name']}  {m['number']}"
                              for i, m in enumerate(matches[:10], 1)]
                     more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
-                    await evt.reply("Несколько совпадений:\n" + "\n".join(lines)
-                                    + more + "\nНаберите номер, чтобы позвонить.")
+                    await evt.reply("Несколько совпадений. Для звонка отправьте "
+                                    "номер правильного контакта:\n" + "\n".join(lines)
+                                    + more)
                     return
                 dest = parse_destination(matches[0]["number"])
                 if dest is None:
@@ -757,9 +607,9 @@ class Userbot:
                             sender_id, raw, dest.number)
             await self._place_call(evt, sender_id, dest)
 
-        @self._client.on(events.NewMessage(pattern=r"(?i)^/contacts\b"))
-        async def handle_contacts(evt):
-            """/contacts — show this user's imported directory (out_call)."""
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/show\b"))
+        async def handle_show(evt):
+            """/show — show this user's phonebook (out_call)."""
             sender_id = evt.sender_id if evt.sender_id else 0
             verdict = self._access(sender_id, "out_call")
             if verdict != "ok":
@@ -769,13 +619,58 @@ class Userbot:
 
             entries = self._user_contacts.get(sender_id)
             if not entries:
-                await evt.reply("Справочник пуст. Пришлите vCard-файл "
-                                "телефонной книги (.vcf) или перешлите "
-                                "контакт из своих контактов.")
+                await evt.reply("Справочник пуст. "
+                                "Добавьте контакт: /add <имя> <номер>")
                 return
             lines = [f"{e['name']}  {e['number']}" for e in entries[:50]]
             more = f"\n… и ещё {len(entries) - 50}" if len(entries) > 50 else ""
             await evt.reply(f"Справочник ({len(entries)}):\n" + "\n".join(lines) + more)
+
+        @self._client.on(events.NewMessage(pattern=r"(?i)^/add\b"))
+        async def handle_add(evt):
+            """/add <name> <number> — add a contact; /add <name> — add the
+            last dialed number. The number is the trailing token that starts
+            with '+' or a digit (the space BEFORE the number, not the space
+            after the name); the name is the rest (spaces -> underscores).
+            Rejects a duplicate number or name (out_call gate)."""
+            sender_id = evt.sender_id if evt.sender_id else 0
+            verdict = self._access(sender_id, "out_call")
+            if verdict != "ok":
+                if verdict == "denied":
+                    await evt.reply(SMSErrorType.DENIED.value)
+                return
+
+            raw = re.sub(r"(?i)^/add\b\s*", "", (evt.message.text or "").strip())
+            if not raw:
+                await evt.reply("Использование: /add <имя> [номер]")
+                return
+
+            # number = the LAST token starting with '+' or a digit; name = rest.
+            matches = list(re.finditer(r"\s([+\d]\S*)", raw))
+            if matches:
+                number = matches[-1].group(1)
+                name = raw[:matches[-1].start()].strip()
+            else:
+                name = raw.strip()
+                number = self._last_call.get(sender_id)
+
+            if not number:
+                await evt.reply("Нет последнего номера. "
+                                "Используйте /add <имя> <номер>.")
+                return
+
+            ok, reason, detail = self._user_contacts.add_unique(sender_id, name, number)
+            display_name = name.strip().replace(" ", "_")
+            if ok:
+                await evt.reply(f"Добавлено: {display_name} ({detail})")
+            elif reason == "number_exists":
+                await evt.reply(f"Отказ: номер уже есть (контакт «{detail}»).")
+            elif reason == "name_exists":
+                await evt.reply(f"Отказ: имя уже занято ({detail}).")
+            elif detail == "no name":
+                await evt.reply("Нет имени. Используйте /add <имя> <номер>.")
+            else:
+                await evt.reply("Некорректный номер.")
 
         @self._client.on(events.NewMessage(pattern=r"(?i)^/del\b"))
         async def handle_del(evt):
@@ -785,8 +680,7 @@ class Userbot:
             number — unambiguous. A name deletes only on a unique
             case-insensitive match; ambiguous matches are listed so the
             user deletes by number. Destructive by design, hence the
-            strict matching. Full reset = send a new vCard file
-            (import replaces the directory).
+            strict matching.
             """
             sender_id = evt.sender_id if evt.sender_id else 0
             verdict = self._access(sender_id, "out_call")
@@ -816,8 +710,9 @@ class Userbot:
             if len(matches) > 1:
                 lines = [f"{i}) {m['name']}  {m['number']}"
                          for i, m in enumerate(matches[:10], 1)]
-                await evt.reply("Несколько совпадений:\n" + "\n".join(lines)
-                                + "\nУдалите по номеру: /del <номер>")
+                more = "" if len(matches) <= 10 else f"\n… и ещё {len(matches) - 10}"
+                await evt.reply("Несколько совпадений. Удалите по номеру:\n"
+                                + "\n".join(lines) + more)
                 return
             n = self._user_contacts.delete_by_name(sender_id, matches[0]["name"])
             if n:
@@ -969,25 +864,42 @@ class Userbot:
             if not self._is_known(sender_id):
                 return
             rights = self._acl.get_user_rights(sender_id)
+            has_call = "out_call" in rights
+            has_sms = "out_sms" in rights
 
-            help_text = "SimBridge commands:\n"
-            if "out_sms" in rights:
-                help_text += "  /sms <phone> <message> — send SMS\n"
-                help_text += "  /broadcast <message> — send to all\n"
-                help_text += "  /block <phone> — block number\n"
-                help_text += "  /unblock <phone> — unblock number\n"
-                help_text += "  /listblock — show blocked numbers\n"
-            if "out_call" in rights:
-                help_text += "  <phone> — voice call (send the number alone)\n"
-                help_text += "  /redial — redial the last number\n"
-                help_text += "  /call <name|number> — call from your directory\n"
-                help_text += "  /contacts — show your directory\n"
-                help_text += "  /del <name|number> — remove from your directory\n"
-                help_text += "  (send a vCard file or forward a contact to import)\n"
-            if "in_sms" in rights:
-                help_text += "  (incoming SMS forwarded automatically)\n"
+            # HTML parse mode: commands are bold, <placeholders> escaped.
+            lines: list[str] = []
+            if has_call:
+                lines += [
+                    "<b>&lt;number&gt;</b> — voice call (simply enter the number)",
+                    "<b>/redial</b> — redial the last number",
+                    "<b>/add &lt;name&gt;</b> — add the last number to the phonebook",
+                    "<b>/add &lt;name&gt; &lt;number&gt;</b> — add a contact to the phonebook",
+                    "<b>/show</b> — show the phonebook",
+                    "<b>/del &lt;name|number&gt;</b> — delete from the phonebook",
+                    "<b>/call &lt;name|number&gt;</b> — call a contact from the phonebook",
+                ]
+            if has_sms or has_call:
+                lines += [
+                    "<b>/block &lt;number&gt;</b> — block a number",
+                    "<b>/listblock</b> — show blocked numbers",
+                    "<b>/unblock &lt;number&gt;</b> — unblock a number",
+                ]
+            if has_sms:
+                lines += [
+                    "<b>/sms &lt;name|number&gt; &lt;message&gt;</b> — send an SMS",
+                ]
 
-            await evt.reply(help_text)
+            if not lines:
+                help_text = (
+                    "SimBridge commands:\n"
+                    "  (no sending rights — see /help on the owner)"
+                )
+            else:
+                help_text = "SimBridge commands:\n" + "\n".join(
+                    "  " + l for l in lines
+                )
+            await evt.reply(help_text, parse_mode="html")
 
         @self._client.on(
             events.NewMessage(
